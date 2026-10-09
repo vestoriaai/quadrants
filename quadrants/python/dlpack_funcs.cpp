@@ -120,6 +120,16 @@ std::pair<uint8_t, uint8_t> get_type_info(Arch arch, DataType dt) {
   uint8_t data_type_code = kDLInt;
   uint8_t element_bits = 0;
   switch (type_id) {
+    case PrimitiveTypeID::i8: {
+      data_type_code = static_cast<uint8_t>(kDLInt);
+      element_bits = 8;
+      break;
+    }
+    case PrimitiveTypeID::i16: {
+      data_type_code = static_cast<uint8_t>(kDLInt);
+      element_bits = 16;
+      break;
+    }
     case PrimitiveTypeID::i32: {
       data_type_code = static_cast<uint8_t>(kDLInt);
       element_bits = 32;
@@ -143,6 +153,26 @@ std::pair<uint8_t, uint8_t> get_type_info(Arch arch, DataType dt) {
     case PrimitiveTypeID::u1: {
       data_type_code = static_cast<uint8_t>(kDLBool);
       element_bits = 8;
+      break;
+    }
+    case PrimitiveTypeID::u8: {
+      data_type_code = static_cast<uint8_t>(kDLUInt);
+      element_bits = 8;
+      break;
+    }
+    case PrimitiveTypeID::u16: {
+      data_type_code = static_cast<uint8_t>(kDLUInt);
+      element_bits = 16;
+      break;
+    }
+    case PrimitiveTypeID::u32: {
+      data_type_code = static_cast<uint8_t>(kDLUInt);
+      element_bits = 32;
+      break;
+    }
+    case PrimitiveTypeID::u64: {
+      data_type_code = static_cast<uint8_t>(kDLUInt);
+      element_bits = 64;
       break;
     }
     default: {
