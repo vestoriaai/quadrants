@@ -1369,6 +1369,100 @@ RhiResult MetalDevice::map(DeviceAllocation alloc, void **mapped_ptr) {
 void MetalDevice::unmap(DevicePtr ptr) {}
 void MetalDevice::unmap(DeviceAllocation ptr) {}
 
+// Per-call commit model (R3b documentation, for consumers):
+//
+// `to_numpy` costs exactly one bridge-kernel cmdlist commit plus one drain. The kernel
+// cmdlist is committed by the gfx runtime (`GfxRuntime` device_to_host, `submit()`), and
+// the drain happens here: when every source buffer is host-visible (the common case --
+// every external-array mirror this runtime allocates is `MTLStorageModeShared`), the
+// "drain" is `wait_idle()`, i.e. `waitUntilCompleted` over already-committed cmdbufs. No
+// staging buffer, no blit, and NO new command buffer is enqueued for the readback itself.
+// Consumers reading N arrays per frame therefore pay N bridge-kernel commits + N drains;
+// merging the arrays into one kernel launch (one commit, one drain, N memcpys) is the
+// way to amortize the fixed per-call cost. A batching API on the qd side would be a
+// separate, additive proposal (async/event-style readback is explicitly out of scope).
+//
+// R2 (byte path): a host-visible source is memcpy'd straight out of its mapped memory
+// after the drain, instead of blit -> fresh Shared staging -> wait -> memcpy-from-staging.
+// On UMA (Apple Silicon) the old blit was Shared -> Shared, a full extra hop over the bus
+// plus one allocation and one commit per call; all of that is gone on this path.
+//
+// Why direct map+memcpy is coherent here: `MetalDevice::allocate_memory` maps every
+// host-accessible allocation (`host_read || host_write`) to `MTLStorageModeShared` --
+// this backend never allocates `MTLStorageModeManaged`, so `can_map()` implies
+// host-visible Shared on every macOS target, Intel dGPUs included. The pre-R2 path made
+// the exact same map()+memcpy on a Shared staging buffer written by a GPU blit, so
+// visibility semantics (contents valid after `waitUntilCompleted`) are unchanged; only
+// the number of hops differs. Sources that are NOT host-visible (`can_map() == false`,
+// e.g. `MTLStorageModePrivate` user ndarrays read by `readback_graph_do_while_flag`)
+// fall back to the generic staging-blit `Device::readback_data` for exactly that subset.
+RhiResult MetalDevice::readback_data(DevicePtr *device_ptr,
+                                     void **data,
+                                     size_t *size,
+                                     int num_alloc,
+                                     const std::vector<StreamSemaphore> &wait_sema) noexcept {
+  if (!device_ptr || !data || !size) {
+    return RhiResult::invalid_usage;
+  }
+
+  std::vector<int> direct_idx;
+  std::vector<int> staged_idx;
+  direct_idx.reserve(num_alloc);
+  staged_idx.reserve(num_alloc);
+  for (int i = 0; i < num_alloc; i++) {
+    if (device_ptr[i].device != this || !data[i]) {
+      return RhiResult::invalid_usage;
+    }
+    if (get_memory(device_ptr[i].alloc_id).can_map()) {
+      direct_idx.push_back(i);
+    } else {
+      staged_idx.push_back(i);
+    }
+  }
+
+  if (!staged_idx.empty()) {
+    // Non-host-visible subset: generic staging-blit path (fresh staging per call is fine
+    // here -- this subset is the rare Private-source readback, not the per-frame mirror
+    // traffic). Its `submit_synced` drains the compute stream (kernel cmdlists included),
+    // which is also the drain the direct subset below needs before its memcpy.
+    std::vector<DevicePtr> staged_ptrs;
+    std::vector<void *> staged_data;
+    std::vector<size_t> staged_sizes;
+    staged_ptrs.reserve(staged_idx.size());
+    staged_data.reserve(staged_idx.size());
+    staged_sizes.reserve(staged_idx.size());
+    for (int i : staged_idx) {
+      staged_ptrs.push_back(device_ptr[i]);
+      staged_data.push_back(data[i]);
+      staged_sizes.push_back(size[i]);
+    }
+    RhiResult res = Device::readback_data(staged_ptrs.data(), staged_data.data(), staged_sizes.data(),
+                                          int(staged_sizes.size()), wait_sema);
+    if (res != RhiResult::success) {
+      return res;
+    }
+  } else {
+    // All sources host-visible: no cmdlist, no staging, no commit. Drain the compute
+    // stream's already-committed cmdbufs (pure `waitUntilCompleted` loop; a no-op when
+    // the stream is idle). Ordering semantics match the old path -- committing an empty
+    // cmdlist and waiting it only ever ordered against this same compute queue's FIFO.
+    // `wait_sema` stays ignored, as every other Metal submit path already does.
+    wait_idle();
+  }
+
+  for (int i : direct_idx) {
+    void *mapped{nullptr};
+    RhiResult res = this->map_range(device_ptr[i], size[i], &mapped);
+    if (res != RhiResult::success) {
+      return res;
+    }
+    memcpy(data[i], mapped, size[i]);
+    this->unmap(device_ptr[i]);
+  }
+
+  return RhiResult::success;
+}
+
 RhiResult MetalDevice::create_pipeline(Pipeline **out_pipeline, const PipelineSourceDesc &src, std::string name,
                                        PipelineCache *cache) noexcept {
   RHI_ASSERT(src.type == PipelineSourceType::spirv_binary);

@@ -85,6 +85,11 @@ struct MetalMemory : public rhi_impl::NonAssignable {
   MTLBuffer_id mtl_buffer() const;
   size_t size() const;
   RhiResult mapped_ptr(void **mapped_ptr) const;
+  // Whether this allocation lives in host-visible memory (this RHI maps `can_map` to
+  // `MTLStorageModeShared`; see `MetalDevice::allocate_memory`). Readbacks source-side
+  // gate on this: a can_map buffer can be memcpy'd out directly once the stream drains,
+  // no staging blit needed.
+  bool can_map() const { return can_map_; }
 
  private:
   MTLBuffer_id mtl_buffer_;
@@ -547,6 +552,12 @@ class MetalDevice final : public GraphicsDevice {
   RhiResult map(DeviceAllocation alloc, void **mapped_ptr) override;
   void unmap(DevicePtr ptr) override;
   void unmap(DeviceAllocation ptr) override;
+
+  RhiResult readback_data(DevicePtr *device_ptr,
+                          void **data,
+                          size_t *size,
+                          int num_alloc = 1,
+                          const std::vector<StreamSemaphore> &wait_sema = {}) noexcept override;
 
   RhiResult create_pipeline(Pipeline **out_pipeline,
                             const PipelineSourceDesc &src,
