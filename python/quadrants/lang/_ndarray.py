@@ -218,6 +218,14 @@ class Ndarray:
         physical buffer through the AST layout-permutation. Untagged ndarrays see canonical == physical and pay no extra
         cost.
 
+        Per-call commit model (Metal, post-R2): one ``to_numpy()`` = one bridge-kernel cmdlist
+        commit (the ``ndarray_to_ext_arr`` launch) plus one completion drain. The byte copy
+        itself is a direct memcpy out of host-visible memory (``MetalDevice::readback_data``),
+        so the remaining fixed per-call cost is the commit+drain round trip. Consumers
+        reading N arrays per frame pay that round trip N times; batching the arrays into a
+        single kernel launch (then reading each result once) amortizes it to one round trip
+        total. An async/event-style readback API is a separate proposal and does not exist.
+
         Returns:
             numpy.ndarray: The result numpy array, in canonical axis order.
         """

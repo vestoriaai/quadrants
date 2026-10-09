@@ -510,13 +510,29 @@ void GfxRuntime::launch_kernel(KernelHandle handle, LaunchContextBuilder &host_c
           // Alloc ext arr
           size_t alloc_size = std::max(size_t(32), ext_array_size.at(arg_id));
           // Must match the h2d gate in `HostDeviceContextBlitter::host_to_device`: the blit maps this allocation, and
-          // `map()` requires host_write (or host_read) on every backend. `host_read` can stay false because the d2h
-          // readback goes through `Device::readback_data`, which brings its own host-readable staging buffer.
+          // `map()` requires host_write (or host_read) on every backend. `host_read` can stay false: the d2h readback
+          // maps this same buffer directly whenever it is host-visible (`MetalDevice::readback_data` R2 direct path)
+          // and falls back to its own staging buffer for non-host-visible allocations.
           bool host_write = access & kExtArrReadWrite;
-          auto [allocated, res] = device_->allocate_memory_unique(
-              {alloc_size, host_write, false, /*export_sharing=*/false, AllocUsage::Storage});
-          QD_ASSERT_INFO(res == RhiResult::success, "Failed to allocate ext arr buffer");
-          any_arrays[arg_id] = *allocated.get();
+          // [R3a] Reuse a pooled mirror when one fits (first-fit >=). Every mirror is the same flavor
+          // (`host_write = READ|WRITE` gate above is direction-independent), so size is the only key.
+          DeviceAllocationUnique allocated;
+          for (auto it = ext_mirror_cache_.begin(); it != ext_mirror_cache_.end(); ++it) {
+            if (it->size >= alloc_size) {
+              allocated = std::move(it->buf);
+              ext_mirror_cache_bytes_ -= it->size;
+              ext_mirror_cache_.erase(it);
+              break;
+            }
+          }
+          if (!allocated) {
+            auto [fresh, res] = device_->allocate_memory_unique(
+                {alloc_size, host_write, false, /*export_sharing=*/false, AllocUsage::Storage});
+            QD_ASSERT_INFO(res == RhiResult::success, "Failed to allocate ext arr buffer");
+            allocated = std::move(fresh);
+          }
+          any_arrays[arg_id] = *allocated;
+          ext_mirror_pending_ids_.emplace(allocated->alloc_id, alloc_size);
           ctx_buffers_.push_back(std::move(allocated));
           // Allocate a parallel device buffer for the gradient slot whenever the caller supplied a grad tensor.
           // Reverse-mode AD reads and writes into it, so we need both host_write and host_read to round-trip
@@ -1078,7 +1094,9 @@ void GfxRuntime::launch_kernel(KernelHandle handle, LaunchContextBuilder &host_c
   if (ctx_blitter) {
     if (ctx_blitter->device_to_host(current_cmdlist_.get(), any_arrays, ext_array_grads, ext_array_size)) {
       current_cmdlist_ = nullptr;
-      ctx_buffers_.clear();
+      // The readback path drained the stream, so parked mirrors are GPU-idle: recycle
+      // them into the R3a pool instead of freeing.
+      retire_ctx_buffers();
     }
   }
 
@@ -1102,6 +1120,40 @@ void GfxRuntime::buffer_copy(DevicePtr dst, DevicePtr src, size_t size) {
   current_cmdlist_->buffer_barrier(dst);
 }
 
+// [R3a] See `ext_mirror_cache_` in runtime.h for the pool design and its drain invariant.
+void GfxRuntime::retire_ctx_buffers() {
+  if (!ext_mirror_pending_ids_.empty()) {
+    for (auto &buf : ctx_buffers_) {
+      auto it = ext_mirror_pending_ids_.find(buf->alloc_id);
+      if (it == ext_mirror_pending_ids_.end()) {
+        continue;
+      }
+      const size_t size = it->second;
+      ext_mirror_pending_ids_.erase(it);
+      // Capacity policy: keep total pooled bytes under the cap, evicting largest-first
+      // to make room; buffers bigger than the cap itself are freed, not pooled.
+      if (size > kExtMirrorCacheCapBytes) {
+        continue;
+      }
+      while (!ext_mirror_cache_.empty() && ext_mirror_cache_bytes_ + size > kExtMirrorCacheCapBytes) {
+        auto victim = std::max_element(ext_mirror_cache_.begin(), ext_mirror_cache_.end(),
+                                       [](const ExtMirrorCacheEntry &a, const ExtMirrorCacheEntry &b) {
+                                         return a.size < b.size;
+                                       });
+        ext_mirror_cache_bytes_ -= victim->size;
+        ext_mirror_cache_.erase(victim);
+      }
+      ext_mirror_cache_bytes_ += size;
+      ext_mirror_cache_.push_back({std::move(buf), size});
+    }
+  }
+  // Defensive: device allocators may recycle alloc_ids after a free, so a stale pending
+  // entry must never survive a harvest generation (it would misclassify a future
+  // non-mirror ctx_buffer as a mirror).
+  ext_mirror_pending_ids_.clear();
+  ctx_buffers_.clear();
+}
+
 void GfxRuntime::synchronize() {
   flush();
   device_->wait_idle();
@@ -1113,7 +1165,9 @@ void GfxRuntime::synchronize() {
       profiler_->insert_record(record.first, record.second);
     }
   }
-  ctx_buffers_.clear();
+  // `wait_idle()` above drained the stream: mirrors parked in `ctx_buffers_` are
+  // GPU-idle, so recycle them into the R3a pool instead of freeing.
+  retire_ctx_buffers();
   ndarrays_in_use_.clear();
   pending_launches_since_sync_ = 0;
   // Async adstack-overflow report: every launch in this sync window that overflowed wrote a non-zero sentinel into the

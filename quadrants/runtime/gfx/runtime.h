@@ -242,6 +242,45 @@ class QD_DLL_EXPORT GfxRuntime {
   // alone when it lands.
   std::vector<std::unique_ptr<DeviceAllocationGuard>> ctx_buffers_;
 
+  // [R3a] Persistent scratch pool for external-array mirror buffers (the per-launch
+  // `allocate_memory_unique` for host ndarray kernel args, e.g. every `to_numpy` /
+  // `from_numpy` bridge launch). Previously each launch allocated a fresh device buffer
+  // per external array arg and freed it at the next drain point; every readback paid a
+  // `newBufferWithLength` round trip on top of its fixed commit+wait cost.
+  //
+  // Mirrors are allocated `{host_write=true, host_read=false, Storage}` (the gate is
+  // `kExtArrReadWrite = READ|WRITE`, so every host-touched external array lands here),
+  // which on Metal means Shared host-visible memory -- hence one homogeneous buffer
+  // flavor and a size-only cache key. A mirror enters the pool only at the two points
+  // where the code already proves the stream drained (the post-readback
+  // `retire_ctx_buffers()` and `synchronize()`), so a pooled buffer is by construction
+  // GPU-idle and free of outstanding CPU maps when it is handed to the next launch; the
+  // record-time host memcpy into it cannot race a previous consumer.
+  //
+  // Capacity policy: total pooled bytes capped at `kExtMirrorCacheCapBytes`; on store,
+  // largest-first eviction until the new buffer fits, else the buffer is freed. Exact
+  // same launch threading model as `ctx_buffers_` / `current_cmdlist_` (single-threaded
+  // per GfxRuntime, Python GIL) -- no additional locking, matching the codebase
+  // convention for these members.
+  struct ExtMirrorCacheEntry {
+    std::unique_ptr<DeviceAllocationGuard> buf;
+    size_t size{0};
+  };
+  std::vector<ExtMirrorCacheEntry> ext_mirror_cache_;
+  size_t ext_mirror_cache_bytes_{0};
+  // Mirrors currently parked in `ctx_buffers_` (launch recorded, drain not yet reached),
+  // mapped alloc_id -> requested size. Lets `retire_ctx_buffers()` pick them out of the
+  // heterogeneous deferred-free vector without disturbing any other entry's lifetime.
+  std::unordered_map<DeviceAllocationId, size_t> ext_mirror_pending_ids_;
+  static constexpr size_t kExtMirrorCacheCapBytes = size_t{64} << 20;  // 64 MiB
+
+  // Moves every parked mirror from `ctx_buffers_` into `ext_mirror_cache_` (subject to
+  // the capacity policy) and frees the rest. MUST only be called at points where the
+  // compute stream has drained -- that is the safety invariant that makes pooled buffers
+  // reusable at next-launch record time. Call sites: after a synchronized readback and
+  // `synchronize()`; both replaced plain `ctx_buffers_.clear()`.
+  void retire_ctx_buffers();
+
   // Single u32 SSBO written by kernels that overflow an adstack. Allocated lazily on the first launch that binds
   // BufferType::AdStackOverflow and then reused across launches; synchronize() reads it, raises if non-zero, and
   // zeros it for the next window.
