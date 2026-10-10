@@ -121,6 +121,11 @@ class LoopScopeAttribute:
         self.is_static = is_static
         self.status: LoopStatus = LoopStatus.Normal
         self.nearest_non_static_if: ast.If | None = None
+        # Names bound to this runtime loop's variable(s) (range-for / struct-for /
+        # mesh-for targets). Assignments to them inside the loop body cannot be
+        # lowered (the loop variable is an IR LoopIndexStmt, not an alloca), so
+        # the transformer rejects them up front -- see check_assign_not_loop_var.
+        self.loop_vars: set[str] = set()
 
 
 class LoopScopeGuard:
@@ -367,6 +372,34 @@ class ASTTransformerFuncContext:
             raise QuadrantsSyntaxError(
                 f"Variable '{loop_var}' is already declared in the outer scope and cannot be used as loop variable"
             )
+
+    def register_loop_var(self, name: str) -> None:
+        """Record |name| as a loop variable of the innermost active runtime loop.
+
+        Only the lowering-broken family is registered: loop variables that map
+        to a bare id expression (LoopIndexStmt after lower_ast). ndrange /
+        grouped-ndrange targets are alloca-backed and remain assignable, so
+        they must NOT be registered.
+        """
+        if self.loop_scopes:
+            self.loop_scopes[-1].loop_vars.add(name)
+
+    def check_assign_not_loop_var(self, name: str) -> None:
+        """Reject `name = ...` / `name op= ...` when name is an active runtime
+        loop variable.
+
+        Without this guard the assignment is lowered into
+        LocalStoreStmt(LoopIndexStmt, ...), which trips the dest-type assert in
+        statements.h (cryptic RuntimeError) or, on the augmented-assign path,
+        escapes as an uncaught C++ exception that aborts the whole process.
+        """
+        for scope in self.loop_scopes:
+            if name in scope.loop_vars:
+                raise QuadrantsSyntaxError(
+                    f"Cannot assign to loop variable '{name}' inside a runtime loop: "
+                    f"loop variables are immutable in compiled kernels. "
+                    f"Use a differently named temporary instead."
+                )
 
     def get_var_by_name(self, name: str) -> tuple[bool, Any, str | None]:
         for s in reversed(self.local_scopes):
