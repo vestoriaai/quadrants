@@ -1424,6 +1424,7 @@ class MatrixField(Field):
             val (Union[Number, Expr, List, Tuple, Matrix]): Values to fill,
                 should have consistent dimension consistent with `self`.
         """
+        self._check_not_stale()
         if isinstance(val, numbers.Number) or (isinstance(val, expr.Expr) and not val.is_tensor()):
             if self.ndim == 2:
                 val = tuple(tuple(val for _ in range(self.m)) for _ in range(self.n))
@@ -1471,6 +1472,7 @@ class MatrixField(Field):
         Returns:
             numpy.ndarray: The result NumPy array.
         """
+        self._check_not_stale()
         if copy is not True:
             arr = _try_zerocopy_numpy(self, copy=copy)
             if arr is not None:
@@ -1508,6 +1510,7 @@ class MatrixField(Field):
         Returns:
             torch.tensor: The result torch tensor.
         """
+        self._check_not_stale()
         if copy is not True:
             tc = _try_zerocopy_torch(self, copy=copy, device=device)
             if tc is not None:
@@ -1532,6 +1535,7 @@ class MatrixField(Field):
 
     @python_scope
     def _from_external_arr(self, arr):
+        self._check_not_stale()
         if len(arr.shape) == len(self.shape) + 1:
             as_vector = True
             assert self.m == 1, "This is not a vector field"
@@ -1555,6 +1559,7 @@ class MatrixField(Field):
             >>> arr = numpy.ones((3, 3, 2, 2))
             >>> m.from_numpy(arr)
         """
+        self._check_not_stale()
 
         if not arr.flags.c_contiguous:
             arr = np.ascontiguousarray(arr)
@@ -1562,11 +1567,13 @@ class MatrixField(Field):
 
     @python_scope
     def __setitem__(self, key, value):
+        self._check_not_stale()
         self._initialize_host_accessors()
         self[key]._set_entries(value)
 
     @python_scope
     def __getitem__(self, key):
+        self._check_not_stale()
         self._initialize_host_accessors()
         key = self._pad_key(key)
         _host_access = self._host_access(key)
