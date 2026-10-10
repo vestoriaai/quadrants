@@ -54,6 +54,7 @@ from quadrants.lang.ast.ast_transformer_utils import (
     ReturnStatus,
 )
 from quadrants.lang.exception import (
+    QuadrantsRuntimeError,
     QuadrantsRuntimeTypeError,
     QuadrantsSyntaxError,
     handle_exception_from_cpp,
@@ -545,6 +546,32 @@ class Kernel(FuncBase):
             if key in self.materialized_kernels:
                 return
 
+            # C0-S: a cache miss means the AST is about to re-walk and bind
+            # whatever the template args reference.  If any captured field
+            # was born under a runtime that has since been cleared (a later
+            # qd.init()), its SNode* points into a freed Program -- compile
+            # would assert/corrupt.  Shallow-walk the args (one-time per
+            # specialization; hot launches take the cache-hit early return
+            # above) and refuse loudly.
+            runtime_now = impl.get_runtime()
+            for _a in py_args:
+                _attrs = getattr(_a, "__dict__", None)
+                if not _attrs:
+                    continue
+                for _v in _attrs.values():
+                    _exprs = getattr(_v, "vars", None)
+                    if not _exprs:
+                        continue
+                    for _e in _exprs:
+                        _rt = getattr(_e, "_qd_owner_runtime", None)
+                        if _rt is not None and _rt is not runtime_now and _rt.cleared:
+                            raise QuadrantsRuntimeError(
+                                f"Kernel {self.func.__qualname__!r} captures a field created "
+                                "under a quadrants runtime that has been reset by a later "
+                                "qd.init(); the field's SNode references freed memory. "
+                                "Re-create the fields and kernel under the current runtime."
+                            )
+
             self.runtime.materialize()
             used_py_dataclass_parameters = self._try_load_fastcache(py_args, key)
             kernel_name = f"{self.func.__name__}_c{self.kernel_counter}_{key[1]}"
@@ -989,7 +1016,8 @@ class Kernel(FuncBase):
                 "qd_stream is not compatible with autograd Tape. Launch the kernel outside the Tape "
                 "context, or omit qd_stream."
             )
-        if impl.get_runtime()._arch == _ARCH_PYTHON:
+        runtime_now = impl.get_runtime()
+        if runtime_now._arch == _ARCH_PYTHON:
             return self.func(*py_args, **kwargs)
         config = impl.current_cfg()
 

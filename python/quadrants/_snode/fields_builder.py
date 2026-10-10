@@ -177,9 +177,18 @@ class FieldsBuilder:
             warning("Finalizing an empty FieldsBuilder!")
         self.finalized = True
         impl.get_runtime().finalize_fields_builder(self)
-        return SNodeTree(
+        tree = SNodeTree(
             _qd_core.finalize_snode_tree(_snode_registry, self.ptr, impl.get_runtime()._prog, compile_only)
         )
+        # C0-S: create-path twin of SNodeTree.destroy().  FieldExpression
+        # holds a SNode*; once a new SNodeTree exists, every previously
+        # compiled kernel's bindings may be stale (LLVM backend bakes tree
+        # ids), so force re-materialization on their next launch.  Without
+        # this, relaunching a kernel compiled before the new tree silently
+        # reads the old buffer (wrong values within its capacity, SIGSEGV
+        # past it -- upstream taichi 1.7.4 crashes identically).
+        impl.get_runtime().clear_compiled_functions()
+        return tree
 
     def _check_not_finalized(self):
         if self.finalized:

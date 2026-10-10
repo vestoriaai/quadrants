@@ -431,6 +431,9 @@ class PyQuadrants:
         self.short_circuit_operators: bool = False
         self.unrolling_limit: int = 0
         self.src_ll_cache: bool = True
+        # C0-S: set by clear() once this runtime's Program has been torn
+        # down; field expressions created under it are dead afterwards.
+        self.cleared = False
 
     @property
     def compiling_callable(self) -> KernelCxx | Kernel | Function:
@@ -452,6 +455,12 @@ class PyQuadrants:
     def clear_compiled_functions(self):
         for k in self.kernels:
             k.materialized_kernels.clear()
+            # C0-S: launch_kernel consults compiled_kernel_data_by_key
+            # directly; leaving it populated re-served the stale artifact
+            # even after the materialized_kernels clear (the round-2 fix
+            # probe crashed for exactly this reason).
+            k.compiled_kernel_data_by_key = {}
+            k._last_compiled_kernel_data = None
 
     def finalize_fields_builder(self, builder):
         self.unfinalized_fields_builder.pop(builder)
@@ -599,6 +608,7 @@ class PyQuadrants:
             self._prog = None
         self._signal_handler_registry = None
         self.materialized = False
+        self.cleared = True
 
     def sync(self):
         if is_python_backend():
@@ -796,6 +806,11 @@ def create_field_member(dtype, name, needs_grad, needs_dual):
     x.ptr = _qd_core.expr_field(x.ptr, dtype)
     x.ptr.set_name(name)
     x.ptr.set_grad_type(SNodeGradType.PRIMAL)
+    # C0-S: remember the runtime this field was born under; a kernel
+    # materializing under a different, already-cleared runtime would resolve
+    # this expr against a freed Program (SNodeType::place asserts, garbage
+    # dims, SIGSEGV) -- refused loudly at materialize time instead.
+    x._qd_owner_runtime = get_runtime()
     pyquadrants.global_vars.append(x)
 
     x_grad = None
