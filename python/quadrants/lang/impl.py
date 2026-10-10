@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any, Callable, Iterable, Sequence
 
 import numpy as np
 
+from quadrants import _logging
 from quadrants._lib import core as _qd_core
 from quadrants._lib.core.quadrants_python import (
     Arch,
@@ -222,6 +223,12 @@ def validate_subscript_index(value, index):
 def subscript(ast_builder, value, *_indices, skip_reordered=False):
     dbg_info = _qd_core.DebugInfo(get_runtime().get_current_src_info())
     ast_builder = get_runtime().compiling_callable.ast_builder()
+    # Stale-field guard (see PyQuadrants.generation): this is the single choke point where a
+    # field -- a member of a template instance or a direct template arg -- enters compiled IR.
+    # A field under a finalized program must be refused before its dangling SNode pointers are
+    # lowered (use-after-free otherwise).
+    if isinstance(value, Field):
+        value._check_not_stale()
     # Ndarray from struct template field: resolve via the AnyArray cache populated by _predeclare_struct_ndarrays
     # during kernel compilation.
     if isinstance(value, Ndarray):
@@ -407,6 +414,18 @@ class PyQuadrants:
         self.materialized = False
         self._prog: Program | None = None
         self._arch: Arch | None = None
+        # Program generation: bumped on every ``reset()`` (i.e. every re-``qd.init``). Python
+        # objects that own C++ state tied to a specific Program (``Field``) record the
+        # generation they were created under and refuse to operate once it is stale. Without
+        # this, a re-init leaves those objects pointing into the finalized Program's memory
+        # (``Program::finalize`` resets the process-global HostMemoryPool) and any later use is
+        # use-after-free -- silent corruption or SIGSEGV. ``Ndarray`` already had the equivalent
+        # guard (``Ndarray._reset``); this closes the same hole for ``Field``.
+        self.generation = 0
+        # Fields created under this program (incremented by ``Field.__init__``). Lets ``reset()``
+        # warn only when a re-init actually orphans user fields (module-internal kernels are
+        # carried across by design and recompile cleanly under the new program).
+        self.fields_alive = 0
         self.src_info_stack = []
         self.inside_kernel: bool = False
         self.compilation_lock = threading.RLock()
@@ -633,8 +652,17 @@ def reset():
     global pyquadrants
     old_ndarrays = pyquadrants.ndarrays
     old_kernels = pyquadrants.kernels
+    old_generation = pyquadrants.generation
+    old_fields_alive = pyquadrants.fields_alive
     pyquadrants.clear()
     pyquadrants = PyQuadrants(old_kernels)
+    pyquadrants.generation = old_generation + 1
+    if old_kernels and old_fields_alive:
+        _logging.warn(
+            f"qd.reset()/re-init: {old_fields_alive} field(s) created under the previous program "
+            f"still have live Python objects. They are stale and will raise on any use; "
+            f"re-create their owning objects under the new program."
+        )
     for nd in old_ndarrays:
         nd._reset()
     for k in old_kernels:
