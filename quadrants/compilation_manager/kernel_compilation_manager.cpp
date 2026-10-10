@@ -65,7 +65,13 @@ CompileResult KernelCompilationManager::load_or_compile(const CompileConfig &com
                                                         const DeviceCapabilityConfig &caps,
                                                         const Kernel &kernel_def) {
   auto cache_mode = get_cache_mode(compile_config, kernel_def.ir_is_ast());
-  const auto kernel_key = make_kernel_key(compile_config, caps, kernel_def);
+  auto kernel_key = make_kernel_key(compile_config, caps, kernel_def);
+  if (cache_epoch_ > 0) {
+    // C0-S: trees changed since this key space was minted; segment it so a
+    // cached artifact compiled against an older SNodeTree layout can never
+    // be re-served (stale field binding -> OOB on the old tree's buffer).
+    kernel_key = fmt::format("e{}:{}", cache_epoch_, kernel_key);
+  }
   auto cached_kernel = try_load_cached_kernel(kernel_def.get_name(), kernel_key, compile_config.arch, cache_mode);
   bool cache_hit = (cached_kernel != nullptr);
   return CompileResult{

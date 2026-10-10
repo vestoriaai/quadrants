@@ -233,6 +233,11 @@ void Program::destroy_snode_tree(SNodeTree *snode_tree) {
   free_snode_tree_ids_.push(snode_tree->id());
   // The destroyed tree's `SNode *`s are about to be freed; cached entries pointing into them must go.
   snode_id_cache_.clear();
+  // C0-S: same invalidation contract as add_snode_tree -- cached artifacts
+  // referencing the destroyed tree must never be re-served (the python side
+  // clears its kernel caches in SNodeTree.destroy(); the artifact cache must
+  // not hand them back).
+  program_impl_->get_kernel_compilation_manager().bump_cache_epoch();
 }
 
 SNodeTree *Program::add_snode_tree(std::unique_ptr<SNode> root, bool compile_only) {
@@ -252,6 +257,14 @@ SNodeTree *Program::add_snode_tree(std::unique_ptr<SNode> root, bool compile_onl
   }
   // Wipe so any negative `nullptr` entry in the cache does not shadow an snode id newly satisfiable by this tree.
   snode_id_cache_.clear();
+  // C0-S: a second (or later) SNodeTree invalidates every compiled kernel's
+  // field bindings on the LLVM backend (they bake tree ids).  Segment the
+  // compilation cache so recompiles are forced; the python side clears its
+  // kernel caches on the same event (FieldsBuilder._finalize), mirroring
+  // SNodeTree.destroy().
+  if (id >= 1) {
+    program_impl_->get_kernel_compilation_manager().bump_cache_epoch();
+  }
   return snode_trees_[id].get();
 }
 

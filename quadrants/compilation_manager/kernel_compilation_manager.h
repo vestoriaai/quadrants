@@ -75,6 +75,17 @@ class KernelCompilationManager final {
 
   explicit KernelCompilationManager(Config init_params);
 
+  // C0-S: bumped by Program whenever an SNodeTree is added or destroyed
+  // beyond the first.  Mixed into the kernel cache key so cached artifacts
+  // compiled against superseded SNodeTrees can never be re-served.  A
+  // single-tree program (the common case) never bumps, so keys -- including
+  // on-disk cache entries -- stay stable.
+  void bump_cache_epoch() { cache_epoch_ += 1; }
+  std::size_t cache_epoch() const { return cache_epoch_; }
+
+
+
+
   // Load from memory || Load from disk || (Compile && Cache in memory)
   CompileResult load_or_compile(const CompileConfig &compile_config,
                                 const DeviceCapabilityConfig &caps,
@@ -132,6 +143,7 @@ class KernelCompilationManager final {
 
   Config config_;
   CachingKernels caching_kernels_;
+  std::size_t cache_epoch_{0};
   CacheData cached_data_;
   std::vector<KernelCacheData *> updated_data_;
   const std::string cache_dir_;
