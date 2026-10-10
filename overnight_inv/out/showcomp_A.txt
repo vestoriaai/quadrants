@@ -1,0 +1,22 @@
+### proc1 (compile)
+[I 10/10/26 23:54:16.313 7091579] [kernel_compilation_manager.cpp:compile_and_cache_kernel@224] Compiling kernel 'ext_arr_to_matrix_c24_0'
+[I 10/10/26 23:54:16.365 7091579] [kernel_compilation_manager.cpp:compile_and_cache_kernel@224] Compiling kernel 'ext_arr_to_tensor_c14_0'
+[I 10/10/26 23:54:16.390 7091579] [kernel_compilation_manager.cpp:compile_and_cache_kernel@224] Compiling kernel 'ext_arr_to_tensor_c14_1'
+[I 10/10/26 23:54:16.417 7091579] [kernel_compilation_manager.cpp:compile_and_cache_kernel@224] Compiling kernel 'ext_arr_to_matrix_c24_1'
+[I 10/10/26 23:54:16.507 7091579] [kernel_compilation_manager.cpp:compile_and_cache_kernel@224] Compiling kernel 'scan_c62_0'
+RESULT {"cxx_key": "T6388871a06b7cec08c1713c2ad979f3215dfb4268a2fa659466818f32b6ec31f", "kernel": "scan", "snode_ids": {"Wp": null, "coef": {"id": 10, "tree": 0}, "grid": {"id": 15, "tree": 0}, "s_ctr": {"id": 2, "tree": 0}, "s_par": {"id": 8, "tree": 0}, "s_rad": {"id": 6, "tree": 0}}, "tag": "inst1", "wall_s": 0.037}
+### proc2 (hit)
+RESULT {"cxx_key": "T6388871a06b7cec08c1713c2ad979f3215dfb4268a2fa659466818f32b6ec31f", "kernel": "scan", "snode_ids": {"Wp": null, "coef": {"id": 10, "tree": 0}, "grid": {"id": 15, "tree": 0}, "s_ctr": {"id": 2, "tree": 0}, "s_par": {"id": 8, "tree": 0}, "s_rad": {"id": 6, "tree": 0}}, "tag": "inst1", "wall_s": 0.014}
+### proc3 two-inst (second instance recompiles in-process)
+[I 10/10/26 23:54:17.202 7091681] [kernel_compilation_manager.cpp:compile_and_cache_kernel@224] Compiling kernel 'ext_arr_to_matrix_c24_0'
+[I 10/10/26 23:54:17.229 7091681] [kernel_compilation_manager.cpp:compile_and_cache_kernel@224] Compiling kernel 'ext_arr_to_tensor_c14_0'
+[I 10/10/26 23:54:17.254 7091681] [kernel_compilation_manager.cpp:compile_and_cache_kernel@224] Compiling kernel 'ext_arr_to_tensor_c14_1'
+[I 10/10/26 23:54:17.292 7091681] [kernel_compilation_manager.cpp:compile_and_cache_kernel@224] Compiling kernel 'ext_arr_to_matrix_c24_1'
+[I 10/10/26 23:54:17.331 7091681] [kernel_compilation_manager.cpp:compile_and_cache_kernel@224] Compiling kernel 'scan_c62_0'
+RESULT {"cxx_key": "T6388871a06b7cec08c1713c2ad979f3215dfb4268a2fa659466818f32b6ec31f", "kernel": "scan", "snode_ids": {"Wp": null, "coef": {"id": 10, "tree": 0}, "grid": {"id": 15, "tree": 0}, "s_ctr": {"id": 2, "tree": 0}, "s_par": {"id": 8, "tree": 0}, "s_rad": {"id": 6, "tree": 0}}, "tag": "inst1", "wall_s": 0.036}
+[I 10/10/26 23:54:17.364 7091681] [kernel_compilation_manager.cpp:compile_and_cache_kernel@224] Compiling kernel 'ext_arr_to_matrix_c24_2'
+[I 10/10/26 23:54:17.387 7091681] [kernel_compilation_manager.cpp:compile_and_cache_kernel@224] Compiling kernel 'ext_arr_to_tensor_c14_2'
+[I 10/10/26 23:54:17.405 7091681] [kernel_compilation_manager.cpp:compile_and_cache_kernel@224] Compiling kernel 'ext_arr_to_tensor_c14_3'
+[I 10/10/26 23:54:17.425 7091681] [kernel_compilation_manager.cpp:compile_and_cache_kernel@224] Compiling kernel 'ext_arr_to_matrix_c24_3'
+[I 10/10/26 23:54:17.450 7091681] [kernel_compilation_manager.cpp:compile_and_cache_kernel@224] Compiling kernel 'scan_c62_1'
+RESULT {"cxx_key": "T0c0bc2eedc680f898cdea95eb7044577d48203d161f76f7ed58e6f302a50fb9b", "kernel": "scan", "snode_ids": {"Wp": null, "coef": {"id": 26, "tree": 1}, "grid": {"id": 31, "tree": 1}, "s_ctr": {"id": 18, "tree": 1}, "s_par": {"id": 24, "tree": 1}, "s_rad": {"id": 22, "tree": 1}}, "tag": "inst2", "wall_s": 0.033}
