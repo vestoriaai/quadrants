@@ -54,10 +54,12 @@ at the Python layer either.
    were created earlier in the same process, in what order — i.e. on instance construction
    history. (Parameter list itself is stable: `program/callable.h:20-27` serializes only
    is_array/total_dim/format/dtype/needs_grad/element_shape/ptype — no names, no ids.)
-5. Secondary latent instability: helper `@qd.func` ids are assigned from a
-   **pointer-ordered** `std::map<Function*, size_t>` (`gen_offline_cache_key.cpp:507-517`) —
-   deterministic in practice (allocation order), but not guaranteed. Did not fire in my 2-helper
-   probe (variant D): same key in both processes.
+5. Helper `@qd.func` ids are **first-use order**, not pointer order: `emit(Function*)`
+   (`gen_offline_cache_key.cpp:507-517`) assigns `real_funcs_.size()` at first insert during the
+   deterministic AST walk (the `std::map<Function*, size_t>` is only the lookup structure, its
+   pointer ordering never reaches the key). Initially suspected as a cross-process hazard;
+   re-checked the code and probed it (variant D, two helpers): same key in both processes —
+   deterministic, NOT a defect.
 6. Python fastcache layer (would skip the AST transform cross-process):
    - Gate: `kernel.py:423` `if self.runtime.src_ll_cache and self.quadrants_callable and
      self.quadrants_callable.is_pure:` — plain `@qd.kernel` sets `is_pure=False`
@@ -142,13 +144,12 @@ unrolled AST differs).
   and `gen_offline_cache_key.cpp:emit(const SNode*)`. Same layout ⇒ safe share (ids differ only
   under destroy/recreate-style histories); different layout ⇒ miss (required). Benefit is real but
   modest for T23 (its histories differ ⇒ layouts differ ⇒ still misses, correctly).
-- Small safe wheel patches that ARE worth doing (S):
-  1. deterministic `real_funcs_` ordering (assign by first-use order or `FunctionKey::get_full_name()`
-     instead of `std::map<Function*,…>` pointer order, gen_offline_cache_key.cpp:507-517,677);
-  2. optionally, allow the Python fastcache to hash Field members structurally
+- Small wheel patches worth considering:
+  1. allow the Python fastcache to hash Field members structurally
      (name+dtype+shape+C++ layout hash folded into the L2 key) instead of `_FAIL_FASTCACHE`
      (args_hasher.py:350-368) — M-sized, needs a new export of the C++ snode-layout hash; gives
-     AST-skip persistence for field-reading kernels *when the layout matches*.
+     AST-skip persistence for field-reading kernels *when the layout matches*;
+  2. `real_funcs_` needs no fix — see mechanism item 5 (initial suspicion withdrawn).
 - **The lever that actually fixes T23 is packages-level** (matches T25's plan):
   1. make the sphere loop dynamic (kill the NS mega-unroll);
   2. pass per-instance data (s_ctr/s_rad/s_par/s_top/coef/esdf grids) as **ndarray args**, not
@@ -157,6 +158,94 @@ unrolled AST differs).
 
 ### Patch status for Investigation 1
 
-No unsound "stable key" patch was landed (see assessment). Landed instead: probes + mechanism
-(this report) on branch `overnight/inv-cache-keys`. The S-sized `real_funcs_` determinism fix is
-queued below (Investigation 2 preemption) — see commits.
+No "stable key" patch was landed — by design: the sound fix is the M-sized layout-key redesign
+above, and the packages-level lever (ndarray args + dynamic loop) is the one that actually
+delivers cross-process persistence. Landed instead: probes + mechanism (this report) on branch
+`overnight/inv-cache-keys` (commit `9f9c2528`).
+
+---
+
+## Investigation 2 — one-arch-per-process root cause (upstream bug #1)
+
+### TL;DR (updated vs the C0-D-era diagnosis)
+
+Re-probed on 1.3.4.dev7 (this tree's wheel, private caches, `overnight_inv/probe_multiarch.py`):
+
+| scenario (fresh process each) | result on dev7 |
+|---|---|
+| init(cpu) → family A launch | PASS |
+| init(metal) → family A launch | PASS |
+| init(cpu) A → **init(metal)** → fresh family B, never touch A | **PASS** (abandoning the old family is safe) |
+| same, A = ndarray-arg-only kernel, re-launch A after re-init | **PASS** (kernels survive reset by design, recompile under the new program) |
+| init(cpu) A → init(metal) → **re-launch A** (field members) | UB → **now loud QuadrantsRuntimeError** (was: garbage-shape QuadrantsIndexError / SIGSEGV per C0-D) |
+| same with metal first | same |
+| init(cpu) A → init(cpu) → re-launch A | same UB → loud error (double-init is the hazard, arch-independent) |
+| cpu launch → create field → re-launch (the C0-D "realloc" shot) | **no crash on dev7** (multi-SNodeTree layout: each `finalize_snode_tree` → `Program::add_snode_tree` allocates a separate tree, `program/program.cpp:238-258`; no root realloc path) |
+
+So the residual defect is **not arch-specific**: `qd.init` #2 (any arch) finalizes Program #1
+(`impl.py:PyQuadrants.clear` → `Program::finalize`, which also resets the process-global
+`HostMemoryPool`, `program/program.cpp:394-429`) while Python `Field` objects survive with raw
+SNode pointers into that freed memory. The kernel objects survive reset **by design**
+(`impl.py:reset` carries them over and `Kernel.reset()` clears materializations) and ndarrays are
+invalidated (`Ndarray._reset`, `lang/_ndarray.py:113`) — **Fields were the one class left with no
+staleness pattern**. Any later use = use-after-free; the failure shape (loud index error, silent
+garbage, SIGSEGV) depends on what the freed pool memory now holds. Mixed arch merely guarantees a
+re-init happened; same-arch double init is equally hazardous (probed).
+
+Per-arch state audit (what init switches, what survives):
+- Destroyed with the Program at `clear()`: SNodeTrees + field storage, KernelCompilationManager +
+  disk-cache handle, device/allocator (metal: `create_metal_device()` shared_ptr owned by
+  ProgramImpl — no process-global device singleton blocks two live Programs),
+  launch contexts.
+- Survives reset by design: class-level `Kernel` objects (materializations cleared, recompiled
+  under the new program), `TemplateMapper` (bound to programs via weakref + destroy callback).
+- Survives reset UNSAFELY (pre-patch): `Field` (raw SNode/SNodeTree pointers) — fixed by this
+  branch; user `Ndarray`s are tracked (`WeakSet`) and neutered; numpy-side buffers are plain
+  host memory (fine).
+- Process-global C++: TypeFactory (arch-free), SNode id counter (monotonic, never reused →
+  the Investigation-1 keying), profiler mode (reconfigured per init), `Stmt::reset_counter()` in
+  finalize.
+
+### Feasibility verdicts
+
+- **S (landed, this branch, commit `80445172`)**: stale-field guard. `PyQuadrants.generation`
+  bumped per reset; `Field` records its generation; host ops and `impl.subscript` (the single
+  choke point where a template-member/template-arg field enters compiled IR) refuse stale fields
+  with a loud `QuadrantsRuntimeError`; `reset()` warns when live fields are orphaned. 64 lines in
+  `impl.py`/`field.py`/`matrix.py` + `tests/python/test_stale_field.py` (4 tests). The C0-D class
+  of incidents becomes a deterministic error naming the cause, wheel-level, for all users.
+- **M**: keep-alive routing — retain per-program bundles (`_prog`, `_arch`, `_root_fb`,
+  `materialized`, fields builder state) and switch them atomically (context manager), with
+  launches routed to the program that owns the kernel's materialization (needs exporting the
+  Program backref from `KernelCxx`/`Callable.program`, and a launch-time ownership check).
+  Blocks: the launch path consults `impl.get_runtime().prog` at `kernel.py:796-848`; swap must
+  be serialized by the existing `compilation_lock`; disk-cache dir is per-path not per-arch (key
+  already includes arch, so sharing the dir is safe).
+- **L**: true per-arch program table (`qd.init(arch)` switches among live Programs instead of
+  finalizing; every Field/Kernel/ndarray tagged with its owning program; cross-family data
+  exchange via ndarrays/host copies — exactly the robostudio ik(cpu)+esdf(metal) shape).
+  Architecturally unblocked (no device singletons), but touches ownership of every object class
+  plus the launch hot path; needs the full test battery, not an overnight patch.
+
+Until M/L land, the wheel contract remains one-arch-per-process — with the difference that the
+enforcement now lives in the wheel (loud, deterministic) instead of in robostudio's `qd_guard`
+discipline.
+
+### Patch status for Investigation 2
+
+Branch `overnight/inv-cache-keys`, commit `80445172` (stale-field guard, S) + `9f9c2528`
+(investigation 1 probes/report). Regression evidence on the patched source:
+- multiarch matrix: base_cpu/base_metal/abandon/abandon_nd/realloc_cpu/realloc_metal PASS
+  unchanged; reuse/same_arch/reuse_metal_cpu now fail LOUDLY with
+  `QuadrantsRuntimeError: This qd.Field was created under a program that has been finalized...`
+  (`overnight_inv/out/map_*.log`).
+- Investigation-1 probes byte-identical keys (patch is compile-neutral):
+  variant A `T6388871a…`, variant B two-inst `T1ea8705d…` unchanged.
+- repo test battery (venv pytest + xdist `-n 0`): test_field/test_reset_ndarrays/
+  test_fields_builder/test_all_field_shortcut 235 passed; data-oriented + template-mapper +
+  kernel-arg-errors 82 passed; test_cache/test_offline_cache 57 passed 1 skipped; matrix/arg
+  batches 180 passed 2 skipped, 80 passed 1 xfailed; new test_stale_field.py 4 passed.
+
+No wheel was installed anywhere (dev-only venv `/Users/mini0/Code/quadrants/.venv-overnight`;
+source tree runs via `PYTHONPATH=python` with the wheel's `_lib/core/*.so` and `_lib/runtime/`
+copied in untracked for testing only).
