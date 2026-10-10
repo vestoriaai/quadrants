@@ -320,6 +320,27 @@ class Field:
         self._shape: tuple[int, ...] | None = None
         self._dtype: DataTypeCxx | None = None
         self.__name: str | None = None
+        # Program generation this field was created under (see PyQuadrants.generation).
+        self._qd_generation = impl.get_runtime().generation
+        impl.get_runtime().fields_alive += 1
+
+    def _check_not_stale(self) -> None:
+        """Raise if this field belongs to a finalized program (a re-``qd.init`` happened).
+
+        A field's C++ SNode/storage live inside the Program that created it. After
+        ``qd.reset()`` that Program is finalized and its host memory pool reset, so the
+        surviving Python object's pointers are dangling; using it is use-after-free. This is the
+        ``Field`` counterpart of ``Ndarray._reset``.
+        """
+        gen = getattr(self, "_qd_generation", None)
+        if gen is not None and gen != impl.get_runtime().generation:
+            raise QuadrantsRuntimeError(
+                "This qd.Field was created under a program that has been finalized by a "
+                "subsequent qd.init()/qd.reset() call. Python fields cannot outlive their "
+                "program; re-create the field (and its owning object) after re-init. "
+                f"(field generation {gen}, current program generation "
+                f"{impl.get_runtime().generation})"
+            )
 
     # TODO: why do we have snode and _snode, that return the same thing?
     @property
@@ -517,6 +538,8 @@ class Field:
         """
         if not isinstance(other, Field):
             raise TypeError("Cannot copy from a non-field object")
+        self._check_not_stale()
+        other._check_not_stale()
         if self.shape != other.shape:
             raise ValueError(f"qd.field shape {self.shape} does not match" f" the source field shape {other.shape}")
         from quadrants._kernels import tensor_to_tensor  # pylint: disable=C0415
@@ -619,6 +642,7 @@ class ScalarField(Field):
 
     def fill(self, val):
         """Fills this scalar field with a specified value."""
+        self._check_not_stale()
         self._require_placed()
         if in_python_scope():
             from quadrants._kernels import fill_field  # pylint: disable=C0415
@@ -640,6 +664,7 @@ class ScalarField(Field):
             copy: ``True`` (default) returns an independent copy, ``False`` requires zero-copy or raises,
                 ``None`` uses zero-copy when available and falls back to a copy otherwise.
         """
+        self._check_not_stale()
         self._require_placed()
         if copy is not True:
             arr = _try_zerocopy_numpy(self, copy=copy, is_scalar=True)
@@ -674,6 +699,7 @@ class ScalarField(Field):
             copy: ``True`` (default) returns an independent copy, ``False`` requires zero-copy or raises,
                 ``None`` uses zero-copy when available and falls back to a copy otherwise.
         """
+        self._check_not_stale()
         self._require_placed()
         if copy is not True:
             result = _try_zerocopy_torch(self, copy=copy, device=device, is_scalar=True)
@@ -706,6 +732,7 @@ class ScalarField(Field):
     @python_scope
     def from_numpy(self, arr):
         """Copies the data from a `numpy.ndarray` into this field."""
+        self._check_not_stale()
         self._require_placed()
         if not arr.flags.c_contiguous:
             import numpy as np  # pylint: disable=C0415
@@ -715,12 +742,14 @@ class ScalarField(Field):
 
     @python_scope
     def __setitem__(self, key, value):
+        self._check_not_stale()
         self._require_placed()
         self._initialize_host_accessors()
         self.host_accessors[0].setter(value, *self._pad_key(key))  # type: ignore
 
     @python_scope
     def __getitem__(self, key):
+        self._check_not_stale()
         self._require_placed()
         self._initialize_host_accessors()
         # Check for potential slicing behaviour
