@@ -1568,10 +1568,18 @@ class ASTTransformer(Builder):
         is_static_if = get_decorator(ctx, node.test) == "static"
 
         if is_static_if:
-            if node.test.ptr:
-                build_stmts(ctx, node.body)
-            else:
-                build_stmts(ctx, node.orelse)
+            # S3: a qd.static branch executes exactly once, at compile time --
+            # Python semantics put its bindings in the ENCLOSING scope. The
+            # default per-block scope of build_stmts swallowed them, so any
+            # use after the join (`if qd.static(c): y = ...` / `x[i] = y`,
+            # even at kernel top level, loop or not) died with
+            # 'Name "y" is not defined' (s3_root_cause.md #1). Build the
+            # taken branch in the enclosing scope instead; runtime ifs are
+            # untouched (their allocas are branch-scoped, so hoisting those
+            # names would be semantically wrong, and initialize-before-if
+            # remains the contract there).
+            branch = node.body if node.test.ptr else node.orelse
+            build_stmts(ctx, branch, scope_guard=False)
             return node
 
         with ctx.non_static_if_guard(node):
@@ -1787,9 +1795,21 @@ class ASTTransformer(Builder):
 build_stmt = ASTTransformer()
 
 
-def build_stmts(ctx: ASTTransformerFuncContext, stmts: list[ast.stmt]):
+def build_stmts(ctx: ASTTransformerFuncContext, stmts: list[ast.stmt], scope_guard: bool = True):
     # TODO: Should we just make this part of ASTTransformer? Then, easier to pass around (just
     # pass the ASTTransformer object around)
+    #
+    # S3: |scope_guard=False| builds the statements in the ENCLOSING scope.
+    # Only build_If's static branch uses it: a compile-time branch's bindings
+    # must survive the join (see the S3 note in build_If). Everything else
+    # keeps the per-block scope so loop bodies and branches do not leak names
+    # into the enclosing scope.
+    if not scope_guard:
+        for stmt in stmts:
+            if ctx.returned != ReturnStatus.NoReturn or ctx.loop_status() != LoopStatus.Normal:
+                break
+            build_stmt(ctx, stmt)
+        return stmts
     with ctx.variable_scope_guard():
         for stmt in stmts:
             if ctx.returned != ReturnStatus.NoReturn or ctx.loop_status() != LoopStatus.Normal:
