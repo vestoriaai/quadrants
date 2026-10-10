@@ -172,6 +172,7 @@ class ASTTransformer(Builder):
             var = impl.expr_init(var)
             ctx.create_variable(target.id, var)
         else:
+            ctx.check_assign_not_loop_var(target.id)
             var = build_stmt(ctx, target)
             if var.ptr.get_rvalue_type() != anno:
                 raise QuadrantsSyntaxError("Static assign cannot have type overloading")
@@ -268,6 +269,8 @@ class ASTTransformer(Builder):
             var = impl.expr_init(value)
             ctx.create_variable(target.id, var)
         else:
+            if is_local:
+                ctx.check_assign_not_loop_var(target.id)
             var = build_stmt(ctx, target)
             try:
                 var._assign(value)
@@ -898,6 +901,8 @@ class ASTTransformer(Builder):
                 f'Kernel argument "{node.target.id}" is immutable in the kernel. '
                 f"If you want to change its value, please create a new variable."
             )
+        if isinstance(node.target, ast.Name):
+            ctx.check_assign_not_loop_var(node.target.id)
         node.ptr = node.target.ptr._augassign(node.value.ptr, type(node.op).__name__)
         return node.ptr
 
@@ -1121,6 +1126,7 @@ class ASTTransformer(Builder):
             ctx.check_loop_var(loop_name)
             loop_var = expr.Expr(ctx.ast_builder.make_id_expr(""))
             ctx.create_variable(loop_name, loop_var)
+            ctx.register_loop_var(loop_name)
             if len(node.iter.args) not in [1, 2]:
                 raise QuadrantsSyntaxError(f"Range should have 1 or 2 arguments, found {len(node.iter.args)}")
             if len(node.iter.args) == 2:
@@ -1279,6 +1285,7 @@ class ASTTransformer(Builder):
                 else:
                     user_indices = loop_indices
                 ctx.create_variable(target, matrix.make_matrix(user_indices, dt=primitive_types.i32))
+                ctx.register_loop_var(target)
                 build_stmts(ctx, node.body)
                 ctx.ast_builder.end_frontend_struct_for()
             else:
@@ -1295,6 +1302,7 @@ class ASTTransformer(Builder):
                         invperm[axis] = k
                     for canon_idx, name in enumerate(targets):
                         ctx.create_variable(name, phys_vars[invperm[canon_idx]])
+                        ctx.register_loop_var(name)
                     expr_group = expr.make_expr_group(*phys_vars)
                 else:
                     _vars = []
@@ -1302,6 +1310,7 @@ class ASTTransformer(Builder):
                         var = expr.Expr(ctx.ast_builder.make_id_expr(""))
                         _vars.append(var)
                         ctx.create_variable(name, var)
+                        ctx.register_loop_var(name)
                     expr_group = expr.make_expr_group(*_vars)
                 impl.begin_frontend_struct_for(ctx.ast_builder, expr_group, loop_var)
                 ctx.loop_depth += 1
@@ -1323,6 +1332,7 @@ class ASTTransformer(Builder):
             assert isinstance(ctx.mesh, impl.MeshInstance)
             mesh_idx = mesh.MeshElementFieldProxy(ctx.mesh, node.iter.ptr._type, var.ptr)
             ctx.create_variable(target, mesh_idx)
+            ctx.register_loop_var(target)
             ctx.ast_builder.begin_frontend_mesh_for(
                 mesh_idx.ptr,
                 ctx.mesh.mesh_ptr,
@@ -1349,6 +1359,7 @@ class ASTTransformer(Builder):
             loop_name = node.target.id + "_index__"
             loop_var = expr.Expr(ctx.ast_builder.make_id_expr(""))
             ctx.create_variable(loop_name, loop_var)
+            ctx.register_loop_var(loop_name)
             begin = expr.Expr(0)
             end = qd_ops.cast(node.iter.ptr.size, primitive_types.i32)
             for_di = _qd_core.DebugInfo(ctx.memoized_get_pos_info(node))
@@ -1362,6 +1373,7 @@ class ASTTransformer(Builder):
             entry_expr.type_check(impl.get_runtime().prog.config())
             mesh_idx = mesh.MeshElementFieldProxy(ctx.mesh, node.iter.ptr.to_element_type, entry_expr)
             ctx.create_variable(target, mesh_idx)
+            ctx.register_loop_var(target)
             ctx.loop_depth += 1
             build_stmts(ctx, node.body)
             ctx.loop_depth -= 1
