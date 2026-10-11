@@ -357,6 +357,29 @@
   {1,3,5,23,24,25,64})同证 bitwise。union gate 7/7 PASS(venv4 实跑)。
 - **状态**:landed(分支 mujocoqd/spirv-vectorize)+ verified(bitwise 契约全绿;默认关闭)。
 
+## R5 — host-visible ndarray 分配策略(opt-in,obs/读回免桥接税)【设计草案,实施中】
+- **描述(设计)**:ndarray 级 opt-in 旋钮 `qd.ndarray(dtype, shape, host_visible=True)`(默认
+  False,行为零变更)。分配路由:`Ndarray` ctor → `Program::create_ndarray(host_visible=)` →
+  `ProgramImpl::allocate_memory_on_device(host_visible=)` → GfxProgramImpl 把 `host_read` 置
+  true → Metal 既有规则(host_read||host_write ⇒ MTLStorageModeShared,R2 论证过,metal 侧
+  **零改动**)把该 ndarray 的 MTLBuffer 直接分到 Shared。读回快路(Python 侧,仅 flag 命中时
+  生效,默认路径逐字节不变):`to_numpy`/`from_numpy`(scalar + matrix/vector,后者恒 AOS,
+  numpy total_shape C-contig == 物理缓冲)跳过桥 kernel(`ndarray_to_ext_arr` /
+  `ext_arr_to_ndarray`),改走新 C++ 入口 `Program::ndarray_copy_to_host/from_host` =
+  `synchronize()`(排干,与 R2 直读同一"waitUntilCompleted 后 contents 可见"契约)+ map_range
+  + memcpy + unmap;to_numpy 输出 np.empty(全量覆写)。跳掉的固定税:桥 kernel Python 侧
+  launch 机器(~0.131ms,R2/R3 报告残差解剖)+ ext 镜像分配/回收 + np.zeros 页分配。
+  **旋钮选 ndarray 级而非 init 级的理由**:host-visibility 是 buffer 属性不是 program 属性;
+  obs 只需要输出/读回缓冲;init 旗标会把全部 ndarray+field 内存翻成 Shared = 全局行为变更,
+  违背 opt-in。文件:`quadrants/program/{ndarray,program,program_impl}.h/.cpp`、
+  `quadrants/runtime/program_impls/{gfx,llvm}`、`quadrants/python/export_lang.cpp`、
+  `python/quadrants/lang/{impl,_ndarray,matrix}.py`、gate `tests/robostudio/gate_r5_host_visible.py`。
+- **背景需求**:quadrants-需求清单 M5-Metal 第 3 项 R5(readback 物理地板;qd-render-poc
+  readback_r2r3_report 残差解剖:1KB to_numpy 0.163ms 中 0.131ms 是桥 kernel launch 机器,
+  R2/R3 只能拿掉 staging/blit/空 commit,拿不掉 launch 本身——除非源缓冲本身 host-mappable,
+  即本条)。mjlab obs 集成路径必经优化。
+- **状态**:in progress(分支 `mujocoqd/r5-host-visible`;落地后补量化数字 + gate 结果)。
+
 ## C2 性能定案(2026-10-11,M4 实测)— 2× 验收未达成,瓶颈=DRAM 字带,非请求吞吐
 - **数据**(同二进制旗标 A/B,三/四轮交错取中位;当日机器态抖动实测 ±4×,同代码 scalar
   自身可在 200µs↔800µs 间摆动):nworld=4096:K1 scalar 13.6/14.8/14.1 vs vec
