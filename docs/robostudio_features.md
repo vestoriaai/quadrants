@@ -161,3 +161,72 @@
   （p50 0.11→0.09s；cavity 仅 2 polish 题，总墙收益小，价值在解除
   retreator + 恢复 table 已验证的 4 组形状）。wheel=
   quadrants-1.3.4.dev25+g3297e86fe。
+
+---
+
+# mujocoqd/compiler-line 分支条目(2026-10-11 起,未合入 robostudio-main)
+
+> 来源战役:mujoco-qd 移植 P0(quadrants 替换 mujoco_warp kernel;方案与探针在
+> `/Users/mini0/Code/mujoqo/`)。基线 dev25 探针重跑后开工;每个 landed 条目
+> 带 gate 进 `tests/robostudio/`,合并前 union runner 复跑。
+
+## M2 — early_return 单出口 AST 改写(opt-in)
+- **描述**:`@qd.kernel(early_return=True)` / `@qd.func(early_return=True)`。变换器
+  `ast/ast_transformers/early_return_transformer.py`(新增)在 build_stmts 前把运行时
+  if/for/while 内的 return 机械改写为单出口(`__er_ret{i}` 按注解 `qd.cast` 零初始化 +
+  `__er_done` 标志 + 后继语句包 guard + 循环内 break)。**break 策略分治**:func 内一律
+  break(内联后嵌套,合法);kernel 最外层并行循环只 guard 不 break(前端禁最外层 break,
+  且 SIMT 下发散早退无收益)。`qd.static` 子树不动(static return 本就合法)。旗标贯穿:
+  kernel.py `use_early_return` / func.py `early_return` / kernel_impl 装饰器。函数体文件:
+  function_def_transformer.py(插桩点)、kernel_impl.py、kernel.py、func.py。
+- **背景需求**:mujoco_warp 全库 kernel/func 早退 ~1500 处,前端一律拒绝——移植最大单项
+  机械成本;`@qd.real_func` 的 Metal/SPIR-V 路径崩溃(A1)堵死了替代路。
+- **状态**:landed(分支)+ verified — gate `probe_early_return_forms.py` 8 形态
+  **metal + cpu 双 ALL PASS**(守卫式/while+return/void/静态旁路/元组/嵌套 break/
+  无注解负例/跨调用 flag 重置)。改写正确性基准 = 原语义纯 Python 孪生。
+
+## M4 — build_Return 元组注解崩溃修复
+- **描述**:`ast_transformer.py` build_Return func 分支:`-> tuple[...]` 解析为多槽
+  return_type 时,`return a, b` 求值成不可变 tuple,逐槽 `qd.cast` 原地赋值即
+  TypeError。修复:tuple 归一为 list。
+- **背景需求**:A4(mujoco-qd P0);上游 test_return.py 元组注解用例仅标
+  cpu/cuda/amdgpu,同一根源。
+- **状态**:landed(分支)+ verified — 带注解元组 @qd.func 单出口形式 metal 数值
+  正确;早退形态由 M2 改写器承接。
+
+## C3 — Tile16x16 matmul_ / matmul_at_ / zero_upper_
+- **描述**:`simt/_tile.py` 工厂新增三方法。`matmul_(A,B,alpha)`:self += alpha·A@B;
+  `matmul_at_(A,B,alpha)`:self += alpha·A@Bᵀ(转置由 lane/寄存器索引互换自然获得,
+  分块分解尾更新 `W -= L_ik@L_jkᵀ` 的标配);`zero_upper_()`:cholesky_ 保留上三角,
+  本方法按 lane 清上三角。外层 k 为 runtime range(寄存器压力经验沿 _trsm)。
+- **背景需求**:mujoco-qd Newton 分块 Cholesky 的列 outer 公式仅 17–36 GF/s;
+  tile-tile 乘法是进入真分块路径的前提。
+- **状态**:landed(分支)+ verified — gate `probe_tile_matmul.py`:unit A@B ±alpha
+  vs numpy 1.9e-6;blocked 2×2 分解+求解(A@Bᵀ 更新)1e-6 级,metal ALL PASS
+  (tile 仅 GPU 后端,CPU 按设计报错)。
+
+## M6 — Metal/Vulkan 静默失效选项响亮警告
+- **描述**:`lang/misc.py` init() 在 arch 选定后,metal/vulkan 上请求 `debug=True` /
+  `check_out_of_bound=True` 时 `_qd_core.warn`(warning_code=INERT_DEBUG_OPTS)——
+  此前文档写明"never(无 in-kernel assertion 机制)"但用户零感知。
+- **背景需求**:mujoco-qd P0 D1;移植期任何越界都是未定义行为而用户以为有检查。
+- **状态**:landed(分支)+ verified — metal+debug=True 触发警告,普通 init 不触发。
+
+## A5 — Metal 循环携带内存依赖被破坏(**open,最高严重度**)
+- **现象(最小复现 `tests/robostudio/probe_metal_loopdep.py`)**:同一数组元素在
+  runtime 循环内经 if 条件读改写(`acc[0] = acc[0] + xs[i]`),Metal 丢更新(4.0 vs
+  正确 6.0;cpu 同代码正确)。判别矩阵:无条件嵌套 ✓、`+=` 增广 ✓(静默原子)、
+  显式 RMW + 分支 ✗(serialize/嵌套皆错)、cpu 全对。每次迭代读到循环前的旧值 =
+  load 被跨迭代缓存/外提。`qd.cast` 形初始化不改变行为(非 LICM 层)。
+- **影响**:极常用模式(物理接触遍历、直方图、链表遍历)静默错结果。
+- **状态**:open — 与 A2(tile runtime-loop ≥3 次外层迭代错值)同属"SPIR-V/Metal
+  路径循环携带依赖被破坏",共享调查;前端 CHI IR 正确(A1 print_ir 定界同法)。
+  gate 已钉死,修复后翻绿即闭环。
+
+## A1/A2 — real_func SPIR-V 崩溃 / tile runtime-loop 错值(**open**)
+- A1:最小复现 `p0_realfunc.py`(metal 0/5,cpu 4/5);`print_ir` 定界 = CHI IR 正常,
+  崩在 `spirv_ir_builder.cpp query_value`(SSA 使用先于定义)→ SPIR-V 后端函数调用
+  发射层。A2:`p0_block_chol.py` m=48 runtime 块循环错 2e-2、同序列静态展开全对
+  (1e-7)。两者与 A5 共享"运行时控制流下值生命周期"调查方向;复现与 gate 均已固化
+  (见 mujoqo/_probe 与 tests/robostudio)。
+- **状态**:open — 定界完成,待 C++ 层深挖。
