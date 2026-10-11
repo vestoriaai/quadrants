@@ -154,5 +154,10 @@
   QD_BLIT_DEBUG 定位：每次失败都是同一个 can_map=false 的 672000B 池
   条目。
 - **状态**：landed + verified — 同一复现 n_group=4 修后 **0 失败**
-  （10/10 过）；`UNION GATE: 6/6 PASS`（含 stale battery）。 cavity
-  4-group 全量验证见 ledger 更新时的记录。
+  （10/10 过）；`UNION GATE: 6/6 PASS`（含 stale battery）。cavity 全量
+  189 @ n_group=4（修后 wheel）：**176/189、routes/overflow 集逐位同、
+  决策 parity 189/189、mapfails_total=0**（vs 记录基线
+  t26_cavity_cmpolish：同 176/189）——cavity 可从 n_group=1 切回 4 组
+  （p50 0.11→0.09s；cavity 仅 2 polish 题，总墙收益小，价值在解除
+  retreator + 恢复 table 已验证的 4 组形状）。wheel=
+  quadrants-1.3.4.dev25+g3297e86fe。
