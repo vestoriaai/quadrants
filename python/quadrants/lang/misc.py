@@ -501,6 +501,22 @@ def init(
     cfg.arch = adaptive_arch_select(arch, enable_fallback)
     print(f"[Quadrants] Starting on arch={_qd_core.arch_name(cfg.arch)}")
 
+    # M6 (mujocoqd/compiler-line): loudly surface options that are silently inert on this backend.
+    if cfg.arch in (_qd_core.metal, _qd_core.vulkan):
+        inert = []
+        if cfg.debug:
+            inert.append("debug=True")
+        if getattr(cfg, "check_out_of_bound", False):
+            inert.append("check_out_of_bound=True")
+        if inert:
+            _qd_core.warn(
+                f"{', '.join(inert)} requested but has NO effect on arch="
+                f"{_qd_core.arch_name(cfg.arch)}: this backend has no in-kernel assertion "
+                "mechanism, so bounds/debug checks are silently disabled. Validate numerics on "
+                "the cpu backend instead (docs/source/user_guide/init_options.md). "
+                "[warning_code=INERT_DEBUG_OPTS]"
+            )
+
     if cfg.arch == _qd_core.amdgpu and get_os_name() == "win":
         _logging.warn("AMDGPU support on Windows is experimental and may not work as expected.")
 
