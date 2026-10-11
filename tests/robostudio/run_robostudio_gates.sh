@@ -2,6 +2,7 @@
 # robostudio-main union gate runner — one command, all robostudio gate families.
 #
 # Reproduces (in order) the exact checks run at the 2026-10-11 consolidation:
+#   7  C2        probe_spirv_vectorize.py metal    -> ALL PASS (bitwise scalar==vec)
 #   1  S2        probe_s2_loopvar_assign.py        -> RESULT: PASS
 #   2  S3        probe_s3_static_if_forms.py       -> RESULT: PASS (10/10)
 #   3  u8        gate_u8_dlpack.py cpu+metal       -> cpu ALL GATES PASS;
@@ -33,8 +34,8 @@ trap 'rm -rf "$TMP"' EXIT
 [[ -x "$PY" ]] || { echo "FATAL: no venv python at $PY (create .venv-consolidated, see docs/build_robostudio.md)" >&2; exit 1; }
 
 PASS=0; NFAIL=0
-gate_pass() { echo "gate $1/6 [$2]: PASS"; (( PASS = PASS + 1 )); }
-gate_fail() { echo "gate $1/6 [$2]: FAIL -- $3"; (( NFAIL = NFAIL + 1 )); }
+gate_pass() { echo "gate $1/7 [$2]: PASS"; (( PASS = PASS + 1 )); }
+gate_fail() { echo "gate $1/7 [$2]: FAIL -- $3"; (( NFAIL = NFAIL + 1 )); }
 
 # wait_gpu_idle: 0 if idle (possibly after waiting), 1 if still busy after 5 min
 wait_gpu_idle() {
@@ -122,6 +123,18 @@ else
   gate_fail 6 "C0S single-init battery" "want 4 PASS / 0 bad, got $GOOD PASS / $BAD bad (tail below)"; tail -12 "$TMP/g6.log"
 fi
 
-echo "UNION GATE: $PASS/6 PASS"
+# 7  C2 spirv-vectorize bitwise parity ---------------------------------------
+# Two subprocess arms (scalar / vec) re-executed by the probe itself; PASS iff
+# every kernel's output hash is bitwise identical across arms.
+if [[ -x "$PY" ]]; then
+  "$PY" -u "$ROOT/tests/robostudio/probe_spirv_vectorize.py" metal >"$TMP/g7.log" 2>&1 \
+    && grep -q "ALL PASS" "$TMP/g7.log" \
+    && gate_pass 7 "C2 spirv-vectorize bitwise" \
+    || { gate_fail 7 "C2 spirv-vectorize bitwise" "output below"; tail -16 "$TMP/g7.log"; }
+else
+  gate_fail 7 "C2 spirv-vectorize bitwise" "venv python missing"
+fi
+
+echo "UNION GATE: $PASS/7 PASS"
 if (( NFAIL > 0 )); then echo "(logs kept in $TMP)"; trap - EXIT; exit 1; fi
 exit 0
