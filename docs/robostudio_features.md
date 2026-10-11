@@ -466,3 +466,62 @@
   (bitwise 不保序,精度类 ~1e-7 rel 不变),若进生产路径其量语义与①旗标同一裁决。
 - **状态**:probe 全部跑通(exit 0);两文件为探针交付物,不落任何生产路径;旗标语义
   裁决与 subgroup 归约立项待用户决策。
+
+## REA — `reassociate` 旗标:C2 向量主循环归约重结合(opt-in,默认 OFF;mujocoqd/reassociate-flag)
+- **描述**:compile_config 新旗标 `reassociate`(qd.init(reassociate=True);已序列化进
+  offline-cache key)。**语义 = 蕴含 `spirv_vectorize`**(二选一裁决:其机制只存在于 C2
+  向量路径内,独立旗标单独打开时静默无效是 footgun,故 flag alone 即启用 C2)。开启后,
+  C2 float4 向量主循环中**资格合格**的循环携带标量归约累加器从「逐迭代 alloca 回写」改为
+  **k=4 部分和(步距 4)+ 循环头 phi 携带**:acc[0] 以循环前累加器值(prologue 结果)播种,
+  acc[1..3] 以运算单位元播种(add/sub: +0.0,mul: 1.0);主循环内 alloca 往返消失,循环
+  出口把 sum-0 存回 alloca,**标量 remainder 继续挂在 sum-0 上**(探针同构:prologue →
+  lane0 → 尾部 → 合并),remainder 之后树形合并 `(t+s1)+(s2+s3)`(mul 乘法合形)。
+  **order-barrier 内层 lane 环对合格归约拆除**。资格规则(vec_rea_qualifies):add/mul
+  任意侧、sub 且累加器在左(`x - acc` 逐元素变号不是部分和分解 → 保留 barrier);累加
+  操作数 DAG 必须可被 scalarize_static 逐 lane 复刻(add/sub/mul/div/truediv + neg/abs +
+  env 叶子),其余维持既有 fast / barrier 路径。**OFF 路径代码不变**:全部新发射都在
+  vec_reassociate_enabled() / 空 reassoc 向量之后(硬门 G1 逐位复验)。
+- **背景需求**:探针线①(codegen 落点裁决):欠占用 + 长链 solver 形状 1.5–2.8×,k=4 优于
+  k=8;C2 性能定案的重开路线①。
+- **Gate**:`tests/robostudio/probe_reassociate_flag.py`(union runner 新 gate 9/9):
+  三子进程臂 scalar/vec/rea(S-guard 单 init 一进程一臂)+ 进程内 perf 子进程。硬门:
+  **G1** OFF 逐位不变(scalar==vec 全部 12+3 输出 hash,含 C2 门全家 nv∈{24,23,5,1});
+  **G2** rea≠vec(重结合确实发生,nv∈{24,23} + payoff 形状);**G3** k_elementwise 三臂
+  全等(旗标不碰未合格循环);**G4** rea≠scalar(旗标单开即含 C2,蕴含语义);**G5**
+  rea 臂 vs numpy f64 < 1e-5(chol 1.47e-07 / matvec 5.71e-07 / sym 1.74e-06,chol 用探针
+  的正定 PSD 数据配方——tril(normal) 对消数据会把这些积和的 rel 指标炸到 1.4e-4@ulp2031,
+  PSD 数据 1.5e-7@ulp2,是数据几何不是 codegen)。**G6 WARN-only** 进程内交错 perf:
+  ON 代码生成(plain 源)vs 同进程顺序标量基线(同源 + 内层 `loop_config(serialize=True)`,
+  vec_analyze 以 special-loop-flags 拒绝 → 纯标量发射),时钟热身后 8 对 ~30ms 深突发、
+  交替顺序、逐臂取 min(机器双峰态只加时,min 收敛到真实成本;median 并报)。两次被否决
+  的估计器:跨进程 ABA 子进程轮(模式粘进程,比值跨运行变号)、短突发 anchor 弃轮(接受集
+  选择偏差,同病)。
+- **数字(venv6,本分支 9a55c585 树的 wheel;GPU 空闲;深突发 min;三连跑 A 臂 min 稳定
+  ±6%)**:
+  | 形状 | ON(rea)µs | 顺序标量 µs | S/A min | S/A median |
+  |---|---|---|---|---|
+  | matvec m=48 nw=1024 niter=8 | 1263 | 5155 | **4.08×** | 1.76× |
+  | symmatvec m=64 nw=512 niter=8 | 966 | 4701 | **4.87×** | 1.47× |
+  | chol_dot m=64 nw=1024 niter=2 | 16190 | 19008 | 1.17× | 1.27× |
+  G6 钉值(matvec/sym ≥1.4×,min 口径)三连跑全过(matvec 3.50–4.89×,sym 1.81–4.87×;
+  S 臂 min 有模式方差 1.7–6.0ms,median 口径保守 1.4–2.1×)。chol m=64 1.2× 量级(长
+  链 + 满载,与探针 1.5× 同向)。跨进程 vec 臂(C2-bitwise)µs 仅作上下文:matvec
+  1263(rea)vs 1229–4163(vec,模式漂移);sym 966 vs 908-1324。**与探针数字的关系**:
+  探针 2.2–2.8× 是 source-rea vs source-seq(双方标量载入);本旗标 ON 在 C2 float4 主
+  循环之上,vs 顺序标量基线 min 口径 3.5–4.9×、median 口径 1.4–2.1×,同向同量级。
+- **附带发现(均为 HEAD 既有,非本线引入;dev59 wheel 复现一致,已量化,未修——超出
+  minimal 改面,待立项)**:① 内层向量化循环体引用任务级标量(kernel arg)时,归约 DAG
+  走 barrier 路径或 VectorCompute 时 emitter env 无该 argload 条目 →
+  `unordered_map::at` 崩(argload 被前端上提到任务级;vec_analyze 有时以
+  "argload used as value" 拒绝有时放行,放行即崩);② 向量化循环体内的 coeff-0
+  (循环不变)ndarray 载入:向量 walk 注册其名字后,remainder walk 重复注册 →
+  `register_value: already exists` 崩;③ C2 门的 k_elementwise 内层循环实际从未向量化
+  (argload 作值被拒),其 hash 恒为标量路径输出(C2 门 bitwise 结论不受影响,记录在案)。
+- **footprint**:native +185/−6 行 5 文件:`codegen/spirv/spirv_codegen.cpp`(+143,含
+  vec_rea_qualifies / rea 发射 / 注释)、`codegen/spirv/detail/spirv_codegen.h`(+20,
+  VecReassoc + 两个声明)、`program/compile_config.h`(+13)、`python/export_lang.cpp`
+  (+5)、`analysis/offline_cache_util.cpp`(+1);gate `tests/robostudio/
+  probe_reassociate_flag.py`(新,499 行)+ union runner gate 9(+16)。无 metal runtime
+  改动,无前端改动。
+- **状态**:landed(分支 `mujocoqd/reassociate-flag`,未 merge)+ verified(硬门 5/5 +
+  union gate 9/9 + test_return 46/46;默认 OFF,OFF 路径逐位不变由 G1 复验)。
