@@ -14,18 +14,18 @@ CPU backend exclusively (the GPU staircases keep their own upstream gates). Case
     deterministically corrupted under the racy pre-fix form (a "serial" kernel's second-and-
     later top-level loops defaulting to parallel on the CPU thread pool) and is kept as the
     regression pin for the per-loop loop_config root cause.
-  - expected-error probes (fresh subprocess each, one-init-per-process): the GPU block-tier
-    staircase cannot lower on the CPU backend — block.sync raises ValueError at trace time,
-    block/subgroup collectives see subgroup size 0 (AssertionError), and a bare SharedArray
-    lowers to an addrspace(3) LLVM global with no CPU backing, failing kernel JIT
-    ("not found" RuntimeError at launch).
+  - block-tier staircase (mujocoqd/subgroup-cpu-support contract, in-process value gates):
+    the three former expected-error pins — block.sync ValueError / subgroup size 0 assert /
+    SharedArray addrspace(3) JIT failure — now run for real on the CPU virtual-block model
+    (one OS thread per virtual thread, real barrier, block-scoped SharedArray window):
+      * block.sync convergence + SharedArray permuted exchange (block_dim=256)
+      * block.reduce_all_add over a 256-virtual-thread block (subgroup size 1 on CPU, so the
+        block.py skeleton publishes per-thread slots and folds them at thread 0)
+      * bare SharedArray write→sync→cross-thread read (the shape that used to fail kernel JIT)
 Run: python probe_algorithms_cpu.py cpu   (exit 0 = pass)
-Ledger: mujocoqd/compiler-line C5 + mujocoqd/algorithms-2.
+Ledger: mujocoqd/compiler-line C5 + mujocoqd/algorithms-2 + mujocoqd/subgroup-cpu-support.
 """
-import os
-import subprocess
 import sys
-import tempfile
 
 import numpy as np
 
@@ -43,6 +43,9 @@ from quadrants.algorithms import (
     sort_scratch_slots,
 )
 from quadrants.algorithms._cpu_paths import is_cpu
+from quadrants.lang.misc import loop_config
+from quadrants.lang.simt import block as _block
+from quadrants.types.primitive_types import u32
 
 qd.init(arch=qd.cpu)
 
@@ -398,111 +401,74 @@ order = np.argsort(keys, kind="stable")
 gate("sort_radix u32 0-d n", np.array_equal(keys_t.to_numpy(), keys[order])
      and np.array_equal(values_t.to_numpy(), values[order]))
 
-# -------------------------------------------------- expected-error probes: GPU block-tier staircase on CPU
-# The GPU radix staircase is block-tier (SharedArray + block barriers + subgroup collectives); each
-# tier of the CPU backend's inability to lower it is pinned here in a fresh subprocess (the CPU
-# backend is one-init-per-process, and every layer fails loudly rather than silently).
-_PROBES = {
-    "staircase_block_sync_valueerror": (
-        """
-import quadrants as qd
-from quadrants.lang.kernel_impl import kernel
-from quadrants.lang.misc import loop_config
-from quadrants.lang.simt import block as _block
-qd.init(arch=qd.cpu)
+# -------------------------------------------------- block-tier staircase (mujocoqd/subgroup-cpu-support)
+# The GPU radix staircase is block-tier (SharedArray + block barriers + subgroup collectives). Under the
+# CPU virtual-block contract these now run for real: each block's 256 virtual threads run concurrently
+# (one OS thread each, thread_idx() = virtual thread index), block.sync() is a real barrier with
+# cross-thread visibility, and the SharedArray is the block-scoped window. The three kernels below are
+# the former expected-error pins (block.sync ValueError / subgroup size 0 assert / SharedArray JIT
+# failure), flipped to positive value gates.
+N = 256
 
-@kernel
-def k(n: qd.i32):
+i32_1d_t = qd.types.ndarray(qd.i32, ndim=1)
+u32_1d_t = qd.types.ndarray(qd.u32, ndim=1)
+
+
+@qd.kernel
+def staircase_block_sync_exchange(out: i32_1d_t):
+    sh = _block.SharedArray((256,), qd.i32)
     loop_config(block_dim=256)
-    for i in range(n):
+    for i in range(N):
+        tid = _block.thread_idx()
+        sh[tid] = 255 - tid
         _block.sync()
+        out[i] = sh[(tid * 7) % 256]
 
-try:
-    k(4)
-    print("MARKER_NO_ERROR")
-except BaseException as e:  # the frontend wraps the ValueError in QuadrantsCompilationError
-    print("MARKER_BARRIER_UNSUPPORTED" if "block.sync is not supported" in str(e) else "MARKER_OTHER")
-""",
-        "MARKER_BARRIER_UNSUPPORTED",
-    ),
-    "staircase_subgroup_assert": (
-        """
-import quadrants as qd
-from quadrants.lang.kernel_impl import kernel
-from quadrants.lang.misc import loop_config
-from quadrants.lang.simt import block as _block
-from quadrants.types.primitive_types import u32
-qd.init(arch=qd.cpu)
-u32_1d = qd.types.ndarray(qd.u32, ndim=1)
 
-@kernel
-def k(out: u32_1d):
+out_t = qd.ndarray(dtype=qd.i32, shape=N)
+out_t.from_numpy(np.zeros(N, np.int32))
+staircase_block_sync_exchange(out_t)
+qd.sync()
+got = out_t.to_numpy()
+want = (255 - (np.arange(N) * 7) % 256).astype(np.int32)
+gate("staircase_block_sync (was ValueError)", np.array_equal(got, want),
+     f"maxerr={int(np.abs(got.astype(np.int64) - want).max())}")
+
+
+@qd.kernel
+def staircase_block_reduce(out: u32_1d_t):
     loop_config(block_dim=256)
-    for i in range(256):
-        v = u32(1)
-        agg = _block.reduce_add(v, 256, u32)
-        if i == 0:
-            out[i] = agg
+    for i in range(N):
+        out[i] = _block.reduce_all_add(u32(1), 256, u32)
 
-t = qd.ndarray(qd.u32, shape=8)
-try:
-    k(t)
-    print("MARKER_NO_ERROR")
-except BaseException as e:  # AssertionError surfaces wrapped as a compilation error
-    msg = str(e)
-    ok = ("subgroup size 0" in msg) or ("subgroup size must be 32 or 64" in msg)
-    print("MARKER_SUBGROUP_UNSUPPORTED" if ok else "MARKER_OTHER")
-""",
-        "MARKER_SUBGROUP_UNSUPPORTED",
-    ),
-    "staircase_shared_array_jit_failure": (
-        """
-import quadrants as qd
-from quadrants.lang.kernel_impl import kernel
-from quadrants.lang.misc import loop_config
-from quadrants.lang.ops import bit_cast
-from quadrants.lang.simt import block as _block
-from quadrants.types.primitive_types import i32, u32
-qd.init(arch=qd.cpu)
-u32_1d = qd.types.ndarray(qd.u32, ndim=1)
 
-@kernel
-def k(out: u32_1d):
+out_u = qd.ndarray(dtype=qd.u32, shape=N)
+out_u.from_numpy(np.zeros(N, np.uint32))
+staircase_block_reduce(out_u)
+qd.sync()
+got = out_u.to_numpy()
+gate("staircase_block_reduce (was subgroup assert)", np.array_equal(got, np.full(N, 256, np.uint32)),
+     f"got[0]={int(got[0])}")
+
+
+@qd.kernel
+def staircase_shared_array_exchange(out: i32_1d_t):
+    sh = _block.SharedArray((256,), qd.i32)
     loop_config(block_dim=256)
-    for i in range(256):
-        tid = i % 256
-        sh = _block.SharedArray((256,), i32)
-        sh[tid] = i32(255 - tid)
-        out[i] = bit_cast(sh[255 - tid], u32)
+    for i in range(N):
+        tid = _block.thread_idx()
+        sh[tid] = 255 - tid
+        _block.sync()
+        out[i] = sh[255 - tid]
 
-t = qd.ndarray(qd.u32, shape=256)
-try:
-    k(t)
-    print("MARKER_NO_ERROR")
-except RuntimeError as e:
-    print("MARKER_JIT_ERROR" if "not found" in str(e) else "MARKER_OTHER_ERROR")
-""",
-        "MARKER_JIT_ERROR",
-    ),
-}
 
-for probe_name, (src, want_marker) in _PROBES.items():
-    with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as f:
-        f.write(src)
-        path = f.name
-    try:
-        r = subprocess.run([sys.executable, path], capture_output=True, text=True, timeout=180,
-                           env={**os.environ, "PYTHONPATH": os.environ.get("PYTHONPATH", "")})
-        got = want_marker in r.stdout
-        if got:
-            detail = "ok"
-        else:
-            out = r.stdout.strip().splitlines()
-            err = r.stderr.strip().splitlines()
-            detail = f"stdout tail: {out[-1]}" if out else (f"stderr tail: {err[-1]}" if err else "no output")
-        gate(f"expected_error {probe_name}", got, detail)
-    finally:
-        os.unlink(path)
+out_t.from_numpy(np.zeros(N, np.int32))
+staircase_shared_array_exchange(out_t)
+qd.sync()
+got = out_t.to_numpy()
+want = np.arange(N, dtype=np.int32)
+gate("staircase_shared_array (was JIT failure)", np.array_equal(got, want),
+     f"maxerr={int(np.abs(got - want).max())}")
 
 # -------------------------------------------------- is_cpu predicate (post-init)
 gate("is_cpu_predicate", is_cpu() is True, f"{is_cpu()}")

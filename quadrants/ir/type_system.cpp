@@ -283,6 +283,11 @@ void Operations::init_internals() {
 
   PLAIN_OP(linear_thread_idx, i32, true);
   PLAIN_OP(block_thread_idx, i32, false);
+  // CPU block-tier barriers: `qd.simt.block.sync()` / `mem_fence()` on the CPU backend (see
+  // python/quadrants/lang/simt/block.py). `cpu_block_barrier` is a runtime-context op: it reads
+  // `RuntimeContext::block_barrier` to find the current block's barrier.
+  PLAIN_OP(cpu_block_barrier, i32_void, true);
+  PLAIN_OP(cpu_block_mem_fence, i32_void, true);
   PLAIN_OP(test_stack, i32_void, true);
   PLAIN_OP(test_active_mask, i32_void, true);
   PLAIN_OP(test_shfl, i32_void, true);

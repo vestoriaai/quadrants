@@ -525,3 +525,163 @@
   改动,无前端改动。
 - **状态**:landed(分支 `mujocoqd/reassociate-flag`,未 merge)+ verified(硬门 5/5 +
   union gate 9/9 + test_return 46/46;默认 OFF,OFF 路径逐位不变由 G1 复验)。
+
+---
+
+# mujocoqd/subgroup-cpu-support 条目(2026-10-11;分支 `mujocoqd/subgroup-cpu-support`,design-first 草稿 → 实现)
+
+> 来源需求:用户指令"整体支持 subgroup"。Metal 侧已由探针线②证实全栈可用(24/24,零
+> handback,原子替换 pin 6.2–7.4×);缺口在 CPU 侧——三种形态全报错:block.sync →
+> trace 期 ValueError("not supported for arch");subgroup 集体操作 →
+> `Program::subgroup_size()`=0 断言;裸 SharedArray → `codegen_llvm.cpp
+> TaskCodeGenLLVM::visit(AllocaStmt)`(is_shared 分支)把共享 alloca lower 成
+> addrspace(3) ExternalLinkage 全局,CPU JIT 无后备存储 → kernel JIT
+> 失败("Function not found",jit_cpu.cpp lookup)。三个 expected-error 探针钉在
+> `probe_algorithms_cpu.py`。本线按 C5 余项里的 native 让渡规格(a)/(b) 落 CPU 侧语义。
+
+## 语义设计(定案)
+
+**subgroup 层 = 虚拟组语义(group_size=1)**:CPU 上每线程 = 自己的 subgroup。
+`Program::subgroup_size()` 对 cpu 返回 1(native,一处);`invocation_id()≡0`、
+`elect()≡1`、shuffle/broadcast 全系 = identity、`ballot/ballot_first_n` = bit0、
+reduce 系 = 自身、inclusive = 自身、exclusive = 单位元、segmented = 自身、
+`all_true/any_true/all_equal` = 谓词自身/恒 1、`bitonic_sort_kv` = 恒等
+(`log2_size=0` 在 reductions.py/sorting.py 本来就是文档化的退化情形,静态展开空环)。
+`subgroup.sync()` = no-op(单 lane 子组屏障平凡收敛);`subgroup.mem_fence()` =
+真实 `std::atomic_thread_fence(seq_cst)`(保守超集)。**逐位确定**。
+选择理由:候选 (i) 每 thread 独立 subgroup 是唯一零成本可移植且诚实的方案;
+候选 (ii) 虚拟 32-lane 串行模拟需要协程化 straight-line 代码,不成立且重。
+
+**block 层 = 真并发虚拟 block(每 virtual thread 一条真实线程)**:GPU 语义
+"block_dim 个虚拟线程同时执行循环体,SharedArray 是 block 窗口,barrier 收敛"在
+CPU 上按字面兑现——`cpu_block_parallel_for`(runtime.cpp 新增)把 [begin,end) 按
+block_dim 切 block,**逐个** block 生成 `n_live` 条 std::thread(vt=0..n_live-1,
+vt 即 `block.thread_idx()`,iteration = block 基址 + vt),barrier =
+mutex+condvar 代际屏障(经 `RuntimeContext::block_barrier` 交付),block 之间
+join(SharedArray 窗口不跨 block 交叠,GPU 一致)。CUDA 侧模型逐条对齐:
+`block.sync` 收敛同 block 全部虚拟线程且带内存可见性(屏障自带 happens-before);
+SharedArray 跨虚拟线程可见。block 级集体(`block.reduce_* / *_scan_* /
+sync_*_nonzero / radix_rank`)**零改动**——block.py 的共享内存骨架在
+`SUBGROUP_SIZE=1`(`NUM_SUBGROUPS=block_dim`,每线程 publish 自槽 + 屏障 +
+thread-0 顺序折叠)下自动正确。**响亮拒绝**:非 range-for 任务(serial/struct_for)
+上的 block-tier 操作、`rand` 进 block-tier 循环(rand 状态按 cpu_thread_id 索引,
+vt 会越界)、`block_dim∉[1,1024]`、`block.global_thread_idx()`(维持 ValueError)
+——全部编译期/trace 期报错,无静默错值路径。
+选择理由:barrier 分离的写读模式(write-all → sync → read)在"顺序逐迭代执行"
+模型下**本质上不可实现**(thread 0 读时 thread 255 尚未执行),顺序模拟必然静默
+错值;真线程 + 真屏障是唯一字面正确的兑现。CPU 侧不要求性能(每 block spawn
+线程),换语义诚实。FP 语义:block 级 reduce/scan = thread-0 顺序折叠,同 launch
+内逐位确定(确定性断言进 gate);vs GPU 树形归约 = 既有"容差桶"裁定(1e-7 rel),
+整数路径逐位一致。
+
+**实现落点(C5 规格 (b) 变体:共享 alloca → addrspace(0) 零初始化模块全局)**:
+`visit(AllocaStmt)` is_shared 分支对 cpu arch 生成 PrivateLinkage + 零初始化的
+addrspace(0) 全局(JIT 可链接;bls_buffer 同款先例)——比规格原文的"arena 指针 +
+运行时 arena 分配"更小:因 block 串行推进,每 (task, alloca) 一个全局即等价于
+per-block 窗口,免掉 RuntimeContext arena 指针、offset 累计与 per-block malloc。
+`make_cpu_multithreaded_range_for` 对 block-tier 任务跳过(保住用户
+[begin,end) 与 block_dim);`TaskCodeGenCPU` 预扫 body(is_shared alloca /
+cpu barrier internal call / RandStmt / AdStackAllocaStmt)后派发
+`cpu_block_parallel_for`,adstack `static_num_threads` 按 max(num_cpu_threads,
+block_dim) 放大(vt 作 cpu_thread_id 时槽位不越界)。python 侧:`subgroup.py`
+CPU 分支(映射表)+ `block.py` CPU 分支(`cpu_block_barrier` /
+`cpu_block_mem_fence` / `linear_thread_idx` / `sync_*_nonzero` 走既有 emulated
+路径)。新 internal op:`cpu_block_barrier`、`cpu_block_mem_fence`(均
+PLAIN_OP + runtime context)。**无新 compile_config 旗标**(后端完备性,非 opt-in)。
+
+## 资格矩阵(CPU 兑现方式 / 响亮拒绝)
+
+| 操作面 | CPU 兑现 |
+|---|---|
+| subgroup 数据移动/投票/reduce/scan/segmented/sort/lanemask | 全部兑现(group_size=1 恒等语义,逐位确定) |
+| subgroup.sync / mem_fence | no-op / seq_cst fence |
+| block.sync / mem_fence / thread_idx | 真屏障(代际 CV)/ seq_cst fence / vt |
+| block.reduce_* / *_scan_* / sync_*_nonzero / radix_rank | block.py 骨架零改动自动正确(SUBGROUP_SIZE=1) |
+| SharedArray(配合 loop_config(block_dim) 的 range-for) | addrspace(0) 零初始化全局,block 窗口语义 |
+| block.global_thread_idx | 响亮 ValueError(维持) |
+| rand / 非 range-for 任务上的 block-tier / block_dim>1024 | 响亮编译期错误 |
+
+## 实现落点(与草稿的差异,已按实现修订)
+1. **SharedArray 后备 = addrspace(0) 零初始化 PrivateLinkage 模块全局**(草稿写的是
+   "运行时 arena + RuntimeContext arena 指针",实现更小):`visit(AllocaStmt)` is_shared
+   分支在 cpu arch 改发 defined global(JIT 从 .bss 链接;bls_buffer 同款先例),
+   block 串行推进 ⇒ 每 (task, alloca) 一个全局即等价 per-block 窗口,免掉 arena
+   malloc/offset 累计/新 RuntimeContext 字段(RuntimeContext 只加了 block_barrier 一个
+   字段,给屏障交付用)。零初始化(GPU 是未初始化)——严格更 defined,对
+   barrier 分离的 produce/consume kernel 不可区分。
+2. **共享 alloca 被 LLVM 消除的平凡 kernel 不进 block-tier 派发**:uses_block_tier_ops
+   以 is_shared alloca **或** barrier internal call 判定;无屏障且访问平凡的 kernel 其
+   共享 alloca 会被 LLVM 直接消除(无跨线程契约的 kernel 本就无此契约,安全)。
+3. **守卫必须放主线程**:QD_ERROR = Logger::error = throw std::string(nanobind translator
+   的 std::string 分支接住 → RuntimeError)。per-task codegen 跑在 ParallelExecutor
+   worker 上,throw 无 handler → abort;故权威校验放 `compile_to_offloads` 尾部
+   (主线程,offload 之后 OffloadedStmt 已存在),codegen_cpu 留同名 last-resort 守卫。
+   过程中实测:worker 上 throw std::string / QuadrantsIrError 均 abort(后者 nanobind
+   无 std::exception 兜底翻译,已试验后回退 translator 改动,维持既有机制)。
+4. **block_dim 契约**:CPU 侧 ASTBuilder::block_dim 既有 power-of-two 断言 ⇒ 有效域
+   {1,2,...,1024};不显式 loop_config 时 default_cpu_block_dim=32(GPU 缺省 128,
+   同策略,缺省块照跑)。
+5. **subgroup python 映射的实现细节**:常数须走 `make_constant_expr`/`ops.cast`
+   (i32(0) 在 plain-function trace 语境不可调用);ballot_first_n/ballot → bit0;
+   @func 层(all_true_tiled/reductions/sorting butterfly)零改动,log2=0 空展开自动正确。
+
+## 门禁(全部跑通,2026-10-12,venv7 = /Users/mini0/Code/mujoqo/_probe.venv7)
+- **新探针 `tests/robostudio/probe_subgroup_cpu.py`(565 行,37 门)ALL PASS**:
+  host group_size==1/log2==0;invocation_id/elect/shuffle×3/broadcast×2 恒等(逐位);
+  ballot/ballot_first_n bit0;all_true/any_true(=pred)/all_equal(=1);reduce×4
+  (=自身)/inclusive(=自身)/exclusive(=0)/segmented(=自身);lanemask/bitonic 恒等;
+  block-tier:sync+SharedArray 置换读(bitwise)、8×block_dim=32 窗口隔离(bitwise)、
+  缺省 block_dim=32 无 loop_config 交换(bitwise)、block.reduce_all_add(i32)=256、
+  inclusive/exclusive min/max 前缀(bitwise)、sync_count_nonzero=64、f32 block reduce
+  launch-twice 逐位确定 + vs f64 ref rel 3.23e-09(1e-7 桶);subgroup.sync no-op 与
+  block.sync 混用;4 个响亮拒绝(serial 任务/rand/block_dim=2048/global_thread_idx)。
+- **`probe_algorithms_cpu.py` 120 门 ALL PASS**(两遍连跑稳定):三个 staircase
+  expected-error 钉翻绿为正值门——staircase_block_sync(置换读 bitwise)、
+  staircase_block_reduce(=256)、staircase_shared_array(cross-thread 读 bitwise)。
+- **union runner 第 10 门**(`run_robostudio_gates.sh`,label /10):metal 臂 =
+  probe_subgroup_metal 24/24 ALL PASS(既有钉,python 改动 arch 门控,GPU 路径零变化);
+  cpu 臂 = probe_subgroup_cpu + probe_algorithms_cpu。**UNION 10/10 PASS**(venv7,
+  GPU 空闲,2026-10-12 00:48)。
+- **`test_return.py` 46 passed**(venv7,pytest+xdist)。
+
+## footprint
+native +402/−13 行 11 文件:`runtime/llvm/runtime_module/runtime.cpp`(+184,
+cpu_block_parallel_for/代际 CV 屏障/cpu_block_barrier/cpu_block_mem_fence +
+STRUCT_FIELD(block_barrier))、`codegen/cpu/codegen_cpu.cpp`(+69 含守卫与
+create_offload_block_range_for 派发、adstack static_num_threads 放大)、
+`transforms/compile_to_offloads.cpp`(+36,主线程权威校验)、`ir/statements.{h,cpp}`
+(+71,uses_block_tier_ops/uses_rand_stmt 预扫)、`codegen/llvm/codegen_llvm.cpp`
+(+33,SharedArray cpu 分支 = addrspace(0) 零初始化全局)、`program/program.cpp`
+(+12,subgroup_size()=1)、`program/context.h`(+9,block_barrier 字段)、
+`transforms/make_cpu_multithreaded_range_for.cpp`(+11,block-tier 跳过)、
+`inc/internal_ops.inc.h` + `ir/type_system.cpp`(+12,cpu_block_barrier /
+cpu_block_mem_fence 注册)。python +120/−58 两文件(simt/subgroup.py CPU 恒等映射 +
+simt/block.py CPU 派发)。门禁:probe_subgroup_cpu.py(新,565 行)+
+probe_algorithms_cpu.py 翻绿 + union runner gate 10(+34)。文档:
+user_guide/subgroup.md(CPU 列 + CPU backend semantics + 数值语义节,+105/−37)、
+block.md(CPU 列 + virtual blocks 节,+41/−4)。**无 metal/cuda/amdgpu runtime 与
+codegen 改动**(arch 全部门控),无新 compile_config 旗标,offline-cache key 无新维度
+(IR 形状差异自然进 key)。
+
+## 数字
+- 虚拟组语义验收 = **逐位一致**(全部门禁,无一处数值 FAIL);block-tier 整数门逐位;
+  f32 block reduce(256 虚拟线程,顺序折叠)vs numpy f64 ref = rel 3.23e-09,
+  同 kernel 两次 launch 输出逐位相同(确定性)。f32 参考形状 (i*0.37+0.11) 之和。
+- 原子替换 pin(Metal,探针线②)不受影响:union gate 10 metal 臂原值复现 ALL PASS。
+- wheel:`dist/quadrants-1.3.4.dev71+g902047d30.d20261011-cp312-cp312-macosx_13_0_arm64.whl`
+  → `/Users/mini0/Code/mujoqo/_probe.venv7`(python3.12,tuna 依赖)。
+
+## 边界与响亮拒绝矩阵(实现核对版)
+| 形态 | CPU 行为 |
+|---|---|
+| subgroup 全 API | 兑现(group_size=1 恒等,逐位确定) |
+| block.sync/mem_fence/thread_idx + block 全部集体 + radix_rank | 兑现(真并发虚拟 block) |
+| SharedArray(带/不带显式 loop_config) | 兑现(缺省 block_dim=32) |
+| block-tier on serial/非 range-for 任务 | 响亮编译期错误 |
+| qd.random in block-tier | 响亮编译期错误 |
+| block_dim 非幂等或 >1024 | 响亮编译期错误 |
+| block.global_thread_idx | 响亮 ValueError(维持) |
+
+- **状态**:landed + verified(分支 `mujocoqd/subgroup-cpu-support`,未 merge;
+  probe_subgroup_cpu 37/37 + probe_algorithms_cpu 120/120 两遍稳定 + union 10/10 +
+  test_return 46/46)。

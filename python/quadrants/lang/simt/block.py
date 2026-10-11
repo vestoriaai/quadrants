@@ -32,12 +32,30 @@ def arch_uses_spv(arch):
     return arch == _qd_core.vulkan or arch == _qd_core.metal
 
 
+def arch_is_cpu(arch):
+    # Host CPU backends (LLVM JIT): the virtual-block model below applies to both.
+    return arch == _qd_core.arm64 or arch == _qd_core.x64
+
+
+# --- CPU block-tier ("virtual block") model --------------------------------------------
+#
+# On the CPU backend a loop annotated with `qd.loop_config(block_dim=N)` whose body touches
+# `SharedArray` / `sync()` / `mem_fence()` / the block collectives runs as true virtual blocks:
+# each block's N threads run CONCURRENTLY (one OS thread per virtual thread, `thread_idx()` =
+# 0..N-1), `sync()` is a real barrier with cross-thread memory visibility, and `SharedArray` is
+# a per-block shared window (see runtime.cpp `cpu_block_parallel_for`). Requirements:
+# `block_dim` in [1, 1024] on a top-level `for`; the loop must not call `qd.rand`.
+
+
 def sync():
     arch = impl.get_runtime().prog.config().arch
     if arch == _qd_core.cuda or arch == _qd_core.amdgpu:
         return impl.call_internal("block_barrier", with_runtime_context=False)
     if arch_uses_spv(arch):
         return impl.call_internal("workgroupBarrier", with_runtime_context=False)
+    if arch_is_cpu(arch):
+        # Real block barrier over the block's virtual threads (convergence + happens-before).
+        return impl.call_internal("cpu_block_barrier", with_runtime_context=True)
     raise ValueError(f"qd.block.sync is not supported for arch {arch}")
 
 
@@ -46,9 +64,10 @@ def sync_all_nonzero(predicate):
     if arch == _qd_core.cuda:
         # Hardware-fused barrier+reduction on NVPTX (`barrier.cta.red.and.aligned.all.sync`).
         return impl.call_internal("block_barrier_and_i32", predicate, with_runtime_context=False)
-    if arch == _qd_core.amdgpu or arch_uses_spv(arch):
+    if arch == _qd_core.amdgpu or arch_uses_spv(arch) or arch_is_cpu(arch):
         # AMDGPU and SPIR-V (Vulkan / Metal) emulate via shared memory + 2 barriers + an atomic; see
-        # `_block_reduce_*_emulated` below for the pattern.
+        # `_block_reduce_*_emulated` below for the pattern. CPU shares the emulated path: its
+        # SharedArray + sync + atomic building blocks are all backed by the block-tier runtime.
         return _block_reduce_all_nonzero_emulated(predicate)
     raise ValueError(f"qd.block.sync_all_nonzero is not supported for arch {arch}")
 
@@ -57,7 +76,7 @@ def sync_any_nonzero(predicate):
     arch = impl.get_runtime().prog.config().arch
     if arch == _qd_core.cuda:
         return impl.call_internal("block_barrier_or_i32", predicate, with_runtime_context=False)
-    if arch == _qd_core.amdgpu or arch_uses_spv(arch):
+    if arch == _qd_core.amdgpu or arch_uses_spv(arch) or arch_is_cpu(arch):
         return _block_reduce_any_nonzero_emulated(predicate)
     raise ValueError(f"qd.block.sync_any_nonzero is not supported for arch {arch}")
 
@@ -66,7 +85,7 @@ def sync_count_nonzero(predicate):
     arch = impl.get_runtime().prog.config().arch
     if arch == _qd_core.cuda:
         return impl.call_internal("block_barrier_count_i32", predicate, with_runtime_context=False)
-    if arch == _qd_core.amdgpu or arch_uses_spv(arch):
+    if arch == _qd_core.amdgpu or arch_uses_spv(arch) or arch_is_cpu(arch):
         return _block_reduce_count_nonzero_emulated(predicate)
     raise ValueError(f"qd.block.sync_count_nonzero is not supported for arch {arch}")
 
@@ -77,6 +96,9 @@ def mem_fence():
         return impl.call_internal("block_mem_fence", with_runtime_context=False)
     if arch_uses_spv(arch):
         return impl.call_internal("workgroupMemoryBarrier", with_runtime_context=False)
+    if arch_is_cpu(arch):
+        # Full seq_cst fence on the block's shared window (see the module note above).
+        return impl.call_internal("cpu_block_mem_fence", with_runtime_context=True)
     raise ValueError(f"qd.block.mem_fence is not supported for arch {arch}")
 
 
@@ -95,6 +117,10 @@ def thread_idx():
         return impl.call_internal("block_thread_idx", with_runtime_context=False)
     if arch_uses_spv(arch):
         return impl.call_internal("localInvocationId", with_runtime_context=False)
+    if arch_is_cpu(arch):
+        # The virtual thread index within the block ([0, block_dim)); `linear_thread_idx` reads
+        # `RuntimeContext::cpu_thread_id`, which `cpu_block_parallel_for` sets to `vt`.
+        return impl.call_internal("linear_thread_idx", with_runtime_context=True)
     raise ValueError(f"qd.block.thread_idx is not supported for arch {arch}")
 
 
@@ -108,6 +134,17 @@ def global_thread_idx():
 
 
 class SharedArray:
+    """Block-scope shared array (the per-block shared-memory window).
+
+    On GPU backends this is the hardware shared memory / threadgroup memory window of the
+    current block. On CPU it is backed by a zero-initialized module global that is concurrently
+    live only within one block: block-tier loops run one block at a time with the block's
+    virtual threads running concurrently (see the module-level note). Requires the enclosing
+    loop to be a top-level ``for`` annotated with ``qd.loop_config(block_dim=N)``, ``1 <= N <=
+    1024``, and no ``qd.rand`` in the loop body; anything else fails at kernel-compile time with
+    an explicit error (never silently).
+    """
+
     _is_quadrants_class = True
 
     def __init__(self, shape, dtype):

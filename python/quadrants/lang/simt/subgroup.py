@@ -4,9 +4,31 @@ import warnings
 
 from quadrants._lib import core as _qd_core
 from quadrants.lang import impl
+from quadrants.lang import ops as _ops
+from quadrants.lang.expr import make_constant_expr
 from quadrants.lang.kernel_impl import func
 from quadrants.types.annotations import template
-from quadrants.types.primitive_types import i32, u32
+from quadrants.types.primitive_types import i32, u32, u64
+
+# --- CPU backend: the "virtual subgroup" model ------------------------------------------
+#
+# The CPU backend has no hardware subgroups, so every running thread is defined to be its own
+# subgroup of one lane: ``subgroup.group_size()`` is 1, ``invocation_id()`` is 0, and every
+# subgroup collective degenerates to an identity (shuffle/broadcast return their input,
+# reductions return the input, scans return the input / the operator identity, ballots are bit
+# 0, ``bitonic_sort_kv`` is the identity network at ``log2_size == 0``). All of those degenerate
+# forms are compiled at *trace* time below (and, for the shuffle-butterfly ``@func`` layers in
+# ``reductions.py`` / ``sorting.py``, fall out of ``log2_group_size() == 0`` unrolling with zero
+# extra code), so a kernel written against this module runs unchanged on every backend - it just
+# observes a subgroup width of 1 on CPU. Block-scope cooperation (``qd.simt.block.SharedArray``,
+# ``block.sync()``, ``block.reduce_*``) is NOT degenerated on CPU: those lower to real
+# concurrently-running virtual threads with a real barrier (see ``block.py`` and
+# ``runtime.cpp``'s ``cpu_block_parallel_for``).
+
+
+def _cpu_backend() -> bool:
+    """True while tracing a kernel for the CPU backend (the virtual-subgroup model above)."""
+    return impl.current_cfg().arch in (_qd_core.arm64, _qd_core.x64)
 
 
 def sync():
@@ -16,9 +38,13 @@ def sync():
 
     Lowers to ``OpControlBarrier(Subgroup, Subgroup, 0)`` on SPIR-V, ``__syncwarp(0xFFFFFFFF)`` on CUDA (reconverges
     lanes that diverged under independent thread scheduling on Volta+), and ``llvm.amdgcn.wave.barrier`` on AMDGPU (a
-    compiler reordering barrier on lockstep GCN waves, a real wave-scope barrier on RDNA). The legacy name
-    ``subgroup.barrier()`` is a deprecated alias that forwards here.
+    compiler reordering barrier on lockstep GCN waves, a real wave-scope barrier on RDNA). On CPU this is a no-op: a
+    subgroup is one thread (the virtual-subgroup model), so the barrier converges trivially - use
+    ``qd.simt.block.sync()`` for a real CPU barrier. The legacy name ``subgroup.barrier()`` is a deprecated alias that
+    forwards here.
     """
+    if _cpu_backend():
+        return None
     return impl.call_internal("subgroupBarrier", with_runtime_context=False)
 
 
@@ -28,9 +54,12 @@ def mem_fence():
     Lowers to ``OpMemoryBarrier(Subgroup, AcquireRelease | UniformMemory | WorkgroupMemory)`` on SPIR-V,
     ``__threadfence_block()`` on CUDA, and ``fence syncscope("workgroup") seq_cst`` on AMDGPU. The CUDA and AMDGPU
     forms are workgroup-scope -- over-strict for the subgroup-scope ask but correct, since the subgroup is a strict
-    subset of the workgroup. Call from uniform control flow with all lanes active (same caveats as `sync`). The legacy
-    name ``subgroup.memory_barrier()`` is a deprecated alias that forwards here.
+    subset of the workgroup. On CPU this lowers to a full ``seq_cst`` fence (same over-strict-but-correct reasoning).
+    Call from uniform control flow with all lanes active (same caveats as `sync`). The legacy name
+    ``subgroup.memory_barrier()`` is a deprecated alias that forwards here.
     """
+    if _cpu_backend():
+        return impl.call_internal("cpu_block_mem_fence", with_runtime_context=True)
     return impl.call_internal("subgroupMemoryBarrier", with_runtime_context=False)
 
 
@@ -96,6 +125,8 @@ def ballot_first_n(predicate, n: template()):
       https://github.com/llvm/llvm-project/pull/71556) but in practice still fails ``Cannot select`` on gfx942 in
       LLVM 20 / 22 for non-constant predicates.  See ``codegen_amdgpu.cpp`` for the full bug + workaround comment.
     * SPIR-V: ``OpGroupNonUniformBallot`` (returns a uvec4); we extract component 0 = lanes 0..31's ballot.
+    * CPU: the subgroup is one thread (virtual-subgroup model), so the ballot is bit 0 - this
+      lane's own predicate - for every ``n >= 1``.
 
     For ``n < 32`` we mask the predicate by ``lane < n`` before issuing the ballot, so bits ``[n, 32)`` of the result
     are forced to zero regardless of what those lanes' actual predicates are.  At ``n == 32`` the masking is provably
@@ -105,6 +136,8 @@ def ballot_first_n(predicate, n: template()):
     Caller contract: uniform CF + all lanes active.  If you need a mask covering more than 32 lanes (for wave64
     callers who want the full subgroup), use `ballot` and check the high 32 bits.
     """
+    if impl.static(_cpu_backend()):
+        return _ops.cast(predicate != 0, u32)
     if impl.static(n == 32):
         return impl.call_internal("subgroupBallotU32", predicate, with_runtime_context=False)
     lane = invocation_id()
@@ -131,7 +164,12 @@ def ballot(predicate):
       respectively) and pack them: ``u64(hi) << 32 | u64(lo)``.
 
     Caller contract: uniform CF + all lanes active.
+
+    On CPU the subgroup is one thread (virtual-subgroup model), so the ballot is bit 0: this lane's
+    own predicate.
     """
+    if _cpu_backend():
+        return _ops.cast(predicate != 0, u64)
     return impl.call_internal("subgroupBallotU64", predicate, with_runtime_context=False)
 
 
@@ -256,7 +294,12 @@ def broadcast(value, index):
     ``OpGroupNonUniformBroadcast`` requires it; passing a per-lane-varying ``index`` is undefined behaviour. On CUDA /
     AMDGPU, ``index`` may vary per lane and the call is identical to ``shuffle(value, index)``; use `shuffle` directly
     if you need a per-lane-varying source lane.
+
+    On CPU the subgroup is one thread (virtual-subgroup model), so the only broadcastable lane is
+    the thread itself and the call returns ``value`` unchanged.
     """
+    if _cpu_backend():
+        return value
     return impl.call_internal("subgroupBroadcast", value, index, with_runtime_context=False)
 
 
@@ -347,6 +390,10 @@ def group_size() -> int:
     backend, including SPIR-V (so MoltenVK / desktop Vulkan see a literal subgroup size rather than a runtime
     ``OpLoad`` of ``BuiltInSubgroupSize``). Calling it from plain host Python after ``qd.init()`` is also legal and
     returns the same number, which is handy for setting up grid dimensions on the host side.
+
+    On CPU this returns ``1``: every thread is its own subgroup (the virtual-subgroup model), so
+    kernels branching on ``group_size()`` (e.g. via ``qd.static``) specialize to the one-lane form
+    automatically.
     """
     return impl.get_runtime().prog.subgroup_size()
 
@@ -369,7 +416,11 @@ def invocation_id():
 
     Used both as a lane id when computing a target lane for `shuffle` / `broadcast`, and as a per-lane identifier in
     cooperative algorithms.
+
+    On CPU this is the constant ``0``: every thread is its own subgroup (virtual-subgroup model).
     """
+    if _cpu_backend():
+        return make_constant_expr(0, i32)
     return impl.call_internal("subgroupInvocationId", with_runtime_context=False)
 
 
@@ -390,7 +441,12 @@ def shuffle(value, index):
     ``ds_bpermute``; wave64 shuffles that cross the 32-lane boundary use a single wave-wide ``ds_bpermute`` on CDNA, or
     a ``permlane64 + ds_bpermute + select`` sequence on RDNA (a few extra cycles). See the cross-half lowering comments
     in ``runtime.cpp`` for the per-ISA details.
+
+    On CPU the subgroup is one thread (virtual-subgroup model): the only readable lane is the
+    thread itself, so the call returns ``value`` unchanged.
     """
+    if _cpu_backend():
+        return value
     return impl.call_internal("subgroupShuffle", value, index, with_runtime_context=False)
 
 
@@ -414,8 +470,10 @@ def shuffle_up(value, offset):
     (typically their own ``value``), so the bottom ``offset`` lanes' results should be ignored or masked. Same dtype
     rules as `shuffle`; ``offset`` is a ``u32``. Lowers to ``__shfl_up_sync`` on CUDA and ``OpGroupNonUniformShuffleUp``
     on SPIR-V; on AMDGPU it is emulated with ``ds_bpermute``, with wave64 cross-half cases handled the same way as
-    `shuffle`.
+    `shuffle`. On CPU (one-thread subgroups) the call returns ``value`` unchanged.
     """
+    if _cpu_backend():
+        return value
     return impl.call_internal("subgroupShuffleUp", value, offset, with_runtime_context=False)
 
 
@@ -426,8 +484,11 @@ def shuffle_down(value, offset):
     value (typically their own ``value``), so reduction patterns must only trust lane 0's final result or mask out the
     out-of-range lanes. Same dtype rules as `shuffle`; ``offset`` is a ``u32``. Lowers to ``__shfl_down_sync`` on CUDA
     and ``OpGroupNonUniformShuffleDown`` on SPIR-V; on AMDGPU it is emulated with ``ds_bpermute``, with wave64
-    cross-half cases handled the same way as `shuffle`.
+    cross-half cases handled the same way as `shuffle`. On CPU (one-thread subgroups) the call returns ``value``
+    unchanged.
     """
+    if _cpu_backend():
+        return value
     return impl.call_internal("subgroupShuffleDown", value, offset, with_runtime_context=False)
 
 

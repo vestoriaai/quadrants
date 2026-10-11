@@ -289,14 +289,20 @@ StreamSemaphore Program::flush() {
 }
 
 int Program::subgroup_size() const {
-  // CUDA / AMDGPU / x64 have arch-fixed subgroup widths; ``subgroup_size(Arch)`` returns those constants directly so we
-  // don't need to consult the device caps.  Returns 0 for x64 (no subgroup model on CPU) which is fine for the cache
-  // key path; SIMT calls that try to lower e.g. ``group_size()`` on x64 would fail elsewhere first.
+  // CUDA / AMDGPU / CPU have arch-fixed subgroup widths; ``subgroup_size(Arch)`` returns those constants directly so we
+  // don't need to consult the device caps.
   if (compile_config_.arch == Arch::cuda) {
     return kCudaWarpSize;
   }
   if (compile_config_.arch == Arch::amdgpu) {
     return kAmdgpuWaveSize;
+  }
+  if (arch_is_cpu(compile_config_.arch)) {
+    // CPU backend: every thread is its own subgroup (the "virtual subgroup" model documented in
+    // ``qd.simt.subgroup``'s user guide) - all subgroup collectives degenerate to identities and
+    // ``log2_group_size()`` (used as the ``log2_size`` template argument by the full-subgroup
+    // wrappers) is 0, which every shuffle-butterfly unrolls to a no-op.
+    return 1;
   }
   // Vulkan / Metal: read the value the device-creation path probed into ``DeviceCapability::spirv_subgroup_size``.
   // ``get_device_caps`` is a copy, but the call is cold (called from

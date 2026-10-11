@@ -62,6 +62,17 @@ class MakeCPUMultithreadedRangeFor : public BasicStmtVisitor {
       return;
     }
 
+    // CPU block-tier ("virtual block") tasks - a `qd.simt.block.SharedArray` or a
+    // `qd.simt.block.sync()` / `mem_fence()` in the body - must keep their user-level
+    // [begin, end) range and `block_dim`: `cpu_block_parallel_for` (runtime.cpp) maps one GPU
+    // block to `block_dim` concurrently-running virtual threads per chunk of the user range,
+    // which requires the un-chunked form this pass would otherwise destroy (it rewrites the
+    // offloaded range to [0, cpu_max_num_threads) with block_dim=1 and nests the user loop as a
+    // serial inner loop). codegen_cpu.cpp dispatches these tasks to `cpu_block_parallel_for`.
+    if (offloaded->uses_block_tier_ops()) {
+      return;
+    }
+
     auto offloaded_body = std::make_unique<Block>();
     auto one = offloaded_body->insert(Stmt::make_typed<ConstStmt>(TypedConstant(PrimitiveType::i32, 1)));
     auto minimal_block_range =

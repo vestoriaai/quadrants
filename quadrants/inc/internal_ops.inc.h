@@ -19,6 +19,13 @@ PER_INTERNAL_OP(do_nothing)
 PER_INTERNAL_OP(refresh_counter)
 PER_INTERNAL_OP(test_internal_func_args)
 
+// CPU block-tier ("virtual block") support. `qd.simt.block.sync()` / `mem_fence()` dispatch to
+// these on the CPU backend (see python/quadrants/lang/simt/block.py); the runtime
+// implementations live in runtime.cpp (`cpu_block_barrier` waits on the per-block barrier
+// published in `RuntimeContext::block_barrier` by `cpu_block_parallel_for`).
+PER_INTERNAL_OP(cpu_block_barrier)
+PER_INTERNAL_OP(cpu_block_mem_fence)
+
 // SPIRV
 PER_INTERNAL_OP(workgroupBarrier)
 PER_INTERNAL_OP(workgroupMemoryBarrier)

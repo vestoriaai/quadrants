@@ -2,27 +2,27 @@
 
 Block-level primitives operate on the threads of a single CUDA thread block (CTA) / AMDGPU workgroup / Vulkan or Metal workgroup. They include thread barriers, memory fences, shared memory, and per-thread indexing helpers - the building blocks for cooperation among threads of the same block.
 
-Block ops live under `qd.simt.block`. They are written so the same Python source compiles to the right vendor primitive on each backend. As of this writing every op on this page is portable across CUDA, AMDGPU, Vulkan, and Metal; the only remaining caveat (called out in the support-table footnote below) is a perf trade-off for the emulated `block.sync_*_nonzero` ops on non-CUDA backends, not a correctness gap. If a future op is added that is not yet portable, the Python layer will raise `ValueError` at compile time on the unsupported backend.
+Block ops live under `qd.simt.block`. They are written so the same Python source compiles to the right vendor primitive on each backend. As of this writing every op on this page is portable across CUDA, AMDGPU, Vulkan, Metal, and CPU (on CPU a block is a set of concurrently-running virtual threads - see [CPU backend: virtual blocks](#cpu-backend-virtual-blocks); only `block.global_thread_idx()` raises there); the only remaining caveat (called out in the support-table footnote below) is a perf trade-off for the emulated `block.sync_*_nonzero` ops on non-CUDA backends, not a correctness gap. If a future op is added that is not yet portable, the Python layer will raise `ValueError` at compile time on the unsupported backend.
 
 The closely-related device-scope memory fence is documented separately in [grid](grid.md). Users picking between a block-scope and a device-scope fence should read that page for the device-scope side.
 
 ## What's available
 
-| Op                                              | CUDA | AMDGPU  | Vulkan | Metal |
-|-------------------------------------------------|------|---------|--------|-------|
-| `block.sync()`                                  | yes  | yes     | yes    | yes   |
-| `block.sync_all_nonzero(predicate)`             | yes  | yes\*   | yes\*  | yes\* |
-| `block.sync_any_nonzero(predicate)`             | yes  | yes\*   | yes\*  | yes\* |
-| `block.sync_count_nonzero(predicate)`           | yes  | yes\*   | yes\*  | yes\* |
-| `block.mem_fence()`                             | yes  | yes     | yes    | yes   |
-| `block.SharedArray(shape, dtype)`               | yes  | yes     | yes    | yes   |
-| `block.global_thread_idx()`                     | yes  | yes     | yes    | yes   |
-| `block.thread_idx()`                            | yes  | yes     | yes    | yes   |
-| `block.reduce_{add,min,max}(v, block_dim, dtype)`     | yes  | yes    | yes    | yes   |
-| `block.reduce_all_{add,min,max}(v, block_dim, dtype)` | yes  | yes    | yes    | yes   |
-| `block.inclusive_{add,min,max}(v, block_dim, dtype)`  | yes  | yes    | yes    | yes   |
-| `block.exclusive_{add,min,max}(v, block_dim, ...)`    | yes  | yes    | yes    | yes   |
-| `block.radix_rank_match_atomic_or(...)`               | yes  | yes    | yes    | yes   |
+| Op                                                    | CUDA | AMDGPU  | Vulkan | Metal | CPU        |
+|-------------------------------------------------------|------|---------|--------|-------|------------|
+| `block.sync()`                                        | yes  | yes     | yes    | yes   | yes        |
+| `block.sync_all_nonzero(predicate)`                   | yes  | yes\*   | yes\*  | yes\* | yes\*      |
+| `block.sync_any_nonzero(predicate)`                   | yes  | yes\*   | yes\*  | yes\* | yes\*      |
+| `block.sync_count_nonzero(predicate)`                 | yes  | yes\*   | yes\*  | yes\* | yes\*      |
+| `block.mem_fence()`                                   | yes  | yes     | yes    | yes   | yes        |
+| `block.SharedArray(shape, dtype)`                     | yes  | yes     | yes    | yes   | yes        |
+| `block.global_thread_idx()`                           | yes  | yes     | yes    | yes   | no (raises)|
+| `block.thread_idx()`                                  | yes  | yes     | yes    | yes   | yes        |
+| `block.reduce_{add,min,max}(v, block_dim, dtype)`     | yes  | yes     | yes    | yes   | yes        |
+| `block.reduce_all_{add,min,max}(v, block_dim, dtype)` | yes  | yes     | yes    | yes   | yes        |
+| `block.inclusive_{add,min,max}(v, block_dim, dtype)`  | yes  | yes     | yes    | yes   | yes        |
+| `block.exclusive_{add,min,max}(v, block_dim, ...)`    | yes  | yes     | yes    | yes   | yes        |
+| `block.radix_rank_match_atomic_or(...)`               | yes  | yes     | yes    | yes   | yes        |
 
 Vulkan and Metal share a SPIR-V codegen path (Metal goes through MoltenVK → MSL); they are listed as separate columns because a couple of ops have Metal-specific caveats called out below. Footnoted entries are still functional, just with the limitations the footnote describes.
 
@@ -33,6 +33,14 @@ Vulkan and Metal share a SPIR-V codegen path (Metal goes through MoltenVK → MS
 The `block.reduce_*` / `block.reduce_all_*` / `block.inclusive_*` / `block.exclusive_*` ops are `value`-dtype generic - the per-subgroup tree is `subgroup.shuffle*` of `value` and the inter-subgroup staging slot is `block.SharedArray(..., dtype)`, so any scalar dtype Quadrants supports for buffer / kernel I/O on the active backend is accepted. Practically that is `i32` / `i64` / `u32` / `u64` / `f32` / `f64` on CUDA, AMDGPU, and Vulkan-on-Linux; Metal and MoltenVK on Darwin do not support `i64` / `u64` / `f64` through their MSL/SPIR-V buffer paths, so kernels using those dtypes won't compile there. Note also that none of the reduce / scan ops use `atomic_min` / `atomic_max` on floats (which would fall back to a CAS loop on every backend) - they reduce via `shuffle*` + per-thread folds in shared memory only.
 
 Naming note: `block.mem_sync()` was recently renamed to `block.mem_fence()` for consistency with the project's "fence vs barrier" terminology. The old name is still available as a deprecated alias that emits `DeprecationWarning` on first use; new code should use `block.mem_fence()`.
+
+## CPU backend: virtual blocks
+
+On the CPU backend a block is a set of **concurrently-running virtual threads**. A top-level `for` annotated with `qd.loop_config(block_dim=N)` whose body touches `block.SharedArray` / `block.sync()` / any block collective runs one block at a time, with the block's `N` virtual threads running on `N` OS threads: `block.thread_idx()` is the virtual thread index (`0..N-1`), iteration `i` of the user range is handled by virtual thread `i % N` of block `i // N`, and `block.sync()` is a real barrier (convergence + cross-thread memory visibility). The `SharedArray` is the block-scoped window - blocks are joined before the next one starts, so it never carries state across blocks (GPU leaves shared memory uninitialized between blocks; CPU keeps it zero-initialized, which is strictly more defined and invisible to barrier-separated kernels).
+
+With this in place every block collective on this page runs unchanged on CPU: subgroup size is 1 there, so each thread simply publishes its own slot to the shared-memory staging array and the fold happens at thread 0. Integer results are bitwise; floating-point block reductions fold sequentially on CPU (deterministic across launches) vs. tree reductions on GPU (reassociation bucket, ~1e-7 relative) - compare cross-backend FP results with a tolerance, not bitwise (same contract as the vectorized-loop paths).
+
+Requirements: `block_dim` a power of two in `[1, 1024]`, on a top-level range-for. Misuse fails at kernel-compile time with an explicit error - a serial / non-range-for loop carrying block-tier ops, `qd.random` inside a block-tier loop (rand states are pool-thread-indexed), or `block_dim` out of range are all loudly rejected; there is no silent-miscompute path. `block.global_thread_idx()` is the one op without a CPU mapping and raises, as before.
 
 ## Barrier vs fence: the distinction that matters
 
@@ -46,6 +54,7 @@ Concretely:
 - CUDA: `sync()` lowers to `__syncthreads()`; `mem_fence()` lowers to `__threadfence_block()` (a pure fence with no convergence requirement).
 - AMDGPU: `sync()` lowers to `s_barrier`; `mem_fence()` lowers to `fence acquire_release syncscope("workgroup")`.
 - Vulkan / Metal (SPIR-V): `sync()` lowers to `workgroupBarrier`; `mem_fence()` lowers to `workgroupMemoryBarrier`.
+- CPU: `sync()` lowers to `cpu_block_barrier` (a mutex/condvar generation barrier over the block's virtual threads - convergence and happens-before in one); `mem_fence()` lowers to `cpu_block_mem_fence` (a full `seq_cst` fence).
 
 Calling `sync()` from a path that not all threads reach (a divergent `if`, an early `return`, etc.) is a classic GPU deadlock and applies to all backends.
 

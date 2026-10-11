@@ -184,6 +184,42 @@ void compile_to_offloads(IRNode *ir,
     irpass::determine_ad_stack_size(ir, config);
     print("Autodiff stack size determined");
   }
+
+
+  // CPU block-tier ("virtual block") contract validation. Deliberately at the end of
+  // `compile_to_offloads`, which runs on the main compile thread: `KernelCodeGen::compile_kernel_to_module`
+  // clones each offloaded task onto a compilation worker (`ParallelExecutor`) and re-runs
+  // `offload_to_executable` there per task, and an exception escaping a worker thread aborts
+  // the process instead of surfacing as a Python compile error (`QD_ERROR` throws a
+  // `std::string`, which only translates on the main thread). Misused block-tier ops must
+  // therefore be rejected here, where the error propagates cleanly. codegen_cpu.cpp carries a
+  // mirrored last-resort guard.
+  if (arch_is_cpu(config.arch)) {
+    if (auto *root = ir->cast<Block>()) {
+      for (auto &s : root->statements) {
+        if (auto *offloaded = s->cast<OffloadedStmt>(); offloaded && offloaded->uses_block_tier_ops()) {
+          using Type = OffloadedStmt::TaskType;
+          if (offloaded->task_type != Type::range_for) {
+            QD_ERROR(
+                "CPU block-tier ops (qd.simt.block.SharedArray / block.sync / block.mem_fence) require a top-level "
+                "`for` annotated with qd.loop_config(block_dim=N); this loop is a {}",
+                OffloadedStmt::task_type_name(offloaded->task_type));
+          }
+          if (offloaded->uses_rand_stmt()) {
+            QD_ERROR(
+                "qd.random inside a CPU block-tier loop is not supported: rand states are indexed by the pool thread "
+                "id, which block-tier virtual threads (up to block_dim-1) would index out of bounds");
+          }
+          if (offloaded->block_dim <= 0 || offloaded->block_dim > 1024) {
+            QD_ERROR(
+                "CPU block-tier loops need qd.loop_config(block_dim=N) with 1 <= N <= 1024 (one std::thread per "
+                "virtual thread per block; N must be a power of two), but block_dim is {}",
+                offloaded->block_dim);
+          }
+        }
+      }
+    }
+  }
 }
 
 void offload_to_executable(IRNode *ir,

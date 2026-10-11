@@ -143,12 +143,70 @@ class TaskCodeGenCPU : public TaskCodeGenLLVM {
     bls_buffer->setInitializer(llvm::UndefValue::get(type));
   }
 
+  // CPU block-tier ("virtual block") dispatch: tasks whose body uses a `qd.simt.block.SharedArray`
+  // or a `qd.simt.block.sync()` / `mem_fence()` run through `cpu_block_parallel_for` (runtime.cpp),
+  // which realizes the GPU block contract literally - one block's `block_dim` virtual threads run
+  // concurrently (one std::thread each, `vt` = `block.thread_idx()`), the block barrier converges
+  // them, and the addrspace(0) globals `TaskCodeGenLLVM::visit(AllocaStmt)` emits for shared
+  // allocas act as the per-block shared-memory window (blocks never overlap in time).
+  void create_offload_block_range_for(OffloadedStmt *stmt) {
+    int step = stmt->reversed ? -1 : 1;
+
+    auto *tls_prologue = create_xlogue(stmt->tls_prologue);
+
+    // The loop body - identical shape to `create_offload_range_for`: a function
+    // (RuntimeContext *, tls, loop_var) called once per (block, virtual thread) pair.
+    llvm::Function *body;
+    {
+      auto guard =
+          get_function_creation_guard({llvm::PointerType::get(get_runtime_type("RuntimeContext"), 0),
+                                       llvm::PointerType::getUnqual(*llvm_context), tlctx->get_data_type<int>()});
+
+      auto loop_var = create_entry_block_alloca(PrimitiveType::i32);
+      loop_vars_llvm[stmt].push_back(loop_var);
+      builder->CreateStore(get_arg(2), loop_var);
+      stmt->body->accept(this);
+
+      body = guard.body;
+    }
+
+    llvm::Value *epilogue = create_xlogue(stmt->tls_epilogue);
+
+    auto [begin, end] = get_range_for_bounds(stmt);
+
+    call("cpu_block_parallel_for", get_arg(0), begin, end, tlctx->get_constant(step),
+         tlctx->get_constant(stmt->block_dim), tls_prologue, body, epilogue, tlctx->get_constant(stmt->tls_size));
+  }
+
   void visit(OffloadedStmt *stmt) override {
     QD_ASSERT(current_offload == nullptr);
     current_offload = stmt;
     if (stmt->bls_size > 0)
       create_bls_buffer(stmt);
     using Type = OffloadedStmt::TaskType;
+    // Block-tier classification + last-resort contract guards. The authoritative validation
+    // runs on the main compile thread at the end of `irpass::compile_to_offloads` (errors
+    // thrown from this per-task codegen run on a `ParallelExecutor` worker, where a throw
+    // cannot reach Python); anything that still reaches this point is a pipeline invariant
+    // violation.
+    const bool block_tier = stmt->uses_block_tier_ops();
+    if (block_tier) {
+      if (stmt->task_type != Type::range_for) {
+        QD_ERROR(
+            "CPU block-tier ops (qd.simt.block.SharedArray / block.sync / block.mem_fence) require a top-level "
+            "`for` annotated with qd.loop_config(block_dim=N); this task is a {}",
+            OffloadedStmt::task_type_name(stmt->task_type));
+      } else if (stmt->uses_rand_stmt()) {
+        QD_ERROR(
+            "qd.random inside a CPU block-tier loop is not supported: rand states are indexed by the pool thread id, "
+            "which block-tier virtual threads (up to block_dim-1) would index out of bounds");
+      } else if (stmt->block_dim <= 0 || stmt->block_dim > 1024) {
+        QD_ERROR(
+            "CPU block-tier loops need qd.loop_config(block_dim=N) with 1 <= N <= 1024 (one std::thread per virtual "
+            "thread per block; N must be a power of two), but block_dim is {}",
+            stmt->block_dim);
+      }
+    }
     auto offloaded_task_name = init_offloaded_task_function(stmt);
     if (compile_config.kernel_profiler && arch_is_cpu(compile_config.arch)) {
       call("LLVMRuntime_profiler_start", get_runtime(), builder->CreateGlobalStringPtr(offloaded_task_name));
@@ -156,7 +214,11 @@ class TaskCodeGenCPU : public TaskCodeGenLLVM {
     if (stmt->task_type == Type::serial) {
       stmt->body->accept(this);
     } else if (stmt->task_type == Type::range_for) {
-      create_offload_range_for(stmt);
+      if (block_tier) {
+        create_offload_block_range_for(stmt);
+      } else {
+        create_offload_range_for(stmt);
+      }
     } else if (stmt->task_type == Type::mesh_for) {
       create_offload_mesh_for(stmt);
     } else if (stmt->task_type == Type::struct_for) {
@@ -183,6 +245,11 @@ class TaskCodeGenCPU : public TaskCodeGenLLVM {
       int cpu_threads = 1;
       if (stmt->task_type != OffloadedStmt::TaskType::serial && stmt->num_cpu_threads > 0) {
         cpu_threads = stmt->num_cpu_threads;
+      }
+      // Block-tier virtual threads run with cpu_thread_id = vt in [0, block_dim), so the
+      // per-thread adstack slot space must cover the block width, not just the pool size.
+      if (stmt->uses_block_tier_ops()) {
+        cpu_threads = std::max(cpu_threads, stmt->block_dim);
       }
       current_task->ad_stack.static_num_threads = static_cast<std::size_t>(cpu_threads);
     }

@@ -2,7 +2,7 @@
 
 Subgroup operations let threads within the same subgroup (warp on NVIDIA, wave on AMD, subgroup on Vulkan / Metal) cooperate directly - exchanging register values, voting on predicates, scanning, and electing a leader - without going through shared memory or block barriers. They are the building block for fast in-warp data exchange and are used internally by `Tile16x16` and `Tile32x32` (see [tile](tile.md)).
 
-Subgroup ops live under `qd.simt.subgroup` and are written so the same Python source compiles to the right vendor primitive on each backend. Calling a backend that has not implemented an op fails when the kernel is compiled, not silently at runtime.
+Subgroup ops live under `qd.simt.subgroup` and are written so the same Python source compiles to the right vendor primitive on each backend. Calling a backend that has not implemented an op fails when the kernel is compiled, not silently at runtime. On the CPU backend every thread is its own subgroup (the [virtual-subgroup model](#cpu-backend-semantics)); all ops below are available there and degrade to the one-lane identities described on that page.
 
 This page is a high-level tour: what each op does, how the pieces fit together, and what to expect performance-wise. The complete per-op reference - exact signatures, dtype support, per-backend behavior, and caller contracts - is generated from the docstrings in the API reference: {py:mod}`quadrants.lang.simt.subgroup` (data movement, identification / control, voting, and lane masks), {py:mod}`quadrants.lang.simt.reductions` (reductions and scans), and {py:mod}`quadrants.lang.simt.sorting` (sorting).
 
@@ -12,16 +12,16 @@ Every op is listed below, grouped by category, with the backends that currently 
 
 ### Data movement
 
-| Op                                          | CUDA | AMDGPU | SPIR-V (Vulkan / Metal) | dtypes                       |
-|---------------------------------------------|------|--------|-------------------------|------------------------------|
-| `subgroup.shuffle(value, index)`            | yes  | yes    | yes                     | i32, u32, f32, f64, i64, u64 |
-| `subgroup.shuffle_down(value, offset)`      | yes  | yes\*  | yes                     | i32, u32, f32, f64, i64, u64 |
-| `subgroup.shuffle_up(value, offset)`        | yes  | yes\*  | yes                     | i32, u32, f32, f64, i64, u64 |
-| `subgroup.shuffle_xor(value, mask)`         | yes  | yes    | yes                     | i32, u32, f32, f64, i64, u64 |
-| `subgroup.broadcast(value, index)`          | yes  | yes    | yes                     | i32, u32, f32, f64, i64, u64 |
-| `subgroup.broadcast_first(value)`           | yes  | yes    | yes                     | i32, u32, f32, f64, i64, u64 |
+| Op                                          | CUDA | AMDGPU | SPIR-V (Vulkan / Metal) | CPU | dtypes                       |
+|---------------------------------------------|------|--------|-------------------------|-----|------------------------------|
+| `subgroup.shuffle(value, index)`            | yes  | yes    | yes                     | yes\*  | i32, u32, f32, f64, i64, u64 |
+| `subgroup.shuffle_down(value, offset)`      | yes  | yes\*  | yes                     | yes\*  | i32, u32, f32, f64, i64, u64 |
+| `subgroup.shuffle_up(value, offset)`        | yes  | yes\*  | yes                     | yes\*  | i32, u32, f32, f64, i64, u64 |
+| `subgroup.shuffle_xor(value, mask)`         | yes  | yes    | yes                     | yes\*  | i32, u32, f32, f64, i64, u64 |
+| `subgroup.broadcast(value, index)`          | yes  | yes    | yes                     | yes\*  | i32, u32, f32, f64, i64, u64 |
+| `subgroup.broadcast_first(value)`           | yes  | yes    | yes                     | yes\*  | i32, u32, f32, f64, i64, u64 |
 
-\* On AMDGPU, `shuffle_down` / `shuffle_up` use a slower cross-lane path rather than a single-cycle register move - see [Performance notes](#performance-notes) for cycle counts.
+\* On AMDGPU, `shuffle_down` / `shuffle_up` use a slower cross-lane path rather than a single-cycle register move - see [Performance notes](#performance-notes) for cycle counts. On CPU every data-movement op returns its input unchanged (the subgroup is one thread).
 
 `shuffle_xor` and `broadcast_first` are portable wrappers over `shuffle` / `broadcast` (`shuffle_xor(value, mask)` ≡ `shuffle(value, lane ^ mask)`; `broadcast_first(value)` ≡ `broadcast(value, qd.u32(0))`). They inline at compile time and run wherever the underlying op runs.
 
@@ -29,14 +29,14 @@ Every op is listed below, grouped by category, with the backends that currently 
 
 ### Identification and control
 
-| Op                                          | CUDA    | AMDGPU  | SPIR-V (Vulkan / Metal) |
-|---------------------------------------------|---------|---------|-------------------------|
-| `subgroup.invocation_id()`                  | yes     | yes     | yes                     |
-| `subgroup.group_size()`                     | yes     | yes     | yes                     |
-| `subgroup.log2_group_size()`                | yes     | yes     | yes                     |
-| `subgroup.elect()`                          | yes     | yes     | yes                     |
-| `subgroup.sync()`                           | yes     | yes     | yes                     |
-| `subgroup.mem_fence()`                      | yes\*\* | yes\*\* | yes                     |
+| Op                                          | CUDA    | AMDGPU  | SPIR-V (Vulkan / Metal) | CPU        |
+|---------------------------------------------|---------|---------|-------------------------|------------|
+| `subgroup.invocation_id()`                  | yes     | yes     | yes                     | yes (0)    |
+| `subgroup.group_size()`                     | yes     | yes     | yes                     | yes (1)    |
+| `subgroup.log2_group_size()`                | yes     | yes     | yes                     | yes (0)    |
+| `subgroup.elect()`                          | yes     | yes     | yes                     | yes (1)    |
+| `subgroup.sync()`                           | yes     | yes     | yes                     | yes (no-op)|
+| `subgroup.mem_fence()`                      | yes\*\* | yes\*\* | yes                     | yes (fence)|
 
 Default scope: every op in this module operates over the **full active subgroup** (32 lanes on wave32, 64 on wave64) unless its name carries a `_tiled` suffix. The `_tiled` variants take an extra `log2_size` template argument and split the subgroup into independent `2**log2_size`-aligned tiles - see [Tiled variants](#tiled-variants).
 
@@ -57,13 +57,13 @@ The `barrier()` / `memory_barrier()` / `ballot_full_subgroup()` names remain as 
 
 `all_true(p)` / `any_true(p)` / `all_equal(v)` vote across the entire subgroup and broadcast the `i32` (`0` or `1`) result to every lane. The two `ballot` variants return a lane-per-bit mask: `ballot_first_n(predicate, n)` returns a `u32` covering lanes `[0, n)` (with `n` a compile-time constant `<= 32`), and `ballot(predicate)` returns a `u64` covering every lane in the subgroup (32 lanes on wave32, 64 on wave64). `lanemask_{lt,le,eq,gt,ge}(lane_id)` are closed-form `u32` lane-mask constants.
 
-| Op                                            | CUDA | AMDGPU | SPIR-V (Vulkan / Metal) |
-|-----------------------------------------------|------|--------|-------------------------|
-| `subgroup.ballot_first_n(predicate, n)`       | yes  | yes    | yes                     |
-| `subgroup.ballot(predicate)`                  | yes  | yes    | yes                     |
-| `subgroup.{all,any}_true(predicate)`          | yes  | yes    | yes                     |
-| `subgroup.all_equal(value)`                   | yes  | yes    | yes                     |
-| `subgroup.lanemask_{lt,le,eq,gt,ge}(lane_id)` | yes  | yes    | yes                     |
+| Op                                            | CUDA | AMDGPU | SPIR-V (Vulkan / Metal) | CPU            |
+|-----------------------------------------------|------|--------|-------------------------|----------------|
+| `subgroup.ballot_first_n(predicate, n)`       | yes  | yes    | yes                     | yes (bit 0)    |
+| `subgroup.ballot(predicate)`                  | yes  | yes    | yes                     | yes (bit 0)    |
+| `subgroup.{all,any}_true(predicate)`          | yes  | yes    | yes                     | yes (= pred)   |
+| `subgroup.all_equal(value)`                   | yes  | yes    | yes                     | yes (1)        |
+| `subgroup.lanemask_{lt,le,eq,gt,ge}(lane_id)` | yes  | yes    | yes                     | yes            |
 
 `all_equal` uses the backend's native `==`, so for floats `NaN != NaN` and `+0.0 == -0.0`. Bit-cast to a same-width integer dtype first if you need bit-equality on floats.
 
@@ -71,16 +71,16 @@ The `barrier()` / `memory_barrier()` / `ballot_full_subgroup()` names remain as 
 
 `reduce_*` returns the reduction in lane 0 (other lanes are undefined); `reduce_all_*` broadcasts the reduction to every lane in the subgroup. `inclusive_*` / `exclusive_*` produce the per-lane prefix; lane `i` ends up with the scan of `value[0..i]` (inclusive) or `value[0..i-1]` (exclusive). `segmented_reduce_*` resets the scan at every `head_flag != 0` and returns the per-segment inclusive reduction in every lane of that segment.
 
-| Op                                                   | CUDA | AMDGPU | SPIR-V (Vulkan / Metal) | dtypes                                                  |
-|------------------------------------------------------|------|--------|-------------------------|---------------------------------------------------------|
-| `subgroup.reduce_add(v)`                             | yes  | yes\*  | yes                     | any type supporting `+`                                 |
-| `subgroup.reduce_all_add(v)`                         | yes  | yes    | yes                     | any type supporting `+`                                 |
-| `subgroup.segmented_reduce_add(v, head_flag)`        | yes  | yes\*  | yes                     | any type supporting `+`                                 |
-| `subgroup.reduce_{min,max}(v)`                       | yes  | yes\*  | yes                     | integer + float                                         |
-| `subgroup.reduce_all_{min,max}(v)`                   | yes  | yes    | yes                     | integer + float                                         |
-| `subgroup.segmented_reduce_{min,max}(v, head_flag)`  | yes  | yes\*  | yes                     | integer + float                                         |
-| `subgroup.inclusive_{add,mul,min,max,and,or,xor}(v)` | yes  | yes\*  | yes                     | integer + float (`_and` / `_or` / `_xor`: integer only) |
-| `subgroup.exclusive_{add,mul,min,max,and,or,xor}(v)` | yes  | yes\*  | yes                     | integer + float (`_and` / `_or` / `_xor`: integer only) |
+| Op                                                   | CUDA | AMDGPU | SPIR-V (Vulkan / Metal) | CPU           | dtypes                                                  |
+|------------------------------------------------------|------|--------|-------------------------|---------------|---------------------------------------------------------|
+| `subgroup.reduce_add(v)`                             | yes  | yes\*  | yes                     | yes (= v)     | any type supporting `+`                                 |
+| `subgroup.reduce_all_add(v)`                         | yes  | yes    | yes                     | yes (= v)     | any type supporting `+`                                 |
+| `subgroup.segmented_reduce_add(v, head_flag)`        | yes  | yes\*  | yes                     | yes (= v)     | any type supporting `+`                                 |
+| `subgroup.reduce_{min,max}(v)`                       | yes  | yes\*  | yes                     | yes (= v)     | integer + float                                         |
+| `subgroup.reduce_all_{min,max}(v)`                   | yes  | yes    | yes                     | yes (= v)     | integer + float                                         |
+| `subgroup.segmented_reduce_{min,max}(v, head_flag)`  | yes  | yes\*  | yes                     | yes (= v)     | integer + float                                         |
+| `subgroup.inclusive_{add,mul,min,max,and,or,xor}(v)` | yes  | yes\*  | yes                     | yes (= v)     | integer + float (`_and` / `_or` / `_xor`: integer only) |
+| `subgroup.exclusive_{add,mul,min,max,and,or,xor}(v)` | yes  | yes\*  | yes                     | yes (identity)| integer + float (`_and` / `_or` / `_xor`: integer only) |
 
 \* On AMDGPU these use a slower cross-lane path (~tens of cycles per step) - see [Performance notes](#performance-notes).
 
@@ -92,9 +92,9 @@ Float NaN handling for `min` / `max` reductions is implementation-defined (CUDA 
 
 In-register key/value sort across the subgroup, one `(key, value)` pair per lane. Pure `shuffle` - no shared memory, no barriers - fully unrolled at compile time.
 
-| Op                                     | CUDA | AMDGPU | SPIR-V (Vulkan / Metal) | dtypes                                                          |
-|----------------------------------------|------|--------|-------------------------|-----------------------------------------------------------------|
-| `subgroup.bitonic_sort_kv(key, value)` | yes  | yes    | yes                     | key & value: i32, u32, f32, f64, i64, u64 (independently typed) |
+| Op                                     | CUDA | AMDGPU | SPIR-V (Vulkan / Metal) | CPU          | dtypes                                                          |
+|----------------------------------------|------|--------|-------------------------|--------------|-----------------------------------------------------------------|
+| `subgroup.bitonic_sort_kv(key, value)` | yes  | yes    | yes                     | yes (identity)| key & value: i32, u32, f32, f64, i64, u64 (independently typed) |
 
 Returns `(key, value)` - assign with `key, value = subgroup.bitonic_sort_kv(key, value)`. Sorts ascending on the `(key, value)` lex tuple; ties on `key` break on ascending `value` (not a textbook-stable sort - equal-keyed lanes come back in ascending-`value` order, not in original-lane order). Tiled variant: `bitonic_sort_kv_tiled(key, value, log2_size)` runs the same sort independently on each `2**log2_size`-aligned tile - see [Tiled variants](#tiled-variants). See [Bitonic key/value sort example](#bitonic-keyvalue-sort-example) for the short-input (sentinel-padding) pattern; the docstring covers the float-NaN and stability caveats in full.
 
@@ -107,6 +107,7 @@ Returns `(key, value)` - assign with `key, value = subgroup.bitonic_sort_kv(key,
 | CUDA                    | `32` (every sm_30+ NVIDIA arch)                                          |
 | AMDGPU                  | `64` (every AMDGPU target is pinned to wave64, see [supported_systems](supported_systems.md)) |
 | SPIR-V (Vulkan / Metal) | probed from the device at `qd.init()` (`32` on Metal and most Vulkan GPUs) |
+| CPU                     | `1` (every thread is its own subgroup - see [CPU backend semantics](#cpu-backend-semantics)) |
 
 The value is fixed for the lifetime of a program, so two kernels launched under the same `qd.init()` always see the same subgroup size.
 
@@ -317,6 +318,34 @@ def cumsum(a: qd.types.ndarray(dtype=qd.i32, ndim=1)):
 ```
 
 After the call, lane `k` (within each group of 32) holds `a[group_start] + a[group_start+1] + ... + a[k]`. The `5` is `log2_size`; `2**5 == 32` matches the block dim. The body unrolls at compile time into five `shuffle_up + add` pairs. Use a smaller `log2_size` to scan over partial-subgroup groups (e.g. `inclusive_add_tiled(v, 3)` produces independent prefix sums in groups of 8).
+
+## CPU backend semantics
+
+The CPU backend has no hardware subgroups, so the whole module runs under the **virtual-subgroup model**: every running thread is its own subgroup of one lane. `group_size()` is `1` and every op degenerates to its one-lane identity - all of it resolved at kernel-compile time (the shuffle-butterfly unrolls of `reductions` / `sorting` see `log2_group_size() == 0` and vanish), so there is zero runtime overhead and the results are bitwise identical across launches:
+
+- `invocation_id()` is `0`, `elect()` is `1`.
+- `shuffle` / `shuffle_up` / `shuffle_down` / `shuffle_xor` / `broadcast` / `broadcast_first` return their input (the only readable lane is the thread itself).
+- `reduce_*` / `inclusive_*` / `segmented_reduce_*` return the input; `exclusive_*` returns the operator identity; `ballot` / `ballot_first_n` return bit 0 (this lane's predicate); `all_true` / `any_true` return the predicate; `all_equal` returns `1`; `bitonic_sort_kv` is the identity network (`log2_size == 0` is the documented degenerate tile).
+- `subgroup.sync()` is a no-op (a one-lane barrier converges trivially); `subgroup.mem_fence()` lowers to a full `seq_cst` fence (over-strict for the one-lane scope, same reasoning as the CUDA / AMDGPU workgroup-scope lowering).
+
+The same kernel source therefore runs unchanged on every backend - it just observes a subgroup width of 1 on CPU. Kernels that need the cooperative behavior should branch on the compile-time `group_size()` (e.g. via `qd.static`) or use the block-scope collectives, which are *not* degenerated on CPU.
+
+### Block-scope cooperation on CPU (`qd.simt.block`)
+
+Block-tier cooperation keeps its GPU semantics on CPU: a top-level `for` annotated with `qd.loop_config(block_dim=N)` whose body touches `block.SharedArray` / `block.sync()` / the block collectives runs as **true virtual blocks** - each block's `N` virtual threads run concurrently (one OS thread each; `block.thread_idx()` is the virtual thread index `0..N-1`), `block.sync()` is a real barrier with cross-thread happens-before, and the `SharedArray` is a block-scoped window (blocks never overlap in time, matching the GPU's per-block shared memory). The block collectives (`block.reduce_*`, `block.*_scan_*`, `block.sync_*_nonzero`, the radix rank) run unchanged: with subgroup size 1 each thread publishes its own slot and the fold happens at thread 0.
+
+Requirements and loud rejections (there is no silent-miscompute path):
+
+- The loop must be a top-level `for` on a range-for task; `block_dim` must be a power of two in `[1, 1024]` (one OS thread per virtual thread per block - CPU-side performance is explicitly not the goal, honest semantics are). Anything else fails at kernel-compile time with an explicit error.
+- `qd.random` inside a block-tier loop is rejected (rand states are indexed by the pool thread id, which virtual threads would index out of bounds).
+- `block.global_thread_idx()` is not supported on CPU (raises, as before).
+- The block-tier SharedArray window is zero-initialized on CPU; GPU leaves shared memory uninitialized. This is strictly more defined and indistinguishable for barrier-separated produce/consume kernels.
+
+### Numerical semantics
+
+- **Integer subgroup/block ops are bitwise** - same results on every backend for a given input (the one-lane identities are exact; block-level integer reductions fold in a fixed order per backend).
+- **Floating-point block-level reductions/scans are reassociation-tolerance objects**: GPU lowers them to parallel tree reductions (order not preserved, accuracy class ~1e-7 relative), while CPU folds sequentially (bitwise deterministic across launches on the same machine). Cross-backend FP equality is not part of the contract; compare with a tolerance (or against a float64 reference). This is the same bucket as the `spirv_vectorize` / `reassociate` vector-loop contracts.
+- Subgroup-scope FP ops on CPU are exact identities (`reduce_add(v) == v`), so the one-lane degeneration itself never loses precision.
 
 ## Performance notes
 

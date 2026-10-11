@@ -42,6 +42,15 @@ struct RuntimeContext {
   // via SPIR-V gate shaders that don't go through RuntimeContext).
   int32_t *checkpoint_resume_point_ptr{nullptr};
   int32_t *checkpoint_yield_signal_ptr{nullptr};
+
+  // CPU block-tier ("virtual block") support: pointer to the barrier shared by the current
+  // block's virtual threads. `cpu_block_parallel_for` (runtime.cpp) allocates one barrier per
+  // block on its own stack, publishes it here before spawning the block's threads, and clears
+  // it after the block joins; the codegen-emitted `qd.simt.block.sync()` lowers to a call to
+  // `cpu_block_barrier(RuntimeContext *)` which waits on it. Null outside block-tier dispatch
+  // (a barrier call reaching the runtime without a live block is a codegen-contract bug and
+  // fires a runtime assert). Never touched on GPU backends.
+  void *block_barrier{nullptr};
 };
 
 #if defined(QD_RUNTIME_HOST)

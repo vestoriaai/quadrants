@@ -1459,6 +1459,20 @@ class OffloadedStmt : public Stmt {
     return has_body();
   }
 
+  // CPU block-tier ("virtual block") classification: true when the task body contains a shared
+  // alloca (a `qd.simt.block.SharedArray`) or a CPU block barrier / fence internal call
+  // (`cpu_block_barrier` / `cpu_block_mem_fence`). Such tasks must keep their user-level
+  // [begin, end) range and `block_dim` on the CPU (so `make_cpu_multithreaded_range_for` skips
+  // them) and are dispatched through `cpu_block_parallel_for` by codegen_cpu.cpp. Walks the
+  // body recursively; compile-time cost only.
+  bool uses_block_tier_ops() const;
+
+  // True when the task body contains a `RandStmt`. On the CPU backend a block-tier task must
+  // not draw random numbers: rand states are indexed by `RuntimeContext::cpu_thread_id`, which
+  // block-tier virtual threads set to their (up to block_dim-1) virtual thread index, so a
+  // draw would index past the state array. Checked (and loudly rejected) by codegen_cpu.cpp.
+  bool uses_rand_stmt() const;
+
   std::unique_ptr<Stmt> clone() const override;
 
   void all_blocks_accept(IRVisitor *visitor, bool skip_mesh_prologue = false);
