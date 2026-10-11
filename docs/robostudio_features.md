@@ -173,11 +173,15 @@
 
 ---
 
-# mujocoqd/compiler-line 分支条目(2026-10-11 起,未合入 robostudio-main)
+# mujocoqd/compiler-line 条目(2026-10-11;**已合入 robostudio-main**,merge 33e7dabf --no-ff)
 
 > 来源战役:mujoco-qd 移植 P0(quadrants 替换 mujoco_warp kernel;方案与探针在
-> `/Users/mini0/Code/mujoqo/`)。基线 dev25 探针重跑后开工;每个 landed 条目
-> 带 gate 进 `tests/robostudio/`,合并前 union runner 复跑。
+> `/Users/mini0/Code/mujoqo/`)。基线 dev25 探针重跑后开工;每个 landed 条目带 gate 进
+> `tests/robostudio/`。合并时 union gate 5/6:gate-4 readback 性能钉值为机器方差
+> (正确性全绿,见"Readback gate-4 perf pins"条,钉值策略待裁决);其余 5 门全过,
+> 另有本线新 gate(early_return / tile_matmul / algorithms_cpu / metal_loopdep /
+> tile_runtime_loop)全绿(Apple 侧 A2/A5 为 PINNED 状态按设计)。源码级快速回归:
+> upstream test_return.py 46/46。
 
 ## M2 — early_return 单出口 AST 改写(opt-in)
 - **描述**:`@qd.kernel(early_return=True)` / `@qd.func(early_return=True)`。变换器
