@@ -248,14 +248,18 @@ class QD_DLL_EXPORT GfxRuntime {
   // per external array arg and freed it at the next drain point; every readback paid a
   // `newBufferWithLength` round trip on top of its fixed commit+wait cost.
   //
-  // Mirrors are allocated `{host_write=true, host_read=false, Storage}` (the gate is
-  // `kExtArrReadWrite = READ|WRITE`, so every host-touched external array lands here),
-  // which on Metal means Shared host-visible memory -- hence one homogeneous buffer
-  // flavor and a size-only cache key. A mirror enters the pool only at the two points
-  // where the code already proves the stream drained (the post-readback
-  // `retire_ctx_buffers()` and `synchronize()`), so a pooled buffer is by construction
-  // GPU-idle and free of outstanding CPU maps when it is handed to the next launch; the
-  // record-time host memcpy into it cannot race a previous consumer.
+  // Mirrors are allocated `{host_write=true, host_read=false, Storage}` UNCONDITIONALLY
+  // -- including for args whose detected access is NONE (dead-arg mirrors are never
+  // blitted/read by their own kernel, but they drain into this pool and must stay
+  // host-visible: a non-host-visible (Metal: Private) entry here made every later
+  // first-fit fetch of it fail forever, since the cache is keyed BY SIZE ONLY -- the
+  // sticky h2d "Failed to map" regime, fixed 2026-10-11). Shared host-visible memory
+  // on Metal, hence one homogeneous buffer flavor and a size-only cache key. A mirror
+  // enters the pool only at the two points where the code already proves the stream
+  // drained (the post-readback `retire_ctx_buffers()` and `synchronize()`), so a
+  // pooled buffer is by construction GPU-idle and free of outstanding CPU maps when
+  // it is handed to the next launch; the record-time host memcpy into it cannot race
+  // a previous consumer.
   //
   // Capacity policy: total pooled bytes capped at `kExtMirrorCacheCapBytes`; on store,
   // largest-first eviction until the new buffer fits, else the buffer is freed. Exact

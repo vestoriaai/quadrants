@@ -86,7 +86,9 @@ class HostDeviceContextBlitter {
             // the user to guess which map call broke. `QD_ASSERT` is also always-on (not release-gated), so this
             // is purely a message-quality choice.
             QD_ERROR_IF(device_->map(buffer, &device_arr_ptr) != RhiResult::success,
-                        "Failed to map ext arr data buffer for host_to_device blit");
+                        "Failed to map ext arr data buffer for host_to_device blit "
+                        "(arg_id={} size={} alloc_id={})",
+                        arg_id, ext_arr_size.at(arg_id), buffer.alloc_id);
             ArgArrayPtrKey data_ptr_idx{arg_id, TypeFactory::DATA_PTR_POS_IN_NDARRAY};
             const void *host_ptr = host_ctx_.array_ptrs[data_ptr_idx];
             std::memcpy(device_arr_ptr, host_ptr, ext_arr_size.at(arg_id));
@@ -502,20 +504,25 @@ void GfxRuntime::launch_kernel(KernelHandle handle, LaunchContextBuilder &host_c
           }
         } else {
           ext_array_size[arg_id] = host_ctx.array_runtime_sizes[arg_id];
-          auto arr_access = qd_kernel->qd_kernel_attribs().ctx_attribs.arr_access;
-          auto access_it = std::find_if(arr_access.begin(), arr_access.end(),
-                                        [indices](const auto &pair) -> bool { return pair.first == indices; });
-          QD_ASSERT(access_it != arr_access.end());
-          uint32_t access = uint32_t(access_it->second);
           // Alloc ext arr
           size_t alloc_size = std::max(size_t(32), ext_array_size.at(arg_id));
-          // Must match the h2d gate in `HostDeviceContextBlitter::host_to_device`: the blit maps this allocation, and
-          // `map()` requires host_write (or host_read) on every backend. `host_read` can stay false: the d2h readback
-          // maps this same buffer directly whenever it is host-visible (`MetalDevice::readback_data` R2 direct path)
-          // and falls back to its own staging buffer for non-host-visible allocations.
-          bool host_write = access & kExtArrReadWrite;
+          // Every mirror is allocated host-visible (host_write=true), ALWAYS -- including
+          // for args whose detected access is NONE (passed but unused by this kernel).
+          // The blit/d2h gates in HostDeviceContextBlitter still key on the per-arg
+          // access bits, so a dead arg never maps its own mirror; but at drain the
+          // mirror lands in `ext_mirror_cache_`, which is keyed BY SIZE ONLY (the
+          // [R3a] "one homogeneous buffer flavor" invariant). A non-host-visible
+          // (Metal: Private) mirror that entered the pool made every later first-fit
+          // fetch of it fail: `map()` on a Private buffer returns invalid_usage
+          // forever, the buffer goes back to the pool, and the next fetch re-picks it
+          // -- a STICKY, deterministic "Failed to map ext arr data buffer for
+          // host_to_device blit" that no retry recovers (the cavity 4-group incident,
+          // 2026-10-11: 4x287 MiB group kins carry kernels with unused large args;
+          // their Private mirrors poisoned the pool and the mppi_coll rollout blits
+          // died in clusters from ~10 launches into every fresh process).
+          bool host_write = true;
           // [R3a] Reuse a pooled mirror when one fits (first-fit >=). Every mirror is the same flavor
-          // (`host_write = READ|WRITE` gate above is direction-independent), so size is the only key.
+          // (host-visible by construction above), so size is the only key.
           DeviceAllocationUnique allocated;
           for (auto it = ext_mirror_cache_.begin(); it != ext_mirror_cache_.end(); ++it) {
             if (it->size >= alloc_size) {

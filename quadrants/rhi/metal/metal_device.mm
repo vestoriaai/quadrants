@@ -4,6 +4,7 @@
 #include "quadrants/rhi/impl_support.h"
 #include "spirv_msl.hpp"
 
+#include <cstdio>
 #include <cstdlib>
 
 namespace quadrants::lang {
@@ -24,10 +25,18 @@ MTLBuffer_id MetalMemory::mtl_buffer() const { return mtl_buffer_; }
 size_t MetalMemory::size() const { return (size_t)[mtl_buffer_ length]; }
 RhiResult MetalMemory::mapped_ptr(void **mapped_ptr) const {
   if (!can_map_) {
+    if (getenv("QD_BLIT_DEBUG") != nullptr) {
+      std::fprintf(stderr, "[blitdbg] map FAIL: can_map=false buffer=%p len=%zu\n",
+                   (void *)mtl_buffer_, (size_t)[mtl_buffer_ length]);
+    }
     return RhiResult::invalid_usage;
   }
   void *ptr = [mtl_buffer_ contents];
   if (ptr == nullptr) {
+    if (getenv("QD_BLIT_DEBUG") != nullptr) {
+      std::fprintf(stderr, "[blitdbg] map FAIL: contents nil buffer=%p len=%zu\n",
+                   (void *)mtl_buffer_, (size_t)[mtl_buffer_ length]);
+    }
     return RhiResult::invalid_usage;
   } else {
     *mapped_ptr = ptr;
