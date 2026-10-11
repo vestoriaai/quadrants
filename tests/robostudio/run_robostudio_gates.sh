@@ -36,8 +36,8 @@ trap 'rm -rf "$TMP"' EXIT
 [[ -x "$PY" ]] || { echo "FATAL: no venv python at $PY (create .venv-consolidated, see docs/build_robostudio.md)" >&2; exit 1; }
 
 PASS=0; NFAIL=0
-gate_pass() { echo "gate $1/8 [$2]: PASS"; (( PASS = PASS + 1 )); }
-gate_fail() { echo "gate $1/8 [$2]: FAIL -- $3"; (( NFAIL = NFAIL + 1 )); }
+gate_pass() { echo "gate $1/9 [$2]: PASS"; (( PASS = PASS + 1 )); }
+gate_fail() { echo "gate $1/9 [$2]: FAIL -- $3"; (( NFAIL = NFAIL + 1 )); }
 
 # wait_gpu_idle: 0 if idle (possibly after waiting), 1 if still busy after 5 min
 wait_gpu_idle() {
