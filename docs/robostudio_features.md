@@ -259,3 +259,77 @@
 - **缓解设计(已定)**:tile 存活跨循环迭代时**必须静态展开块循环**(mujoco-warp 的
   matrix_size_static 工厂模式天然满足);文档 tile.md 加限制说明 + 长期报 Apple。
 - **状态**:open — A2 缓解=文档+lint(可选);A1 待 C++ 深挖。复现/gate 已固化。
+
+
+---
+
+# mujocoqd/algorithms-2 条目(2026-10-11;分支 mujocoqd/algorithms-2 @ 54501e79,未合入)
+
+> 来源需求:quadrants-需求清单 M5 的 C5 余项(基数版 sort CPU SIGBUS 根查)与 C4(API 冻结 +
+> segmented sort + scratch 预算文档)。零 native 改动,全部在 python 层。gate:
+> `tests/robostudio/probe_algorithms_cpu.py`(121 门,cpu)、
+> `tests/robostudio/probe_algorithms_segmented.py`(cpu+metal 双跑)。
+
+## C5 余项 — 基数版 sort CPU SIGBUS 根因 + 修复(串行 LSD 基数)
+- **现象(上条线遗留)**:C5 首轮为 CPU 后端写"串行 LSD 基数 sort"时 SIGBUS,退回归并版
+  (`_cpu_sort`)并把陈旧注释留在 dispatch 里("serial LSD radix sort ... scratch[0:256] as
+  digit counters"),根因未查。
+- **根因(两层,均已最小复现并钉进 gate)**:
+  1. **主因(历史 SIGBUS)**:`qd.loop_config(serialize=True)` 只 directive **下一个**循环
+     (`ast_builder.parallelize(1)` + `strictly_serialize()`,消费于下一个 for)。基数版有
+     zero/histogram/scan/scatter **四个**顶层 for,只有第一个被串行化,其余三个在 CPU 线程池上
+     **默认并行** → 计数排序竞态:scatter 读到半成品 scratch 基址 → `dst[t]` 越界写 → SIGBUS
+     (越界恰在界内时表现为静默错值;负键 n=1000 形状 100% 复现错值)。归并版幸存的机制:while
+     不消费 directive,其唯一尾随 for 恰好被串行化。已 landed 的 scan/reduce/select 单 for 形态
+     天然安全。修复 = 每个运行时循环自带 directive(`_cpu_paths.py` 全部串行 func 已按此审计)。
+  2. **次因(block-tier GPU 阶梯在 CPU 不可下沉,三层证据链)**:GPU 基数阶梯依赖 block-tier
+     原语,CPU 后端逐层拒绝:block.sync 类 → trace 期 ValueError("not supported for arch",
+     前端包成 QuadrantsCompilationError);block/subgroup 集体操作 → subgroup.group_size()=0
+     断言;裸 SharedArray → codegen_llvm 把共享 alloca lower 成 **addrspace(3) ExternalLinkage
+     全局**(GPU 语义),CPU JIT 无后备存储 → kernel JIT 失败("Function ... not found",
+     jit_cpu.cpp:198)。三者均为响亮错误,HEAD 上无 SIGBUS 可复现(三个 expected-error 探针
+     钉死)。**native 改动规格(让渡,本线不做)**:CPU 后端共享内存/屏障模型需 (a) ORC 侧为
+     addrspace(3) 全局提供后备(线程池全局 arena)或 (b) codegen_llvm 在 CPU arch 把
+     SharedMemoryStmt lower 为进程级 arena + 屏障原语,并补 block.*/subgroup.* 的 CPU 映射 —
+     工程量大且被串行路径完全覆盖,无消费需求。
+- **修复**:CPU `sort` 派发到新 `_cpu_radix_sort`(串行 LSD 基数,逐循环 serialize):twiddle →
+  end_bit//8 个稳定字节趟(LSB→MSB,keys/tmp_keys ping-pong,values 随行)→ 逆 twiddle;语义与
+  GPU 阶梯逐条对齐(end_bit 掩码、稳定 tie、numpy 序 NaN——按位核验、scratch[0:256] 计数器在
+  sort_scratch_slots 契约内);O(4n),n=1e5 1.56ms(numpy 稳定 argsort 4.75ms);CPU 侧 n 同时
+  接受 0-d ndarray(GPU 契约形)/host int/i32 标量核参。归并版删除(单实现,历史见本条)。
+- **状态**:landed + verified — `probe_algorithms_cpu.py` 121 门全过(6 dtype × 12 边界 n、
+  NaN 按位、end_bit 8/16/24/32、has_values=False、0-d n、64 位键、三个 expected-error 探针、
+  n=1000 负键回归钉),两遍连跑稳定。
+
+## C4② — sort_segmented(分段稳定键值排序)
+- **描述**:`qd.algorithms.sort_segmented(keys, tmp_keys, values, tmp_values, segment_ids,
+  tmp_seg, scratch, n, num_segments, key_dtype, has_values, end_bit, log256_max_n)` +
+  `sort_segmented_scratch_slots(n, D) = n + sort_scratch_slots(n, D)`。分段 = 连续区间
+  `[ids[j], ids[j+1])`,调用方给 num_segments+1 个起始偏移(末位=哨兵 n;恰为 warp
+  segmented_sort_pairs / CUB 的数组形状,mujoco SAP 直接可用);空段(ids[j]==ids[j+1])合法,
+  段序保持。文件:`python/quadrants/algorithms/_segmented.py`(新)、`_cpu_paths.py`(CPU 逐段
+  串行)、`__init__.py`。
+- **设计裁定(需求清单原设想"段号<<32|键"不可行)**:Metal 无 64 位键/原子,复合键方案在短期
+  目标后端不存在。实现 = (run-rank, key) 的字典序 LSD 基数:起始 flags + select 的 scan 阶梯
+  导出每元素 run-rank,字节趟先 key(次键)后 rank(主键),keys/values/rank 三数组随行 ping-
+  pong;全程 32 位数字。rank 由 flags 排他扫描修正而来(excl + flag - 1——排他扫描把 run0 自己
+  的起始也算进后续元素,整树旋转一位的 off-by-one 已实测钉死);tile-histogram 区上移到
+  scratch[n:] 与活 rank 共存。
+- **Gate**:`probe_algorithms_segmented.py [metal|cpu]`——numpy 逐段稳定参考解,键按位
+  (NaN-safe)值精确:变长段、空段、单元素段、单段、n∈{1,2,257,5000}、负键/NaN、
+  has_values=False、u32/i32/f32(metal)±u64/i64/f64(cpu)全过;SAP 形状吞吐 pin(128 world
+  × 256 geom)按 gate-4 教训 WARN-only:cpu 0.24ms(135 Mkeys/s)、metal 0.38ms(85.6 Mkeys/s)。
+- **状态**:landed + verified(cpu+metal 双跑全过;metal 跑前 `_gpu_busy.sh` 确认空闲)。
+
+## C4① — API 冻结(qd.algorithms 稳定化)
+- **描述**:`reduce_{add,min,max}` / `exclusive_scan_{add,min,max}` / `select` / `sort` /
+  `sort_segmented` 去 **Experimental** 标注(docstring + 文档横幅),契约写入
+  `docs/source/user_guide/algorithms.md`:签名/语义/scratch 契约冻结、后续只做加法;
+  reduce_by_key_add 维持 experimental(min/max 变体未落地);parallel_sort/PrefixSumExecutor
+  维持 deprecated 移除轨。后端覆盖段改写(CPU 后端已支持, Metal 32 位限制, CPU 计数三形态),
+  scratch 预算公式表(B=256, cdiv 链闭式, 逐 op 精确式 + 渐近 ~N+O(N/256) u32 槽)。
+- **契约要点(dtype/稳定性/in-out)**:键 dtype 集 {u32,i32,f32,u64,i64,f64}(Metal 32 位子集);
+  sort/sort_segmented 稳定(LSD 字节趟构造性稳定);NaN 序 = numpy.sort(按位核验);end_bit 为 8
+  的正偶倍数 ≤ 键宽(偶数趟落回 keys);sort 系 out = in-place(keys 原地,scan/select out 与 arr
+  必须异 buffer);scratch 契约各 op 对应 helper,无设备端检查(graph 契约)。
+- **状态**:landed(文档 + docstring;无行为变更,纯承诺固化)。
