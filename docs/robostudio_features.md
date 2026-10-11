@@ -107,7 +107,16 @@
   to_numpy ≤7ms / from_numpy ≤5ms（实测 ~5.4/3.4ms 档）+ 1KB/4MB/64MB
   字节正确性扫（union runner gate 4/6）。
 
-## Union integration — capture walk defers to S-guard
+## Readback gate-4 perf pins — machine-variance caveat(mujocoqd/compiler-line A/B 实测,2026-10-11)
+- **数据(修正版)**:两次相邻构建实测 to_numpy 7.72 / 9.45ms、from_numpy 7.89 / 6.01ms
+  ——事后核查两次构建**都含** per-access volatile hunk(该 hunk 已随 C5 的 add -A 进
+  HEAD,"对照"未成立),因此这两组数字之差 = **纯机器态方差(±40%)**,与 volatile 改动
+  无关;union gate 4 的绝对毫秒钉值(≤7.0/≤5.0;原值 5.561/3.239 出自另一机器态)在本机
+  当前态下不可稳定满足。正确性字节扫全过,与后端改动无关。volatile-vs-plain 的真实性能
+  A/B 未做(可选后续)。
+- **结论/建议**:gate 4 的绝对 ms 钉值应改为**相对钉值**(如同跑 numpy memcpy 的 ≤2×)或
+  跑前记录机器基线;本轮 mujocoqd/compiler-line 的 5/6 中 gate 4 FAIL 判定为方差,非回归。
+- **状态**:open(钉值策略调整待用户裁决;本轮不静默放宽门限)。
 - **描述**：C0S 的 cache-miss 粗粒度捕获走查让位给 S-guard：带
   generation 戳的捕获交由精确收口点（`impl.subscript` →
   `_check_not_stale`）拒绝；粗走查仅继续拦截**无** generation 戳的捕获
