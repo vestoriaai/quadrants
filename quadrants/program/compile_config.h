@@ -57,6 +57,15 @@ struct CompileConfig {
   // value to always disable it.
   std::size_t ad_stack_sparse_threshold_bytes{100u * 1024u * 1024u};
 
+  // C2 (mujocoqd/spirv-vectorize): SIMD-within-thread vectorization of serial
+  // innermost loops on the SPIR-V backends. When on, an innermost runtime
+  // `range` loop whose memory accesses are provably stride-1 on ndarray args
+  // is rewritten at SPIR-V emission into [scalar align-up prologue] +
+  // [float4 vector main loop] + [scalar remainder]; loop-carried reductions
+  // keep a sequential scalar accumulator so results stay bitwise identical to
+  // the scalar path. Metal/Vulkan only; physical-storage-buffer devices only.
+  bool spirv_vectorize{false};
+
   int saturating_grid_dim;
   int max_block_dim;
   int cpu_max_num_threads;

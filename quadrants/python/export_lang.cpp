@@ -270,6 +270,10 @@ void export_lang(nb::module_ &m) {
       .def_rw("ad_stack_sparse_threshold_bytes", &CompileConfig::ad_stack_sparse_threshold_bytes,
               "Byte cutoff below which the sparse adstack sizing path is skipped in favor of eager heap allocation. "
               "No effect unless ad_stack_experimental_enabled is on.")
+      .def_rw("spirv_vectorize", &CompileConfig::spirv_vectorize,
+              "C2: SIMD-within-thread vectorization of serial innermost loops on the SPIR-V backends "
+              "(Metal/Vulkan). Rewrites stride-1 ndarray inner loops into float4 vector loads/stores with a "
+              "sequential scalar reduction accumulator (bitwise-identical results). Default off.")
       .def_rw("flatten_if", &CompileConfig::flatten_if,
               "Flatten simple if statements into predicated (branchless) form.")
       .def_rw("make_thread_local", &CompileConfig::make_thread_local,

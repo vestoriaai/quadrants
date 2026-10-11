@@ -482,6 +482,18 @@ class IRBuilder {
   Value query_value(std::string name) const;
   // Check whether a value has been evaluated
   bool check_value_existence(const std::string &name) const;
+  // Save / restore the whole name -> value table. Used by the C2 SPIR-V
+  // inner-loop vectorizer, which emits the same CHI loop body up to three
+  // times (scalar prologue / vector main / scalar remainder) and must not
+  // trip register_value's duplicate-registration guard across copies.
+  void push_value_scope() {
+    value_name_scope_.push_back(value_name_tbl_);
+  }
+  void pop_value_scope() {
+    QD_ASSERT(!value_name_scope_.empty());
+    value_name_tbl_ = value_name_scope_.back();
+    value_name_scope_.pop_back();
+  }
   // Create a new SSA value
   Value new_value(const SType &type, ValueKind flag) {
     Value val;
@@ -514,6 +526,34 @@ class IRBuilder {
   SType v4_u32_type() const {
     return t_v4_uint_;
   }
+  // C2 vectorization: <4 x float> type (declared in init_pre_defs).
+  SType v4_f32_type() const {
+    return t_v4_fp32_;
+  }
+
+  // ---- C2 SPIR-V inner-loop vectorization helpers (SIMD-within-thread) ----
+  // All of these operate on plain SSA values; vector SType carries no DataType,
+  // so nothing in the scalar helpers may consume them.
+  // Broadcast a scalar f32 to a <4 x float> (OpCompositeConstruct).
+  Value splat_f32(Value scalar);
+  // Extract one lane of a <4 x float> as f32 (OpCompositeExtract).
+  Value extract_lane_f32(Value vec, uint32_t lane);
+  // Lane-wise float binary op on <4 x float> (OpFAdd / OpFSub / OpFMul / OpFDiv).
+  Value vec_f32_bin_op(spv::Op op, Value a, Value b);
+  // Lane-wise negate / abs on <4 x float>.
+  Value vec_f32_neg(Value a);
+  Value vec_f32_abs(Value a);
+  // Create a PhysicalStorageBuffer pointer to a <4 x float> element from the
+  // u64 base address of the ndarray and a vec4-granular element index
+  // (byte_offset >> 4). Mirrors the scalar `base + OpPtrAccessChain` shape the
+  // backend already uses to sidestep the Apple per-element-reinterpret_cast
+  // miscompile.
+  Value physical_vec4_ptr(Value base_u64, Value elem_idx4);
+  // OpLoad/OpStore with explicit Aligned (+optional Volatile) memory operands.
+  // Required for vector widths: the generic helpers derive alignment from the
+  // (scalar) element size.
+  Value load_variable_aligned(Value pointer, const SType &res_type, uint32_t alignment, bool is_volatile);
+  void store_variable_aligned(Value pointer, Value value, uint32_t alignment);
 
   SType i16_type() const {
     return t_int16_;
@@ -612,6 +652,8 @@ class IRBuilder {
   std::map<std::pair<uint32_t, uint64_t>, Value> const_tbl_;
   // map from raw_name(string) to Value
   std::unordered_map<std::string, Value> value_name_tbl_;
+  // scope stack for push_value_scope / pop_value_scope
+  std::vector<std::unordered_map<std::string, Value>> value_name_scope_;
 
   // Header segment, include import
   std::vector<uint32_t> header_;

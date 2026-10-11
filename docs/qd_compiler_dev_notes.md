@@ -115,3 +115,28 @@
 3. 上游关系 = 直修不提 PR(T20 裁决);overlay 树已退役,禁止再打 overlay;
 4. wheel 全部从本分支构建(配方 `docs/build_robostudio.md`,RelWithDebInfo + `-DQD_WITH_CUDA:BOOL=OFF`——**CUDA 从未验证,对外引用数字须带此边界**);
 5. 对外引用任何数字带验证域(metal macOS arm64 + cpu linux aarch64 容器)。
+
+## 7. C2 向量化战役新地雷/新模式(2026-10-11,mujocoqd/spirv-vectorize)
+
+1. **SPIRV-Cross 对 vec4 型 PhysicalStorageBuffer 指针的 OpPtrAccessChain 按 1(字节)缩放**
+   (实测;标量 float 指针走数组索引按 4 正确缩放)。vec4 访问必须显式算字节地址 +
+   OpConvertUToPtr;别依赖 PtrAccessChain 的元素缩放。MSL 形态:
+   `*(device float4*)(args._mN._m1 + ulong(idx << 4))` ✓。
+2. **Apple MSL fast-math 会重结合"裸露的累加器链"**:`(acc - p0) - p1 - p2 - p3` 与
+   `acc + (-p0) + (-p1)…`(以及 `acc + x*c` 常数因子形态)都会被重排,实测 1–2 ulp 漂移;
+   而**循环携带链**(runtime 界的内层循环)与逐元素向量运算(saxpy)保持程序序。
+   对策 = 把 lane 归约放进 runtime 界内层循环(OpVectorExtractDynamic 动态 lane),
+   编译器无法证明 trip count → 不展开 → 序保持 → bitwise。纯 add/mul-over-load 链
+   (物理热点形状)实测静态展开也 bitwise,可走快路径。
+3. **前端把 `s -= X` 降低为 `s = s + neg(X)`**(显式 UnaryOp neg 节点 + add)——做归约
+   分析时别假设 binop=sub 存在;neg 节点会出现在乘积之上。
+4. **Metal ndarray 镜像来自子分配池,data_ptr 不保证 16B 对齐**:vec4 访问的对齐判定必须
+   用**绝对地址**(data_ptr 低 4 位 + 元素偏移)算 residue,只看元素索引会在部分分配布局下
+   产生硬件 misaligned float4 慢路径(实测症状:同进程内 4× 吞吐抖动)。
+5. **实测墙:bench_physics 形状在 M4 上是 DRAM 字宽瓶颈**(dot 2load/el 与 4×flops 版同速、
+   半字节版半速;~63 GB/s ≈ 同进程 copy 带宽)。codegen 改动若不减字节搬运量,大尺寸无
+   收益;小尺寸吃 dispatch 税。测 perf 前先跑 copy 定墙,再同轮 A/B(当日机器态抖动 ±4×,
+   单轮定论必事故)。
+6. **逐位 A/B 的正确姿势**:one-init-per-process ⇒ 双臂必须子进程;hash 对照 ndarray
+   bytes;覆盖 nv ∈ {1,3,5,23,24,25}(tiny/remainder/跨 arg class 不一致/对齐 prologue)。
+   参考实现:tests/robostudio/probe_spirv_vectorize.py。
