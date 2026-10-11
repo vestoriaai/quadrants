@@ -259,3 +259,44 @@
 - **缓解设计(已定)**:tile 存活跨循环迭代时**必须静态展开块循环**(mujoco-warp 的
   matrix_size_static 工厂模式天然满足);文档 tile.md 加限制说明 + 长期报 Apple。
 - **状态**:open — A2 缓解=文档+lint(可选);A1 待 C++ 深挖。复现/gate 已固化。
+
+## C2 — SPIR-V serial inner-loop vectorization (SIMD-within-thread, opt-in)
+- **描述**:compile_config 新旗标 `spirv_vectorize`(qd.init(spirv_vectorize=True) / env
+  QD_SPIRV_VECTORIZE;已序列化进 offline-cache key)。开启后,SPIR-V 后端(Metal/Vulkan,
+  physical-storage-buffer 设备)对"最内层串行 range 循环 + 可证 stride-1 ndarray 访问"在
+  **发射层**重写为 [≤3 迭代对齐 prologue] + [float4 向量主循环] + [标量 remainder],逐元素
+  语义与标量路径 **bitwise 一致**:循环携带归约保持顺序标量累加(危险形状走内层 runtime
+  循环 order-barrier),非携带局部量按 lane 向量化、循环出口 spill lane-3(=标量"最后一次
+  迭代获胜"语义)。安全规则(任一不满足即保守回退标量):语句白名单(Const/Alloca/
+  LocalLoad/LocalStore/BinaryOp/UnaryOp/GlobalLoad/GlobalStore/LoopIndex/ExternalPtr/
+  Shape/ArgLoad)、f32 标量 ndarray、无 if/while/原子/随机/嵌套循环/continue/cast、存储必须
+  stride-1、同 arg 多访问点必须同 base(不同 arg 假设不别名,与 LLVM 后端一致)、归约累加器
+  不得作为 lane 值消费、循环值不得外泄。文件:`quadrants/codegen/spirv/spirv_codegen.cpp`
+  (vec_analyze / try_emit_vectorized_range_for / vec_emit_* )、`spirv_ir_builder.{h,cpp}`
+  (v4f32 助手 + name-scope)、`program/compile_config.h` + `python/export_lang.cpp` +
+  `analysis/offline_cache_util.cpp`(旗标贯穿)。
+- **背景需求**:mujoco-qd 需求清单 C2(Metal 算力利用率 1–5% 的根因=串行内层循环无 SIMD;
+  同代码 CPU(LLVM) 75 GF/s vs Metal 45.6)。调研结论见本文末"C2 性能定案"。
+- **Gate**:tests/robostudio/probe_spirv_vectorize.py(gate 7/7):4 kernel 形状 × nv∈
+  {24,23,5,1}(对齐 prologue/remainder、跨 arg class 不一致、tiny 全标量回退)双臂子进程
+  scalar/vec 逐位 hash 对照 —— 12/12 ALL PASS。bench 全家(K1/K2/K3/K4/saxpy @NV∈
+  {1,3,5,23,24,25,64})同证 bitwise。union gate 7/7 PASS(venv4 实跑)。
+- **状态**:landed(分支 mujocoqd/spirv-vectorize)+ verified(bitwise 契约全绿;默认关闭)。
+
+## C2 性能定案(2026-10-11,M4 实测)— 2× 验收未达成,瓶颈=DRAM 字带,非请求吞吐
+- **数据**(同二进制旗标 A/B,三/四轮交错取中位;当日机器态抖动实测 ±4×,同代码 scalar
+  自身可在 200µs↔800µs 间摆动):nworld=4096:K1 scalar 13.6/14.8/14.1 vs vec
+  14.6/14.3/16.5 GF/s;K2 7.4/8.7/7.0 vs 8.9/7.4/9.8 —— **parity(≈1.0–1.2×)**。
+- **瓶颈定位**(microbench 链):dot@65536×24:dot1(2 load/el)194µs ≈ dot4(同 load、4×
+  flops、4 独立累加器)198µs ⇒ **算力/ILP 免费非瓶颈**;dotL(1 load/el,半字节)99µs=
+  一半时间 ⇒ **严格 load 字宽瓶颈,~63 GB/s ≈ 同进程 copy 65 GB/s(DRAM 墙)**。即大尺寸
+  下标量发射已打满有效 DRAM 带宽,向量化减少的是"请求数"而非"字节数",无收益空间;小尺寸
+  则被 dispatch(µs 级 launch 税)支配。volatile 载入(A5 缓解)经对照非瓶颈
+  (QD_NO_VOLATILE_LOADS 诊断临时开关,已撤销)。col-major(跨线程连续)布局同速 ⇒ 跨线程
+  scatter 非瓶颈。这从 codegen 层独立复证了 §4.1 结论(Mac 统一内存带宽 CPU 可吃满、SIMT
+  形状不可达峰值)。
+- **含义**:bitwise(保持 FP 求值顺序)约束下,within-thread 向量化在带宽墙形状上无 2× 可
+  拿;突破 2× 需要重结合(4 独立累加器,实证可行但**违反 bitwise 验收**)或换并行分解
+  (warp 级/分块),属新立项。旗标默认 OFF,A/B 工具链与 bitwise 机制保留。
+- **状态**:open(性能线)/landed(机制线)—— 如需重开:先在非带宽墙形状(如 nworld 小、
+  L2 驻留、算力密集)找收益点,或立项"顺序重结合 opt-in 旗标"(须用户裁定量语义)。
