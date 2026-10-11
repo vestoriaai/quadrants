@@ -564,13 +564,25 @@ class Kernel(FuncBase):
                         continue
                     for _e in _exprs:
                         _rt = getattr(_e, "_qd_owner_runtime", None)
-                        if _rt is not None and _rt is not runtime_now and _rt.cleared:
-                            raise QuadrantsRuntimeError(
-                                f"Kernel {self.func.__qualname__!r} captures a field created "
-                                "under a quadrants runtime that has been reset by a later "
-                                "qd.init(); the field's SNode references freed memory. "
-                                "Re-create the fields and kernel under the current runtime."
-                            )
+                        if _rt is None or _rt is runtime_now or not _rt.cleared:
+                            continue
+                        # Union note (2026-10-11, S-guard composition): captures
+                        # stamped with the stale-field generation are refused
+                        # precisely when they enter compiled IR
+                        # (impl.subscript -> Field._check_not_stale); refusing
+                        # them here too would reject kernels that merely carry a
+                        # stale field without reading it
+                        # (tests/python/test_stale_field.py scan_nd). The coarse
+                        # walk stays as the net for captures that lack the
+                        # generation guard.
+                        if getattr(_v, "_qd_generation", None) is not None:
+                            continue
+                        raise QuadrantsRuntimeError(
+                            f"Kernel {self.func.__qualname__!r} captures a field created "
+                            "under a quadrants runtime that has been reset by a later "
+                            "qd.init(); the field's SNode references freed memory. "
+                            "Re-create the fields and kernel under the current runtime."
+                        )
 
             self.runtime.materialize()
             used_py_dataclass_parameters = self._try_load_fastcache(py_args, key)
