@@ -2032,6 +2032,16 @@ void TaskCodegen::visit(RangeForStmt *for_stmt) {
 //   * reduction allocas: the accumulator may only be loaded by its own
 //     accumulate op and must not be consumed as a lane-varying value;
 //   * body values may not escape the loop (cross-block SSA uses).
+//
+// Reassociate mode (mujocoqd/reassociate-flag, compile_config `reassociate`,
+// default OFF; implies spirv_vectorize): with the flag on, qualifying
+// reductions (add/mul on either side, or sub with the accumulator on the
+// LHS; operand DAG reproducible by scalarize_static) drop the order-barrier
+// and keep their accumulator in k=4 partial-sum phis through the vector main
+// loop (stride-4), with a tree merge after the scalar remainder. The
+// bitwise-equality contract above applies to the flag-OFF path only; the ON
+// path reassociates by definition (accuracy contract: within the 1e-5
+// physics gate vs an f64 reference). See vec_rea_qualifies / VecReassoc.
 // ============================================================================
 
 static constexpr int64_t kVecMaxAffineCoeff = 1 << 20;
@@ -2056,13 +2066,53 @@ static int64_t vec_const_i64(const ConstStmt *c) {
 }
 
 bool TaskCodegen::spirv_vectorize_enabled() const {
-  if (compile_config_ == nullptr || !compile_config_->spirv_vectorize)
+  // `reassociate` implies `spirv_vectorize`: its mechanism only exists inside
+  // the C2 vector path (see compile_config.h).
+  if (compile_config_ == nullptr || !(compile_config_->spirv_vectorize || compile_config_->reassociate))
     return false;
   if (arch_ != Arch::metal && arch_ != Arch::vulkan)
     return false;
   if (for_stmt_guard_)
     return false;  // re-entrant visit of a nested loop inside vector emission
   return caps_->get(DeviceCapability::spirv_has_physical_storage_buffer) != 0;
+}
+
+bool TaskCodegen::vec_reassociate_enabled() const {
+  return compile_config_ != nullptr && compile_config_->reassociate;
+}
+
+// mujocoqd/reassociate-flag: does this reduction decompose into k=4 stride-4
+// partial sums + an exit tree merge? Two conditions:
+//   * the accumulation must be a partial-sum decomposition: add/mul on either
+//     side, or sub with the accumulator on the LHS (`x - acc` alternates the
+//     sign every element -- not a partial-sum form -- so it keeps the
+//     order-barrier);
+//   * the accumulated operand DAG must be reproducible lane-wise by
+//     scalarize_static (add/sub/mul/div + neg/abs over env leaves). Anything
+//     else keeps the existing fast / order-barrier emission.
+bool TaskCodegen::vec_rea_qualifies(const VecReduction &r) const {
+  if (r.binop == BinaryOpType::sub && !r.load_is_lhs)
+    return false;
+  std::function<bool(const Stmt *)> dag_ok = [&](const Stmt *n) -> bool {
+    if (auto *b = n->cast<BinaryOpStmt>()) {
+      switch (b->op_type) {
+        case BinaryOpType::add:
+        case BinaryOpType::sub:
+        case BinaryOpType::mul:
+        case BinaryOpType::div:
+        case BinaryOpType::truediv:
+          break;
+        default:
+          return false;
+      }
+      return dag_ok(b->lhs) && dag_ok(b->rhs);
+    }
+    if (auto *u = n->cast<UnaryOpStmt>())
+      return (u->op_type == UnaryOpType::neg || u->op_type == UnaryOpType::abs) && dag_ok(u->operand);
+    return true;  // leaf: global load / const / shadow load -- all present in env
+  };
+  const Stmt *x = r.load_is_lhs ? r.op->rhs : r.op->lhs;
+  return dag_ok(x);
 }
 
 // Structural equality of two pure-integer expressions with respect to the
@@ -2303,7 +2353,8 @@ void TaskCodegen::vec_emit_vector_loop(
     const std::unordered_map<ExternalPtrStmt *, spirv::Value> &base_b0,
     const std::unordered_map<int, spirv::Value> &base_u64_by_arg,
     const std::unordered_map<int, spirv::Value> &scalar_base_by_arg,
-    std::vector<std::pair<AllocaStmt *, std::pair<spirv::Value, bool>>> *spills) {
+    std::vector<std::pair<AllocaStmt *, std::pair<spirv::Value, bool>>> *spills,
+    std::vector<VecReassoc> *reassoc) {
   auto i32t = ir_->i32_type();
   auto f32t = ir_->f32_type();
   auto v4t = ir_->v4_f32_type();
@@ -2312,6 +2363,22 @@ void TaskCodegen::vec_emit_vector_loop(
   auto arg_key = [&](ExternalPtrStmt *ep) {
     return ep->base_ptr->cast<ArgLoadStmt>()->arg_id[0] * 2 + (ep->is_grad ? 1 : 0);
   };
+
+  // ---- reassociate (opt-in): load each qualifying reduction's pre-loop
+  // accumulator once, here in the preheader (the scalar prologue left it in
+  // the alloca). ----
+  struct ReaInit {
+    const VecReduction *r;
+    spirv::Value init;
+  };
+  std::vector<ReaInit> rea_init;
+  if (vec_reassociate_enabled()) {
+    for (const auto &r : reductions) {
+      if (!vec_rea_qualifies(r))
+        continue;
+      rea_init.push_back({&r, ir_->load_variable(ir_->query_value(r.alloca_stmt->raw_name()), f32t)});
+    }
+  }
 
   // ---- loop skeleton: for (w4 = 0; w4 < n_vec; w4++) ----
   spirv::Label init_label = ir_->current_label();
@@ -2323,6 +2390,22 @@ void TaskCodegen::vec_emit_vector_loop(
   ir_->start_label(head_label);
   spirv::PhiValue w4 = ir_->make_phi(i32t, 2);
   w4.set_incoming(0, ir_->const_i32_zero_, init_label);
+  // ---- reassociate: k=4 partial-sum phis (loop header = phis lead the
+  // block). Index map for the body walk lives in rea_idx. ----
+  reassoc->clear();
+  reassoc->reserve(rea_init.size());
+  std::unordered_map<const VecReduction *, int> rea_idx;
+  for (const auto &ri : rea_init) {
+    const spirv::Value identity = ir_->float_immediate_number(
+        f32t, ri.r->binop == BinaryOpType::mul ? 1.0 : 0.0);
+    rea_idx[ri.r] = (int)reassoc->size();
+    reassoc->push_back(VecReassoc{ri.r->alloca_stmt, ri.r->binop, {}, {}});
+    VecReassoc &rs = reassoc->back();
+    for (int lane = 0; lane < 4; ++lane) {
+      rs.acc[lane] = ir_->make_phi(f32t, 2);
+      rs.acc[lane].set_incoming(0, (lane == 0) ? ri.init : identity, init_label);
+    }
+  }
   spirv::Value loop_cond = ir_->lt(w4, n_vec);
   ir_->make_inst(spv::OpLoopMerge, merge_label, continue_label, spv::LoopControlMaskNone);
   ir_->make_inst(spv::OpBranchConditional, loop_cond, body_label, merge_label);
@@ -2438,6 +2521,10 @@ void TaskCodegen::vec_emit_vector_loop(
   for (const auto &r : reductions) {
     red_by_store[r.store] = &r;
   }
+  std::unordered_map<const Stmt *, const VecReduction *> red_by_load;
+  for (const auto &r : reductions) {
+    red_by_load[r.load] = &r;
+  }
 
   for (const auto &stmt_up : body->statements) {
     Stmt *stmt = stmt_up.get();
@@ -2515,6 +2602,10 @@ void TaskCodegen::vec_emit_vector_loop(
       }
       case VecRole::ReductionLoad: {
         auto *ll = stmt->cast<LocalLoadStmt>();
+        // reassociate: the accumulator lives in the k=4 partial-sum phis;
+        // the in-loop alloca round-trip disappears.
+        if (rea_idx.count(red_by_load.at(ll)))
+          break;
         env[stmt] = ir_->load_variable(ir_->query_value(ll->src->raw_name()), f32t);
         break;
       }
@@ -2523,6 +2614,36 @@ void TaskCodegen::vec_emit_vector_loop(
       case VecRole::ReductionStore: {
         auto *ls = stmt->cast<LocalStoreStmt>();
         const VecReduction *r = red_by_store.at(ls);
+        // reassociate (opt-in): k=4 partial sums, static lane unroll. The
+        // lane values ride the phis (no in-loop alloca store); the exit
+        // sequence (park sum 0 -> scalar remainder -> tree merge) runs in
+        // try_emit_vectorized_range_for.
+        {
+          auto rit = rea_idx.find(r);
+          if (rit != rea_idx.end()) {
+            VecReassoc &rs = (*reassoc)[rit->second];
+            const bool load_lhs = (r->op->lhs == r->load);
+            QD_ASSERT(r->binop != BinaryOpType::sub || load_lhs);
+            const Stmt *x_stmt_full = load_lhs ? r->op->rhs : r->op->lhs;
+            for (uint32_t lane = 0; lane < 4; ++lane) {
+              spirv::Value x = scalarize_static(x_stmt_full, lane);
+              switch (r->binop) {
+                case BinaryOpType::add:
+                  rs.next[lane] = load_lhs ? ir_->add(rs.acc[lane], x) : ir_->add(x, rs.acc[lane]);
+                  break;
+                case BinaryOpType::sub:
+                  rs.next[lane] = ir_->sub(rs.acc[lane], x);
+                  break;
+                case BinaryOpType::mul:
+                  rs.next[lane] = load_lhs ? ir_->mul(rs.acc[lane], x) : ir_->mul(x, rs.acc[lane]);
+                  break;
+                default:
+                  QD_ASSERT(false && "unexpected reassociated reduction op");
+              }
+            }
+            break;
+          }
+        }
         spirv::Value acc = env.at(r->load);
         spirv::Value acc0 = acc;
         const bool load_lhs = (r->op->lhs == r->load);
@@ -2637,8 +2758,17 @@ void TaskCodegen::vec_emit_vector_loop(
   ir_->start_label(continue_label);
   spirv::Value next_value = ir_->add(w4, ir_->const_i32_one_);
   w4.set_incoming(1, next_value, ir_->current_label());
+  // reassociate: wire the per-lane partial sums as the phi backedges.
+  for (auto &rs : *reassoc)
+    for (int lane = 0; lane < 4; ++lane)
+      rs.acc[lane].set_incoming(1, rs.next[lane], ir_->current_label());
   ir_->make_inst(spv::OpBranch, head_label);
   ir_->start_label(merge_label);
+  // reassociate: park partial sum 0 in the alloca so the scalar remainder
+  // (emitted next by the caller) keeps chaining onto it -- probe-exact
+  // association prologue -> lane 0 -> tail -> tree merge.
+  for (const auto &rs : *reassoc)
+    ir_->store_variable(ir_->query_value(rs.alloca_stmt->raw_name()), rs.acc[0]);
 
   for (const auto &[al, val_and_vec] : shadow_final) {
     spills->emplace_back(const_cast<AllocaStmt *>(al), val_and_vec);
@@ -2772,8 +2902,9 @@ bool TaskCodegen::try_emit_vectorized_range_for(RangeForStmt *for_stmt) {
 
   // ---- [2] vector main loop [start, start + 4*n_vec) ----
   std::vector<std::pair<AllocaStmt *, std::pair<spirv::Value, bool>>> spills;
+  std::vector<VecReassoc> reassoc;
   vec_emit_vector_loop(for_stmt, body, groups, reductions, roles, e, start, n_vec, g0_vec, base_b0,
-                       base_u64_by_arg, scalar_base_by_arg, &spills);
+                       base_u64_by_arg, scalar_base_by_arg, &spills, &reassoc);
 
   // ---- [3] scalar remainder [start + 4*n_vec, e) ----
   spirv::Value main_end = ir_->add(start, ir_->make_value(spv::OpShiftLeftLogical, i32t, n_vec,
@@ -2785,6 +2916,19 @@ bool TaskCodegen::try_emit_vectorized_range_for(RangeForStmt *for_stmt) {
   // Keep the loop-variable name alive after the loop (mirrors the single-loop
   // baseline where the phi stays registered).
   ir_->register_value(for_stmt->raw_name(), rem_var);
+
+  // ---- [3b] reassociate exit: tree-merge the partial sums onto the
+  // post-remainder accumulator. Sum 0 carries prologue + lane-0 + remainder
+  // contributions; sums 1..3 seed from the op identity, so an empty main
+  // loop or empty remainder degenerates to the exact input value. ----
+  for (const auto &rs : reassoc) {
+    spirv::Value ptr = ir_->query_value(rs.alloca_stmt->raw_name());
+    spirv::Value t = ir_->load_variable(ptr, ir_->f32_type());
+    spirv::Value lo = (rs.binop == BinaryOpType::mul) ? ir_->mul(t, rs.acc[1]) : ir_->add(t, rs.acc[1]);
+    spirv::Value hi =
+        (rs.binop == BinaryOpType::mul) ? ir_->mul(rs.acc[2], rs.acc[3]) : ir_->add(rs.acc[2], rs.acc[3]);
+    ir_->store_variable(ptr, (rs.binop == BinaryOpType::mul) ? ir_->mul(lo, hi) : ir_->add(lo, hi));
+  }
 
   // ---- spills: non-carried locals keep "last iteration (lane 3)" semantics ----
   for (const auto &[al, val_and_vec] : spills) {
