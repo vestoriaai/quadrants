@@ -644,6 +644,11 @@ class ASTTransformer(Builder):
             if ctx.func.return_type is not None:
                 if len(ctx.func.return_type) == 1:
                     ctx.return_data = [ctx.return_data]
+                elif isinstance(ctx.return_data, tuple):
+                    # tuple[...] annotations evaluate `return a, b` into an immutable
+                    # python tuple of exprs; normalize to a list so the per-slot casts
+                    # below can assign in place (mujocoqd/compiler-line, A4)
+                    ctx.return_data = list(ctx.return_data)
                 for i, return_type in enumerate(ctx.func.return_type):
                     if id(return_type) in primitive_types.type_ids:
                         ctx.return_data[i] = qd_ops.cast(ctx.return_data[i], return_type)

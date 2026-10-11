@@ -36,7 +36,7 @@ def func(fn: F, *, is_real_function: bool = ..., requires_top_level: bool = ...)
 def func(fn: None = ..., *, is_real_function: bool = ..., requires_top_level: bool = ...) -> Callable[[F], F]: ...
 
 
-def func(fn=None, *, is_real_function=False, requires_top_level=False):
+def func(fn=None, *, is_real_function=False, requires_top_level=False, early_return=False):
     """Marks a function as callable in Quadrants-scope.
 
     This decorator transforms a Python function into a Quadrants one. Quadrants
@@ -78,7 +78,7 @@ def func(fn=None, *, is_real_function=False, requires_top_level=False):
         level = (4 if _bare else 3) + is_real_function
         is_classfunc = _inside_class(level_of_class_stackframe=level)
 
-        fun = Func(fn, _classfunc=is_classfunc, is_real_function=is_real_function)
+        fun = Func(fn, _classfunc=is_classfunc, is_real_function=is_real_function, early_return=early_return)
         quadrants_callable = QuadrantsCallable(fn, fun)
         quadrants_callable._is_quadrants_function = True
         quadrants_callable._is_real_function = is_real_function
@@ -159,6 +159,7 @@ def _kernel_impl(
     verbose: bool = False,
     graph: bool = False,
     checkpoints: bool = False,
+    early_return: bool = False,
 ) -> QuadrantsCallable:
     # Can decorators determine if a function is being defined inside a class?
     # https://stackoverflow.com/a/8793684/12003165
@@ -170,6 +171,7 @@ def _kernel_impl(
     adjoint = Kernel(_func, autodiff_mode=_REVERSE, _is_classkernel=is_classkernel)
     primal.use_graph = graph
     primal.use_checkpoints = checkpoints
+    primal.use_early_return = early_return
     adjoint.use_checkpoints = checkpoints
     # Having |primal| contains |grad| makes the tape work.
     primal.grad = adjoint
@@ -234,6 +236,7 @@ def kernel(
     fastcache: bool = False,
     graph: bool = False,
     checkpoints: bool = False,
+    early_return: bool = False,
 ):
     """
     Marks a function as a Quadrants kernel.
@@ -278,7 +281,7 @@ def kernel(
                 f"@qd.kernel({fn.__name__!r}, checkpoints=True) requires graph=True; "
                 "the checkpoint resume model is only meaningful for graph kernels."
             )
-        wrapped = _kernel_impl(fn, level_of_class_stackframe=level, graph=graph, checkpoints=checkpoints)
+        wrapped = _kernel_impl(fn, level_of_class_stackframe=level, graph=graph, checkpoints=checkpoints, early_return=early_return)
         wrapped.is_pure = pure is not None and pure or fastcache
         if pure is not None:
             warnings_helper.warn_once(

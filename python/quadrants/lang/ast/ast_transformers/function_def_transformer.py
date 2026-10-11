@@ -35,6 +35,9 @@ from quadrants.lang.ast.ast_transformers import graph_api
 from quadrants.lang.ast.ast_transformers.checkpoint_transformer import (
     CheckpointTransformer,
 )
+from quadrants.lang.ast.ast_transformers.early_return_transformer import (
+    EarlyReturnTransformer,
+)
 from quadrants.lang.ast.ast_transformers.struct_primitive_predeclarer import (
     predeclare_struct_primitives,
 )
@@ -598,6 +601,21 @@ class FunctionDefTransformer:
                 # blocks and bare prologue stmts.
                 if kernel.use_checkpoints:
                     node.body = CheckpointTransformer.auto_wrap_for_loops(node.body)
+
+        # Early-return rewrite for `@qd.kernel(early_return=True)` / `@qd.func(early_return=True)`
+        # (opt-in). Mutates `node.body` in place: every runtime-context `return` becomes slot
+        # stores + `__er_done` flag + guarded successors, so warp-style guard-clause code compiles
+        # without manual single-exit restructuring. Must run before build_stmts; `qd.static`
+        # subtrees are left untouched (static returns are already legal).
+        er_on = (
+            getattr(ctx.global_context.current_kernel, "use_early_return", False)
+            if ctx.is_kernel and ctx.global_context.current_kernel is not None
+            else (getattr(ctx.func, "early_return", False) if not ctx.is_kernel else False)
+        )
+        if er_on:
+            node.body = EarlyReturnTransformer.rewrite(
+                node, is_kernel=ctx.is_kernel, global_vars=ctx.global_vars or {}
+            ).body
 
         with ctx.variable_scope_guard():
             build_stmts(ctx, node.body)
