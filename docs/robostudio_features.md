@@ -234,10 +234,15 @@
   侧缓解 = 评估条件 RMW 的 select 无分支化 lower,需设计评审)。与 A2 共享"Apple 编译器
   对循环携带模式"怀疑。gate 已钉死,Apple 修复或缓解落地后翻绿。
 
-## A1/A2 — real_func SPIR-V 崩溃 / tile runtime-loop 错值(**open**)
+## A1/A2 — real_func SPIR-V 崩溃 / tile runtime-loop 错值(**open,机制假设已获 MSL 证据**)
 - A1:最小复现 `p0_realfunc.py`(metal 0/5,cpu 4/5);`print_ir` 定界 = CHI IR 正常,
   崩在 `spirv_ir_builder.cpp query_value`(SSA 使用先于定义)→ SPIR-V 后端函数调用
-  发射层。A2:`p0_block_chol.py` m=48 runtime 块循环错 2e-2、同序列静态展开全对
-  (1e-7)。两者与 A5 共享"运行时控制流下值生命周期"调查方向;复现与 gate 均已固化
-  (见 mujoqo/_probe 与 tests/robostudio)。
-- **状态**:open — 定界完成,待 C++ 层深挖。
+  发射层。
+- A2:MSL diff 定位(dev25+ wheel,QD_DUMP_MSL=1,`p0_block_chol.py` runtime 版 vs
+  `/tmp` 静态展开版,m=48):runtime 版在 for 头部携带 **16 个 tile 寄存器的长 phi 链**
+  (`_1990=_1991, _1993=_1994, ...`, rank-1 内循环跨迭代携带全部 tile 行寄存器),静态版
+  无此结构(直线 SSA)。与 A5 同家族:**Apple 编译器对运行时循环携带值(长 phi 链 /
+  循环携带内存依赖)处理有缺陷**。
+- **缓解设计(已定)**:tile 存活跨循环迭代时**必须静态展开块循环**(mujoco-warp 的
+  matrix_size_static 工厂模式天然满足);文档 tile.md 加限制说明 + 长期报 Apple。
+- **状态**:open — A2 缓解=文档+lint(可选);A1 待 C++ 深挖。复现/gate 已固化。
