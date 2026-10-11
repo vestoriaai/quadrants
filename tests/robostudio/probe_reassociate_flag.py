@@ -22,9 +22,10 @@ Gates:
   G2 (HARD) reassociation actually happens: rea != vec bitwise on reduction
         outputs where the vector main loop provably runs (nv in {24,23}; the
         payoff shapes at nw=1).
-  G3 (HARD) flag-inert anchor: rea == vec == scalar on k_elementwise (its
-        inner loop stays on the plain scalar path -- arg-in-DAG -- so this
-        pins the flag leaves untouched loops untouched; hash-only).
+  G3 (HARD) flag-inert anchor: rea == vec == scalar on k_elementwise. The
+        loop has no reduction, so neither flag can change its output, and
+        elementwise float4 is bitwise anyway (since c2-emitter-fixes it
+        actually vectorizes in the vec/rea arms; hash-only).
   G4 (HARD) implication semantics: rea != scalar on the reduction outputs --
         reassociation only exists inside the C2 vector path, so differing
         => C2 was on with the flag alone.
@@ -50,15 +51,14 @@ Gates:
         sandwiches (acceptance-set selection bias, same flip problem).
 
 Baseline note: a literal same-process flag-ON vs flag-OFF pair is impossible
-(one qd.init per process, S-guard), and the two constructs that could fake a
+(one qd.init per process, S-guard); the two constructs that could fake a
 flag-OFF emission inside an ON process (runtime-scalar factor / coeff-0 load
-in the reduction DAG) both trip PRE-EXISTING C2 emitter limitations (argload
-outside the loop body has no env entry; coeff-0 loads re-register in the
-remainder walk) -- see the ledger entry. The serialized-loop baseline is the
-same sequential-accumulation semantics the flag-OFF path computes (bitwise
-per G1), measured in-process. The cross-process vec-arm microseconds are
-reported for context only (mode-sticky across processes, never compared to
-the ON child).
+in the reduction DAG) compile cleanly since c2-emitter-fixes, but neither
+yields the flag-OFF association order inside an ON process anyway. The
+serialized-loop baseline is the same sequential-accumulation semantics the
+flag-OFF path computes (bitwise per G1), measured in-process. The
+cross-process vec-arm microseconds are reported for context only (mode-sticky
+across processes, never compared to the ON child).
 
 Non-metal archs: SKIP, exit 0 (the transform only runs on SPIR-V backends).
 

@@ -685,3 +685,93 @@ codegen 改动**(arch 全部门控),无新 compile_config 旗标,offline-cache k
 - **状态**:landed + verified(分支 `mujocoqd/subgroup-cpu-support`,未 merge;
   probe_subgroup_cpu 37/37 + probe_algorithms_cpu 120/120 两遍稳定 + union 10/10 +
   test_return 46/46)。
+
+---
+
+# mujocoqd/c2-emitter-fixes 条目(2026-10-12;分支 `mujocoqd/c2-emitter-fixes`,基于 8ebf8620)
+
+> 修复 REA 条目"附带发现"里的三个 HEAD 既有 C2 emitter/analyze 缺陷(dev59/dev71 wheel
+> 均复现,非任何在飞线引入)。约束:旗标 OFF 路径逐位不变(全部改动位于
+> vec_analyze / vec_emit_vector_loop / try_emit 的 ON-only 路径);每缺陷独立 commit +
+> 独立 gate 臂。
+
+## ① arg-in-DAG env miss(崩 → 正确向量发射,commit 7880d68f)
+- **根因(代码定位 `spirv_codegen.cpp` vec_emit_vector_loop)**:向量化循环体的 DAG 引用
+  **体外**语句时(任务级标量 kernel-arg load;或被 `cache_loop_invariant_global_vars`
+  上提的循环不变 global load 及其上的纯算术),emitter env 无条目 →
+  `env.at()` 抛 `unordered_map::at` / scalarize 叶子 `QD_ASSERT(env.end())`(release=UB)。
+  vec_analyze 一直**放行**这类循环:其 "argload used as value" 规则只检查**体内**
+  ArgLoadStmt,而 hoister 早已把标量 argload 上提到任务级 → 崩溃即放行的后果。
+- **"时拒时放"定性**:analyze 是 IR 的纯函数,同一 kernel 形态判定确定;表象不确定来自
+  两条规则的覆盖差——还原循环(体内无 global store)放行后崩;含体内 store 的循环被
+  缺陷③的 dtype 误拒(拒绝理由还打印成 "non-f32 memory access")。③修复后,arg-in-DAG
+  的准入只剩真实规则,不再有"撞上另一条误拒"的表象。
+- **修法**:`env_lookup()` 三级解析(env → 按 raw_name 查任务级已注册值 → 兜底现发射并
+  记忆化)。体外值按 SSA def-before-use 必为循环不变,复用发射值精确且与标量路径逐位一致;
+  重发射会撞 register_value 重复守卫,故走名字复用。
+- **连带根修(同 commit)**:还原 fast 路径资格收紧——累加操作数 DAG 的叶子必须是
+  **体内 stride-1** GlobalLoad:循环不变 uniform 叶子(hoisted load 或体内 coeff-0 load)
+  会被 Apple MSL fast-math 把四条 lane 积和**析因重排**成 `(x0+x1+x2+x3)*c`(实测
+  `s += x[j]*c` 漂 ~2 ulp,dev notes §7.2 "acc + x*c 常数因子形态"的 uniform 叶子特化),
+  此类还原回落 order-barrier lane 环(循环携带 → 程序序 → 逐位)。纯 coeff-1 load DAG 的
+  fast 路径不变(C2 门 bitwise 复验)。
+- **复现臂(G1)**:`k_red_arg`(argload 入还原 DAG)/ `k_red_extemp`(hoisted 不变 temp)/
+  `k_red_c0hoisted`(hoisted coeff-0 load 入还原 DAG)。修复前:vec 臂
+  `IndexError: unordered_map::at: key not found`(三形态全部);修复后:三形态 bitwise
+  scalar==vec + 无 IR-builder 错误。
+
+## ③ store 循环从未向量化 / k_elementwise(commit 2ebc88d4)
+- **根因(`vec_analyze` memory-group dtype 检查)**:dtype 取自 `mem->element_type()`,
+  而 `GlobalStoreStmt` 不产值、`ret_type` 恒为 unknown → **所有含体内 global store 的
+  内层循环**被误拒("non-f32 memory access")。还原循环(体内无 store)向量化了,
+  elementwise 循环从未向量化;C2 门 k_elementwise bitwise 锚通过的原因是两臂都走纯标量。
+  **REA 条目对 ③ 的"argload 作值被拒"归因不准**:体内 argload 已被 hoister 上提,
+  该规则对 k_elementwise 从未触发,真凶是 dtype 误拒(确定性拒绝,非不确定性)。
+- **修法**:dtype 改取 ext-ptr pointee(load/store 通载)。分析单侧改动,OFF 路径不变。
+- **效果**:elementwise 形态在缺陷①的 env_lookup 支撑下发射正确 float4 代码
+  (`y[w,j]=a*x+3`:uniform a 与 const 3 各 OpCompositeConstruct splat,三循环结构,
+  dump SPIR-V 验证)。
+- **复现臂(G2)**:`k_ew_arg`(k_elementwise 同形)/`k_ew_extemp`/`k_ew_c0`:
+  bitwise scalar==vec,且 `k_ew_arg` 任务 dump 的 SPIR-V 含
+  `OpLoad %v4float`(Aligned 16)/`OpStore`(Aligned 16)——修复前 dump 无任何 float4
+  (静默标量)。
+- **gate 期望更新**:`probe_reassociate_flag.py` G3 注释改写(k_elementwise 现已向量化,
+  锚仍三臂 bitwise 相等)+ baseline 注记更新(两个"可能伪造 OFF 发射"的构照自本线起
+  可正常编译)。
+
+## ② coeff-0 remainder 重复注册(崩 → 正确向量发射,commit 4f09cab7)
+- **根因(`try_emit_vectorized_range_for`)**:同一循环体被走三遍(prologue/vector/
+  remainder)。prologue 的名字注册有 push/pop 保护,**vector walk 的没有**:第一个体内
+  标量值语句(体内 coeff-0 载入 = ScalarMemLoad;多访问点同数组读使 hoister 放弃上提,
+  故能留在体内;或 ScalarCompute 重发射)把 raw_name 注册进活表,remainder walk 重注册 →
+  `register_value: "tmpNN already exists"` QD_ERROR(本分支构建下 = RuntimeError 崩)。
+- **修法**:vector walk 包 `push_value_scope`/`pop_value_scope`(与 prologue 既有模式
+  同构)。循环后按名查询的只有 alloca 与任务级值(均注册于 push 之前);spills/
+  reassemble 出口携带 Value 对象,不受影响。
+- **复现臂(G3)**:`k_ew_c0same`(`y[w,j] = x[w,j] + x[w,0]`,同数组双访问点):
+  修复前 vec 臂 `RuntimeError: [spirv_ir_builder.cpp:register_value@1129] tmp12 already
+  exists.`(scalar 臂正常);修复后 bitwise scalar==vec + 零 IR-builder 错误。
+
+## 门禁
+- **`tests/robostudio/probe_c2_emitter_fixes.py`(新;union runner 新 gate 11,label /11)**:
+  三缺陷各一硬门臂(G1 三形态 / G2 bitwise+SPIR-V 结构 / G3 bitwise+零重复注册),
+  scalar 臂 = 旗标全 OFF。**ALL HARD GATES PASS**(venv8,GPU 空闲,2026-10-12)。
+- **union runner 11/11 PASS**(venv8,2026-10-12;原 10 门全数保留通过 = OFF 路径零变化
+  全电池复验):S2/S3/u8/readback/S-guard/C0S/C2 bitwise/R5/rea/subgroup/c2-emitter-fixes。
+- **`test_return.py` 46 passed**(venv8,pytest+xdist)。
+- **probe_spirv_vectorize(C2 门 7)ALL PASS**、**probe_reassociate_flag(门 9)ALL HARD
+  GATES PASS**(rea 准确度 chol 1.47e-07 / matvec 5.71e-07 / sym 1.74e-06)不变;perf
+  WARN-only(机器双峰态,本线无 perf 钉值需求)。
+
+## footprint
+native +62/−18 行 1 文件:`codegen/spirv/spirv_codegen.cpp`(env_lookup + 五处查点切换 +
+fast_dag 资格收紧 + store dtype 改 ext-ptr pointee + vector walk scope 包裹;含注释)。
+**无前端/runtime/其他 codegen 改动,无新 compile_config 旗标,offline-cache key 无新维度**
+(生成的 SPIR-V 形状差异自然进 key)。门禁:probe_c2_emitter_fixes.py(新,264 行)+
+union runner gate 11(+19/−5);probe_reassociate_flag.py 注释修正(+11/−11)。
+- **commits**:7880d68f(①)→ 2ebc88d4(③)→ 4f09cab7(②)(③先于②:dtype 误拒
+  解除后缺陷②的复现形态才可达 vector walk;①先于③:k_elementwise 放行后依赖 env_lookup
+  发射)。
+- **wheel**:`dist/quadrants-1.3.4.dev78+g4f09cab72.d20261011-cp312-cp312-macosx_13_0_arm64.whl`
+  → `/Users/mini0/Code/mujoqo/_probe.venv8`(python3.12,tuna 依赖镜像)。
+- **状态**:landed + verified(分支 `mujocoqd/c2-emitter-fixes`,未 merge)。

@@ -2430,6 +2430,27 @@ void TaskCodegen::vec_emit_vector_loop(
   spirv::Value e_ = e_val, start_ = start;
   std::unordered_map<const Stmt *, spirv::Value> env;
   std::unordered_map<const AllocaStmt *, spirv::Value> shadow;
+  // Resolve a DAG leaf that may live OUTSIDE the vectorized body: scalar
+  // kernel-arg loads, loop-invariant global loads and pure arithmetic over
+  // them hoisted out of the loop by cache-loop-invariant-global-vars (they
+  // are loop-invariant by SSA def-before-use order). The plain task walk
+  // already emitted those before entering this loop and registered them by
+  // raw_name, so reuse by name; re-emitting would trip register_value's
+  // duplicate guard, and a raw env.at() here was the arg-in-DAG
+  // unordered_map::at crash (mujocoqd/c2-emitter-fixes defect 1).
+  std::function<spirv::Value(const Stmt *)> env_lookup = [&](const Stmt *s) -> spirv::Value {
+    auto it = env.find(s);
+    if (it != env.end())
+      return it->second;
+    if (ir_->check_value_existence(s->raw_name()))
+      return ir_->query_value(s->raw_name());
+    // Not reachable today (body defs precede uses; outside defs are
+    // pre-registered): emit on demand as a scalar and memoize.
+    const_cast<Stmt *>(s)->accept(this);
+    spirv::Value v = ir_->query_value(s->raw_name());
+    env.emplace(s, v);
+    return v;
+  };
   // Static-lane scalarized view (fast path): same DAG with
   // OpCompositeExtract at the vector leaves.
   std::unordered_map<uint64_t, spirv::Value> scalarized_static;
@@ -2467,9 +2488,8 @@ void TaskCodegen::vec_emit_vector_loop(
       else
         v = ir_->call_glsl450(ir_->f32_type(), GLSLstd450FAbs, o);
     } else {
-      auto found = env.find(stmt);
-      QD_ASSERT(found != env.end());
-      v = (found->second.stype.id == v4t.id) ? ir_->extract_lane_f32(found->second, lane) : found->second;
+      spirv::Value leaf = env_lookup(stmt);
+      v = (leaf.stype.id == v4t.id) ? ir_->extract_lane_f32(leaf, lane) : leaf;
     }
     scalarized_static.emplace(key, v);
     return v;
@@ -2508,12 +2528,11 @@ void TaskCodegen::vec_emit_vector_loop(
         return ir_->make_value(spv::OpFNegate, ir_->f32_type(), o);
       return ir_->call_glsl450(ir_->f32_type(), GLSLstd450FAbs, o);
     }
-    auto found = env.find(stmt);
-    QD_ASSERT(found != env.end());
-    if (found->second.stype.id == v4t.id) {
-      return ir_->make_value(spv::OpVectorExtractDynamic, ir_->f32_type(), found->second, lane);
+    spirv::Value leaf = env_lookup(stmt);
+    if (leaf.stype.id == v4t.id) {
+      return ir_->make_value(spv::OpVectorExtractDynamic, ir_->f32_type(), leaf, lane);
     }
-    return found->second;
+    return leaf;
   };
   std::unordered_map<const AllocaStmt *, std::pair<spirv::Value, bool>> shadow_final;
   std::unordered_map<ExternalPtrStmt *, spirv::Value> load_cache;
@@ -2540,8 +2559,11 @@ void TaskCodegen::vec_emit_vector_loop(
       }
       case VecRole::VectorCompute: {
         if (auto *b = stmt->cast<BinaryOpStmt>()) {
-          spirv::Value va = env.at(b->lhs);
-          spirv::Value vb = env.at(b->rhs);
+          // env_lookup: an operand may be a loop-invariant value defined
+          // outside the body (task-level scalar arg load / hoisted invariant
+          // arithmetic) -- splat it below like any scalar operand.
+          spirv::Value va = env_lookup(b->lhs);
+          spirv::Value vb = env_lookup(b->rhs);
           if (va.stype.id != v4t.id)
             va = ir_->splat_f32(va);
           if (vb.stype.id != v4t.id)
@@ -2559,7 +2581,7 @@ void TaskCodegen::vec_emit_vector_loop(
             QD_ASSERT(false && "unexpected vector op");
           env[stmt] = ir_->vec_f32_bin_op(op, va, vb);
         } else if (auto *u = stmt->cast<UnaryOpStmt>()) {
-          spirv::Value vo = env.at(u->operand);
+          spirv::Value vo = env_lookup(u->operand);
           env[stmt] = (u->op_type == UnaryOpType::neg) ? ir_->vec_f32_neg(vo) : ir_->vec_f32_abs(vo);
         } else {
           QD_ASSERT(false && "unexpected vector stmt");
@@ -2594,7 +2616,7 @@ void TaskCodegen::vec_emit_vector_loop(
       case VecRole::VecStore: {
         auto *gss = stmt->cast<GlobalStoreStmt>();
         auto *ep = gss->dest->cast<ExternalPtrStmt>();
-        spirv::Value val = env.at(gss->val);
+        spirv::Value val = env_lookup(gss->val);
         if (val.stype.id != v4t.id)
           val = ir_->splat_f32(val);
         ir_->store_variable_aligned(vec4_ptr(ep), val, 16);
@@ -2644,7 +2666,7 @@ void TaskCodegen::vec_emit_vector_loop(
             break;
           }
         }
-        spirv::Value acc = env.at(r->load);
+        spirv::Value acc = env_lookup(r->load);
         spirv::Value acc0 = acc;
         const bool load_lhs = (r->op->lhs == r->load);
         const Stmt *x_stmt_full = load_lhs ? r->op->rhs : r->op->lhs;
@@ -2901,10 +2923,19 @@ bool TaskCodegen::try_emit_vectorized_range_for(RangeForStmt *for_stmt) {
   ir_->pop_value_scope();
 
   // ---- [2] vector main loop [start, start + 4*n_vec) ----
+  // Scope the vector walk's name registrations (ScalarMemLoad loads and
+  // ScalarCompute re-emissions): the remainder walk below re-visits the very
+  // same statements and must register them fresh; leaking the vector walk's
+  // entries tripped register_value's duplicate guard on the first in-body
+  // scalar-valued statement ("tmpNN already exists",
+  // mujocoqd/c2-emitter-fixes defect 2). Everything the post-loop code needs
+  // by name (allocas, task-level values) was registered before this push.
+  ir_->push_value_scope();
   std::vector<std::pair<AllocaStmt *, std::pair<spirv::Value, bool>>> spills;
   std::vector<VecReassoc> reassoc;
   vec_emit_vector_loop(for_stmt, body, groups, reductions, roles, e, start, n_vec, g0_vec, base_b0,
                        base_u64_by_arg, scalar_base_by_arg, &spills, &reassoc);
+  ir_->pop_value_scope();
 
   // ---- [3] scalar remainder [start + 4*n_vec, e) ----
   spirv::Value main_end = ir_->add(start, ir_->make_value(spv::OpShiftLeftLogical, i32t, n_vec,
@@ -3018,7 +3049,14 @@ bool TaskCodegen::vec_analyze(RangeForStmt *for_stmt, std::vector<VecMemGroup> *
     }
     auto *ep = is_store ? s->cast<GlobalStoreStmt>()->dest->cast<ExternalPtrStmt>()
                         : s->cast<GlobalLoadStmt>()->src->cast<ExternalPtrStmt>();
-    auto dt = mem->element_type().ptr_removed();
+    // NOTE: mem->element_type() is only meaningful for GlobalLoadStmt; a
+    // GlobalStoreStmt produces no value, so its ret_type stays unset
+    // (unknown) and used to reject EVERY store-bearing inner loop as
+    // "non-f32 memory access" -- reduction loops (no in-body store)
+    // vectorized while elementwise loops never did (mujocoqd/c2-emitter-fixes
+    // defect 3). Judge the dtype on the ext-ptr pointee, which both loads
+    // and stores carry.
+    auto dt = ep->element_type().ptr_removed();
     if (!dt->is_primitive(PrimitiveTypeID::f32)) {
       *why = "non-f32 memory access";
       return false;
@@ -3219,16 +3257,31 @@ bool TaskCodegen::vec_analyze(RangeForStmt *for_stmt, std::vector<VecMemGroup> *
             r.store = st;
             r.binop = bin->op_type;
             r.load_is_lhs = lhs_is_load;
-            // fast iff the accumulated operand DAG is add/mul over loads
-            // only (no neg/sub nodes, no constant factors -- both shapes are
-            // reassociated by the Apple MSL compiler, see ReductionStore).
+            // fast iff the accumulated operand DAG is add/mul over stride-1
+            // IN-BODY loads only (no neg/sub nodes, no constant factors --
+            // both shapes are reassociated by the Apple MSL compiler, see
+            // ReductionStore). A loop-invariant uniform leaf (a load hoisted
+            // out of the loop by cache-loop-invariant-global-vars, or an
+            // in-body coeff-0 load) is common to all four lane products and
+            // gets refolded by Apple's MSL fast-math into (x0+x1+x2+x3)*c,
+            // which reorders the accumulation (measured ~2 ulp on
+            // `s += x[j] * c`): those reductions keep the order-barrier lane
+            // loop, which stays loop-carried hence program-ordered.
             std::function<bool(const Stmt *)> fast_dag = [&](const Stmt *n) -> bool {
               if (auto *nb = n->cast<BinaryOpStmt>()) {
                 if (nb->op_type != BinaryOpType::add && nb->op_type != BinaryOpType::mul)
                   return false;
                 return fast_dag(nb->lhs) && fast_dag(nb->rhs);
               }
-              return n->is<GlobalLoadStmt>();
+              if (auto *nl = n->cast<GlobalLoadStmt>()) {
+                if (nl->parent != body)
+                  return false;  // hoisted invariant load: uniform across lanes
+                for (auto &g : *groups)
+                  if (g.load == nl)
+                    return g.coeff == 1;  // coeff-0: uniform across lanes
+                return false;
+              }
+              return false;
             };
             const Stmt *xd = lhs_is_load ? bin->rhs : bin->lhs;
             r.fast = fast_dag(xd);
