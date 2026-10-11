@@ -1,7 +1,8 @@
 #!/bin/zsh
 # robostudio-main union gate runner — one command, all robostudio gate families.
 #
-# Reproduces the consolidation checks plus gate 9 (reassociate flag).
+# Reproduces the consolidation checks plus gate 9 (reassociate flag) and
+# gate 10 (simt.subgroup/block on Metal + CPU - mujocoqd/subgroup-cpu-support).
 #   7  C2        probe_spirv_vectorize.py metal    -> ALL PASS (bitwise scalar==vec)
 #   8  R5        gate_r5_host_visible.py metal     -> RESULT: PASS (byte parity +
 #                  relative perf pins; small readback <=x0.5 default, 64MB <=x1.2)
@@ -36,8 +37,8 @@ trap 'rm -rf "$TMP"' EXIT
 [[ -x "$PY" ]] || { echo "FATAL: no venv python at $PY (create .venv-consolidated, see docs/build_robostudio.md)" >&2; exit 1; }
 
 PASS=0; NFAIL=0
-gate_pass() { echo "gate $1/9 [$2]: PASS"; (( PASS = PASS + 1 )); }
-gate_fail() { echo "gate $1/9 [$2]: FAIL -- $3"; (( NFAIL = NFAIL + 1 )); }
+gate_pass() { echo "gate $1/10 [$2]: PASS"; (( PASS = PASS + 1 )); }
+gate_fail() { echo "gate $1/10 [$2]: FAIL -- $3"; (( NFAIL = NFAIL + 1 )); }
 
 # wait_gpu_idle: 0 if idle (possibly after waiting), 1 if still busy after 5 min
 wait_gpu_idle() {
@@ -163,6 +164,31 @@ else
   gate_fail 9 "reassociate flag" "gpu-busy"
 fi
 
-echo "UNION GATE: $PASS/9 PASS"
+# 10 subgroup/block stack, Metal + CPU arms (mujocoqd/subgroup-cpu-support) ---------------------
+# Metal arm: the 24/24 availability probe (SPIR-V -> MSL). CPU arm: the virtual-subgroup
+# (group_size=1) + virtual-block (true concurrent threads) probe plus the algorithms CPU gate
+# whose three former expected-error staircase pins are now positive value gates.
+G10_OK=1
+if wait_gpu_idle; then
+  "$PY" -u "$ROOT/tests/robostudio/probe_subgroup_metal.py" metal >"$TMP/g10_metal.log" 2>&1
+  if (( $? == 0 )) && grep -q "ALL PASS" "$TMP/g10_metal.log"; then
+    echo "  subgroup metal: ALL PASS"
+  else
+    G10_OK=0; echo "  subgroup metal: expected ALL PASS:"; grep "^\[FAIL\]\|^\[RAISED\]\|SUMMARY" "$TMP/g10_metal.log" || tail -8 "$TMP/g10_metal.log"
+  fi
+else
+  G10_OK=0; echo "  subgroup metal: gpu-busy"
+fi
+"$PY" -u "$ROOT/tests/robostudio/probe_subgroup_cpu.py" cpu >"$TMP/g10_cpu.log" 2>&1 \
+  && grep -q "ALL PASS" "$TMP/g10_cpu.log" \
+  && echo "  subgroup cpu: ALL PASS" \
+  || { G10_OK=0; echo "  subgroup cpu: expected ALL PASS:"; grep "^\[FAIL\]" "$TMP/g10_cpu.log" || tail -8 "$TMP/g10_cpu.log"; }
+"$PY" -u "$ROOT/tests/robostudio/probe_algorithms_cpu.py" cpu >"$TMP/g10_algos.log" 2>&1 \
+  && grep -q "ALL PASS" "$TMP/g10_algos.log" \
+  && echo "  algorithms cpu: ALL PASS" \
+  || { G10_OK=0; echo "  algorithms cpu: expected ALL PASS:"; grep "^\[FAIL\]" "$TMP/g10_algos.log" || tail -8 "$TMP/g10_algos.log"; }
+(( G10_OK )) && gate_pass 10 "subgroup stack (metal+cpu)" || gate_fail 10 "subgroup stack (metal+cpu)" "see arms above"
+
+echo "UNION GATE: $PASS/10 PASS"
 if (( NFAIL > 0 )); then echo "(logs kept in $TMP)"; trap - EXIT; exit 1; fi
 exit 0
