@@ -78,6 +78,19 @@ newest wheel from there) and:
     zsh scratch/quadrants_c0s/install_qds.sh        # install + marker verify + S2/S3 probes
     zsh scratch/quadrants_c0s/post_install_gate.sh  # 4/4 must PASS
 
+## Union gate — one command
+
+`zsh tests/robostudio/run_robostudio_gates.sh [venv]` runs every family
+in-repo (default venv `.venv-consolidated`): S2 probe, S3 form matrix,
+u8 DLPack cpu+metal (with the pinned f64 expected-failure), readback
+R2/R3 perf pins, the stale-field pytest battery, and the C0S
+single-init battery. The vendored scripts under `tests/robostudio/` are
+verbatim copies of the probes/gates that validated the consolidation
+(originals: robostudio worktree `scratch/quadrants_c0s/probes/`,
+`scratch/quadrants_src/probes/probe_multi_init.py`, and simtest
+qd-render-poc `results/u8_dlpack_gate.py`); the readback gate was
+extracted verbatim from post_install_gate.sh's gate-4 heredoc.
+
 ## Retirement (documented recommendation; not executed)
 
 `scratch/quadrants_src` is superseded: its unique content (S2/S3/C0S
