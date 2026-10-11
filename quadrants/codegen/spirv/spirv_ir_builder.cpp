@@ -1,5 +1,6 @@
 #include "quadrants/codegen/spirv/spirv_ir_builder.h"
 #include "fp16.h"
+#include "spirv/unified1/GLSL.std.450.h"
 
 namespace quadrants::lang {
 
@@ -1039,6 +1040,83 @@ void IRBuilder::store_variable(Value pointer, Value value) {
   QD_ASSERT(value.stype.id == pointer.stype.element_type_id);
   if (pointer.flag == ValueKind::kPhysicalPtr) {
     uint32_t alignment = uint32_t(get_primitive_type_size(value.stype.dt));
+    ib_.begin(spv::OpStore).add_seq(pointer, value, spv::MemoryAccessAlignedMask, alignment).commit(&function_);
+  } else {
+    ib_.begin(spv::OpStore).add_seq(pointer, value).commit(&function_);
+  }
+}
+
+// ---- C2 SPIR-V inner-loop vectorization helpers ----
+
+Value IRBuilder::splat_f32(Value scalar) {
+  QD_ASSERT(scalar.stype.id == t_fp32_.id);
+  Value ret = new_value(t_v4_fp32_, ValueKind::kNormal);
+  ib_.begin(spv::OpCompositeConstruct)
+      .add_seq(t_v4_fp32_, ret, scalar, scalar, scalar, scalar)
+      .commit(&function_);
+  return ret;
+}
+
+Value IRBuilder::extract_lane_f32(Value vec, uint32_t lane) {
+  QD_ASSERT(vec.stype.id == t_v4_fp32_.id);
+  Value ret = new_value(t_fp32_, ValueKind::kNormal);
+  ib_.begin(spv::OpCompositeExtract).add_seq(t_fp32_, ret, vec, lane).commit(&function_);
+  return ret;
+}
+
+Value IRBuilder::vec_f32_bin_op(spv::Op op, Value a, Value b) {
+  QD_ASSERT(a.stype.id == t_v4_fp32_.id && b.stype.id == t_v4_fp32_.id);
+  QD_ASSERT(op == spv::OpFAdd || op == spv::OpFSub || op == spv::OpFMul || op == spv::OpFDiv);
+  return make_value(op, t_v4_fp32_, a, b);
+}
+
+Value IRBuilder::vec_f32_neg(Value a) {
+  QD_ASSERT(a.stype.id == t_v4_fp32_.id);
+  return make_value(spv::OpFNegate, t_v4_fp32_, a);
+}
+
+Value IRBuilder::vec_f32_abs(Value a) {
+  QD_ASSERT(a.stype.id == t_v4_fp32_.id);
+  return call_glsl450(t_v4_fp32_, GLSLstd450FAbs, a);
+}
+
+Value IRBuilder::physical_vec4_ptr(Value base_u64, Value elem_idx4) {
+  SType ptr_type = get_pointer_type(t_v4_fp32_, spv::StorageClassPhysicalStorageBuffer);
+  Value ret = make_value(spv::OpConvertUToPtr, ptr_type, base_u64);
+  ret.flag = ValueKind::kPhysicalPtr;
+  Value chained = make_value(spv::OpPtrAccessChain, ptr_type, ret, elem_idx4);
+  chained.flag = ValueKind::kPhysicalPtr;
+  return chained;
+}
+
+Value IRBuilder::load_variable_aligned(Value pointer, const SType &res_type, uint32_t alignment, bool is_volatile) {
+  QD_ASSERT(pointer.flag == ValueKind::kPhysicalPtr || pointer.flag == ValueKind::kVariablePtr);
+  Value ret = new_value(res_type, ValueKind::kNormal);
+  if (pointer.flag == ValueKind::kPhysicalPtr) {
+    // Physical pointers require the Aligned mask; OR in Volatile when asked
+    // (same encoding as the scalar `load_variable` physical path).
+    if (is_volatile) {
+      ib_.begin(spv::OpLoad)
+          .add_seq(res_type, ret, pointer, spv::MemoryAccessAlignedMask | spv::MemoryAccessVolatileMask, alignment)
+          .commit(&function_);
+    } else {
+      ib_.begin(spv::OpLoad)
+          .add_seq(res_type, ret, pointer, spv::MemoryAccessAlignedMask, alignment)
+          .commit(&function_);
+    }
+  } else {
+    if (is_volatile) {
+      ib_.begin(spv::OpLoad).add_seq(res_type, ret, pointer, spv::MemoryAccessVolatileMask).commit(&function_);
+    } else {
+      ib_.begin(spv::OpLoad).add_seq(res_type, ret, pointer).commit(&function_);
+    }
+  }
+  return ret;
+}
+
+void IRBuilder::store_variable_aligned(Value pointer, Value value, uint32_t alignment) {
+  QD_ASSERT(pointer.flag == ValueKind::kPhysicalPtr || pointer.flag == ValueKind::kVariablePtr);
+  if (pointer.flag == ValueKind::kPhysicalPtr) {
     ib_.begin(spv::OpStore).add_seq(pointer, value, spv::MemoryAccessAlignedMask, alignment).commit(&function_);
   } else {
     ib_.begin(spv::OpStore).add_seq(pointer, value).commit(&function_);
