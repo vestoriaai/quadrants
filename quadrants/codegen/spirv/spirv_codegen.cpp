@@ -1927,6 +1927,14 @@ void TaskCodegen::visit(IfStmt *if_stmt) {
 }
 
 void TaskCodegen::visit(RangeForStmt *for_stmt) {
+  // C2 (mujocoqd/spirv-vectorize): an innermost serial range loop with
+  // provably stride-1 ndarray accesses is re-emitted as
+  // [align-up scalar prologue] + [float4 vector main loop] + [scalar
+  // remainder] with bitwise-identical semantics. Falls back to the plain
+  // scalar path below unless every safety rule of `vec_analyze` holds.
+  if (try_emit_vectorized_range_for(for_stmt)) {
+    return;
+  }
   auto loop_var_name = for_stmt->raw_name();
   // Must get init label after making value(to make sure they are correct)
   spirv::Label init_label = ir_->current_label();
@@ -1982,6 +1990,1219 @@ void TaskCodegen::visit(RangeForStmt *for_stmt) {
   ir_->make_inst(spv::OpBranch, head_label);
   // loop merge
   ir_->start_label(merge_label);
+}
+
+// ============================================================================
+// C2: SPIR-V inner-loop vectorization (SIMD-within-thread).
+//
+// An innermost runtime `range` loop whose body is straight-line and whose
+// ndarray accesses are provably stride-1 (element-unit coefficient of the loop
+// index == 1) is emitted as three sequential loops over the same iteration
+// space:
+//
+//   [scalar prologue, <4 iters: aligns the group base addresses to 16B]
+//   [vector main loop: float4 loads/stores + lane-wise compute, step 4]
+//   [scalar remainder]
+//
+// Bitwise-equality contract vs the scalar path:
+//   * every element is touched by exactly one of the three loops, in the
+//     original order, with the same per-element instruction sequence;
+//   * loop-carried reductions keep a single SCALAR accumulator updated in
+//     lane order inside the vector loop, so the floating-point evaluation
+//     order is identical;
+//   * non-carried locals are computed lane-wise on vectors; their final
+//     lane-3 value is spilled to the scalar alloca after the loop, which is
+//     exactly the "last scalar iteration wins" semantics;
+//   * vector arithmetic ops are the same opcodes as the scalar ones
+//     (OpFAdd/OpFMul/... on <4 x float>), so per-lane rounding is identical.
+//
+// Safety rules (any violation -> the loop stays scalar):
+//   * body whitelist: Const / Alloca / LocalLoad / LocalStore / BinaryOp /
+//     UnaryOp / GlobalLoad / GlobalStore / LoopIndex / ExternalPtr /
+//     ExternalTensorShapeAlongAxis / ArgLoad (as ext-ptr base only);
+//   * no if / while / atomics / random / nested loops / continue / casts;
+//   * f32 elements, scalar ndarrays (no element_shape), i32 loop bounds;
+//   * physical-storage-buffer devices only (Metal on Apple silicon; the
+//     buffer-binding path stays scalar);
+//   * stores must be stride-1 (loop-invariant stores rejected);
+//   * two access sites on the SAME ndarray arg are only allowed when all
+//     their bases are structurally equal (same element per iteration,
+//     program order preserved); different args are assumed not to alias,
+//     matching the LLVM backend's assumption;
+//   * reduction allocas: the accumulator may only be loaded by its own
+//     accumulate op and must not be consumed as a lane-varying value;
+//   * body values may not escape the loop (cross-block SSA uses).
+// ============================================================================
+
+static constexpr int64_t kVecMaxAffineCoeff = 1 << 20;
+
+static int64_t vec_const_i64(const ConstStmt *c) {
+  const auto &v = c->val;
+  if (v.dt->is_primitive(PrimitiveTypeID::i32))
+    return v.val_i32;
+  if (v.dt->is_primitive(PrimitiveTypeID::u32))
+    return (int64_t)v.val_u32;
+  if (v.dt->is_primitive(PrimitiveTypeID::i64))
+    return v.val_i64;
+  if (v.dt->is_primitive(PrimitiveTypeID::i16))
+    return v.val_i16;
+  if (v.dt->is_primitive(PrimitiveTypeID::u16))
+    return v.val_u16;
+  if (v.dt->is_primitive(PrimitiveTypeID::i8))
+    return v.val_i8;
+  if (v.dt->is_primitive(PrimitiveTypeID::u8))
+    return v.val_u8;
+  return 0;
+}
+
+bool TaskCodegen::spirv_vectorize_enabled() const {
+  if (compile_config_ == nullptr || !compile_config_->spirv_vectorize)
+    return false;
+  if (arch_ != Arch::metal && arch_ != Arch::vulkan)
+    return false;
+  if (for_stmt_guard_)
+    return false;  // re-entrant visit of a nested loop inside vector emission
+  return caps_->get(DeviceCapability::spirv_has_physical_storage_buffer) != 0;
+}
+
+// Structural equality of two pure-integer expressions with respect to the
+// candidate loop (the loop index counts as "equal to itself"). Used for the
+// same-arg base-conflict rule.
+static bool vec_struct_eq(const Stmt *a_, const Stmt *b_, const RangeForStmt *loop) {
+  auto *a = const_cast<Stmt *>(a_);
+  auto *b = const_cast<Stmt *>(b_);
+  if (a == b)
+    return true;
+  if (a->type() != b->type())
+    return false;
+  if (auto *ca = a->cast<ConstStmt>()) {
+    auto *cb = b->cast<ConstStmt>();
+    return ca->val.dt == cb->val.dt && ca->val.value_bits == cb->val.value_bits;
+  }
+  if (auto *ba = a->cast<BinaryOpStmt>()) {
+    auto *bb = b->cast<BinaryOpStmt>();
+    return ba->op_type == bb->op_type && vec_struct_eq(ba->lhs, bb->lhs, loop) &&
+           vec_struct_eq(ba->rhs, bb->rhs, loop);
+  }
+  if (auto *ua = a->cast<UnaryOpStmt>()) {
+    auto *ub = b->cast<UnaryOpStmt>();
+    return ua->op_type == ub->op_type && vec_struct_eq(ua->operand, ub->operand, loop);
+  }
+  if (auto *la = a->cast<LoopIndexStmt>()) {
+    auto *lb = b->cast<LoopIndexStmt>();
+    return la->loop == lb->loop && la->index == lb->index;
+  }
+  if (auto *sa = a->cast<ExternalTensorShapeAlongAxisStmt>()) {
+    auto *sb = b->cast<ExternalTensorShapeAlongAxisStmt>();
+    return sa->arg_id == sb->arg_id && sa->axis == sb->axis;
+  }
+  return false;
+}
+
+bool TaskCodegen::vec_affine_coeff(const Stmt *stmt, const RangeForStmt *loop, int64_t *coeff) const {
+  if (auto *li = stmt->cast<LoopIndexStmt>()) {
+    if (li->loop == loop) {
+      *coeff = 1;
+      return true;
+    }
+    if (li->index == 0)
+      *coeff = 0;
+    return li->index == 0;
+  }
+  if (auto *c = stmt->cast<ConstStmt>()) {
+    const auto &v = c->val.dt;
+    if (!is_integral(v))
+      return false;
+    *coeff = 0;
+    return true;
+  }
+  if (stmt->is<ExternalTensorShapeAlongAxisStmt>()) {
+    *coeff = 0;
+    return true;
+  }
+  if (auto *b = stmt->cast<BinaryOpStmt>()) {
+    int64_t cl = 0, cr = 0;
+    if (!vec_affine_coeff(b->lhs, loop, &cl) || !vec_affine_coeff(b->rhs, loop, &cr))
+      return false;
+    switch (b->op_type) {
+      case BinaryOpType::add:
+        *coeff = cl + cr;
+        break;
+      case BinaryOpType::sub:
+        *coeff = cl - cr;
+        break;
+      case BinaryOpType::mul: {
+        if (cl == 0 && cr == 0) {
+          *coeff = 0;
+        } else if (cl == 0) {
+          auto *lc = b->lhs->cast<ConstStmt>();
+          if (lc == nullptr || !is_integral(lc->val.dt))
+            return false;
+          *coeff = vec_const_i64(lc) * cr;
+        } else if (cr == 0) {
+          auto *rc = b->rhs->cast<ConstStmt>();
+          if (rc == nullptr || !is_integral(rc->val.dt))
+            return false;
+          *coeff = cl * vec_const_i64(rc);
+        } else {
+          return false;
+        }
+        break;
+      }
+      default:
+        return false;
+    }
+    *coeff = std::min<int64_t>(std::max<int64_t>(*coeff, -kVecMaxAffineCoeff), kVecMaxAffineCoeff);
+    return true;
+  }
+  if (auto *u = stmt->cast<UnaryOpStmt>()) {
+    if (u->op_type != UnaryOpType::neg)
+      return false;
+    int64_t co = 0;
+    if (!vec_affine_coeff(u->operand, loop, &co))
+      return false;
+    *coeff = -co;
+    return true;
+  }
+  return false;
+}
+
+bool TaskCodegen::vec_emit_affine(const Stmt *stmt, const RangeForStmt *loop, spirv::Value subst_j,
+                                  spirv::Value *out) {
+  auto i32t = ir_->i32_type();
+  if (auto *li = stmt->cast<LoopIndexStmt>()) {
+    if (li->loop == loop) {
+      *out = subst_j;
+      return true;
+    }
+    // Outer loop index: replicate visit(LoopIndexStmt) without registering a
+    // name (the scalar loops re-visit this stmt and register their own copy).
+    if (li->loop->is<OffloadedStmt>()) {
+      *out = ir_->query_value("ii");
+    } else if (li->loop->is<RangeForStmt>()) {
+      *out = ir_->add(ir_->query_value(li->loop->raw_name()), ir_->const_i32_zero_);
+    } else {
+      return false;
+    }
+    return true;
+  }
+  if (auto *c = stmt->cast<ConstStmt>()) {
+    *out = ir_->int_immediate_number(i32t, vec_const_i64(c));
+    return true;
+  }
+  if (auto *shp = stmt->cast<ExternalTensorShapeAlongAxisStmt>()) {
+    // Replicate visit(ExternalTensorShapeAlongAxisStmt) without registering.
+    std::vector<int> indices = shp->arg_id;
+    indices.push_back(TypeFactory::SHAPE_POS_IN_NDARRAY);
+    indices.push_back(shp->axis);
+    spirv::Value var_ptr = ir_->make_access_chain(ir_->get_pointer_type(i32t, spv::StorageClassUniform),
+                                                  get_buffer_value(BufferType::Args, PrimitiveType::i32), indices);
+    var_ptr.flag = ValueKind::kVariablePtr;
+    *out = ir_->load_variable(var_ptr, i32t);
+    return true;
+  }
+  if (auto *b = stmt->cast<BinaryOpStmt>()) {
+    spirv::Value l, r;
+    if (!vec_emit_affine(b->lhs, loop, subst_j, &l) || !vec_emit_affine(b->rhs, loop, subst_j, &r))
+      return false;
+    switch (b->op_type) {
+      case BinaryOpType::add:
+        *out = ir_->add(l, r);
+        return true;
+      case BinaryOpType::sub:
+        *out = ir_->sub(l, r);
+        return true;
+      case BinaryOpType::mul:
+        *out = ir_->mul(l, r);
+        return true;
+      default:
+        return false;
+    }
+  }
+  if (auto *u = stmt->cast<UnaryOpStmt>()) {
+    if (u->op_type != UnaryOpType::neg)
+      return false;
+    spirv::Value o;
+    if (!vec_emit_affine(u->operand, loop, subst_j, &o))
+      return false;
+    *out = ir_->make_value(spv::OpSNegate, i32t, o);
+    return true;
+  }
+  return false;
+}
+
+// Replicates the element-unit linearization of `visit(ExternalPtrStmt)` for a
+// scalar-shape f32 ndarray, with the candidate loop index replaced by
+// `subst_j`. Scalar ndarrays only (element_shape empty).
+bool TaskCodegen::vec_emit_linear_elem(ExternalPtrStmt *ep, const RangeForStmt *loop, spirv::Value subst_j,
+                                       spirv::Value *out) {
+  const int num_indices = (int)ep->indices.size();
+  if (!ep->element_shape.empty())
+    return false;
+  spirv::Value linear = ir_->int_immediate_number(ir_->i32_type(), 0);
+  for (int i = 0; i < num_indices; i++) {
+    std::vector<int> shape_idx = ep->base_ptr->cast<ArgLoadStmt>()->arg_id;
+    shape_idx.push_back(TypeFactory::SHAPE_POS_IN_NDARRAY);
+    shape_idx.push_back(i);
+    spirv::Value size_ptr = ir_->make_access_chain(ir_->get_pointer_type(ir_->i32_type(), spv::StorageClassUniform),
+                                                   get_buffer_value(BufferType::Args, PrimitiveType::i32), shape_idx);
+    size_ptr.flag = ValueKind::kVariablePtr;
+    spirv::Value size_var = ir_->load_variable(size_ptr, ir_->i32_type());
+    spirv::Value idx;
+    if (!vec_emit_affine(ep->indices[i], loop, subst_j, &idx))
+      return false;
+    linear = ir_->add(ir_->mul(linear, size_var), idx);
+  }
+  *out = linear;
+  return true;
+}
+
+void TaskCodegen::vec_emit_scalar_range_loop(spirv::Value begin_val, spirv::Value end_val, RangeForStmt *for_stmt,
+                                             Block *body, spirv::Value *loop_var_out) {
+  auto loop_var_name = for_stmt->raw_name();
+  spirv::Label init_label = ir_->current_label();
+  spirv::Label head_label = ir_->new_label();
+  spirv::Label body_label = ir_->new_label();
+  spirv::Label continue_label = ir_->new_label();
+  spirv::Label merge_label = ir_->new_label();
+
+  ir_->make_inst(spv::OpBranch, head_label);
+  ir_->start_label(head_label);
+  spirv::PhiValue loop_var = ir_->make_phi(begin_val.stype, 2);
+  loop_var.set_incoming(0, begin_val, init_label);
+  spirv::Value loop_cond = ir_->lt(loop_var, end_val);
+  ir_->make_inst(spv::OpLoopMerge, merge_label, continue_label, spv::LoopControlMaskNone);
+  ir_->make_inst(spv::OpBranchConditional, loop_cond, body_label, merge_label);
+
+  ir_->start_label(body_label);
+  push_loop_control_labels(continue_label, merge_label);
+  ir_->register_value(loop_var_name, spirv::Value(loop_var));
+  body->accept(this);
+  pop_loop_control_labels();
+  ir_->make_inst(spv::OpBranch, continue_label);
+
+  ir_->start_label(continue_label);
+  spirv::Value next_value = ir_->add(loop_var, ir_->const_i32_one_);
+  loop_var.set_incoming(1, next_value, ir_->current_label());
+  ir_->make_inst(spv::OpBranch, head_label);
+  ir_->start_label(merge_label);
+  if (loop_var_out != nullptr)
+    *loop_var_out = loop_var;
+}
+
+void TaskCodegen::vec_emit_vector_loop(
+    const RangeForStmt *for_stmt,
+    Block *body,
+    const std::vector<VecMemGroup> &groups,
+    const std::vector<VecReduction> &reductions,
+    const std::unordered_map<const Stmt *, VecRole> &roles,
+    spirv::Value e_val,
+    spirv::Value start,
+    spirv::Value n_vec,
+    const std::unordered_map<ExternalPtrStmt *, spirv::Value> &g0_vec,
+    const std::unordered_map<ExternalPtrStmt *, spirv::Value> &base_b0,
+    const std::unordered_map<int, spirv::Value> &base_u64_by_arg,
+    const std::unordered_map<int, spirv::Value> &scalar_base_by_arg,
+    std::vector<std::pair<AllocaStmt *, std::pair<spirv::Value, bool>>> *spills) {
+  auto i32t = ir_->i32_type();
+  auto f32t = ir_->f32_type();
+  auto v4t = ir_->v4_f32_type();
+  auto v4ptr = ir_->get_pointer_type(v4t, spv::StorageClassPhysicalStorageBuffer);
+  auto f32ptr = ir_->get_pointer_type(f32t, spv::StorageClassPhysicalStorageBuffer);
+  auto arg_key = [&](ExternalPtrStmt *ep) {
+    return ep->base_ptr->cast<ArgLoadStmt>()->arg_id[0] * 2 + (ep->is_grad ? 1 : 0);
+  };
+
+  // ---- loop skeleton: for (w4 = 0; w4 < n_vec; w4++) ----
+  spirv::Label init_label = ir_->current_label();
+  spirv::Label head_label = ir_->new_label();
+  spirv::Label body_label = ir_->new_label();
+  spirv::Label continue_label = ir_->new_label();
+  spirv::Label merge_label = ir_->new_label();
+  ir_->make_inst(spv::OpBranch, head_label);
+  ir_->start_label(head_label);
+  spirv::PhiValue w4 = ir_->make_phi(i32t, 2);
+  w4.set_incoming(0, ir_->const_i32_zero_, init_label);
+  spirv::Value loop_cond = ir_->lt(w4, n_vec);
+  ir_->make_inst(spv::OpLoopMerge, merge_label, continue_label, spv::LoopControlMaskNone);
+  ir_->make_inst(spv::OpBranchConditional, loop_cond, body_label, merge_label);
+  ir_->start_label(body_label);
+  push_loop_control_labels(continue_label, merge_label);
+  // Loop-varying float4 address: element-group index = g0_vec + w4, byte
+  // address computed explicitly (see the OpPtrAccessChain note above).
+  auto arg_key2 = [&](ExternalPtrStmt *ep) {
+    return ep->base_ptr->cast<ArgLoadStmt>()->arg_id[0] * 2 + (ep->is_grad ? 1 : 0);
+  };
+  auto vec4_ptr = [&](ExternalPtrStmt *ep) {
+    spirv::Value elem4 = ir_->add(g0_vec.at(ep), spirv::Value(w4));
+    spirv::Value byte_off =
+        ir_->make_value(spv::OpShiftLeftLogical, i32t, elem4, ir_->int_immediate_number(i32t, 4));
+    spirv::Value addr =
+        ir_->add(base_u64_by_arg.at(arg_key2(ep)), ir_->make_value(spv::OpSConvert, ir_->u64_type(), byte_off));
+    spirv::Value p = ir_->make_value(spv::OpConvertUToPtr, v4ptr, addr);
+    p.flag = ValueKind::kPhysicalPtr;
+    return p;
+  };
+
+  spirv::Value e_ = e_val, start_ = start;
+  std::unordered_map<const Stmt *, spirv::Value> env;
+  std::unordered_map<const AllocaStmt *, spirv::Value> shadow;
+  // Static-lane scalarized view (fast path): same DAG with
+  // OpCompositeExtract at the vector leaves.
+  std::unordered_map<uint64_t, spirv::Value> scalarized_static;
+  std::function<spirv::Value(const Stmt *, uint32_t)> scalarize_static =
+      [&](const Stmt *stmt, uint32_t lane) -> spirv::Value {
+    const uint64_t key = (uint64_t)(uintptr_t)stmt * 4 + lane;
+    auto it = scalarized_static.find(key);
+    if (it != scalarized_static.end())
+      return it->second;
+    spirv::Value v;
+    if (auto *b = stmt->cast<BinaryOpStmt>()) {
+      spirv::Value l = scalarize_static(b->lhs, lane);
+      spirv::Value r2 = scalarize_static(b->rhs, lane);
+      switch (b->op_type) {
+        case BinaryOpType::add:
+          v = ir_->add(l, r2);
+          break;
+        case BinaryOpType::sub:
+          v = ir_->sub(l, r2);
+          break;
+        case BinaryOpType::mul:
+          v = ir_->mul(l, r2);
+          break;
+        case BinaryOpType::div:
+        case BinaryOpType::truediv:
+          v = ir_->div(l, r2);
+          break;
+        default:
+          QD_ASSERT(false && "unexpected scalarized op");
+      }
+    } else if (auto *u = stmt->cast<UnaryOpStmt>()) {
+      spirv::Value o = scalarize_static(u->operand, lane);
+      if (u->op_type == UnaryOpType::neg)
+        v = ir_->make_value(spv::OpFNegate, ir_->f32_type(), o);
+      else
+        v = ir_->call_glsl450(ir_->f32_type(), GLSLstd450FAbs, o);
+    } else {
+      auto found = env.find(stmt);
+      QD_ASSERT(found != env.end());
+      v = (found->second.stype.id == v4t.id) ? ir_->extract_lane_f32(found->second, lane) : found->second;
+    }
+    scalarized_static.emplace(key, v);
+    return v;
+  };
+
+  // Dynamic-lane scalarized view of the vector values feeding a reduction:
+  // the same pure-arithmetic DAG with OpVectorExtractDynamic at the vector
+  // leaves. The reduction accumulator must be updated by the EXACT scalar op
+  // sequence of the scalar path (bitwise contract), and an exposed 4-lane
+  // chain gets reassociated by Apple's MSL compiler under fast-math
+  // (measured 1-2 ulp drift). Loop-carried chains are NOT reassociated by
+  // this toolchain, so the lane updates run in an inner loop with a
+  // runtime bound (see ReductionStore below).
+  std::function<spirv::Value(const Stmt *, spirv::Value)> scalarize_dyn =
+      [&](const Stmt *stmt, spirv::Value lane) -> spirv::Value {
+    if (auto *b = stmt->cast<BinaryOpStmt>()) {
+      spirv::Value l = scalarize_dyn(b->lhs, lane);
+      spirv::Value r = scalarize_dyn(b->rhs, lane);
+      switch (b->op_type) {
+        case BinaryOpType::add:
+          return ir_->add(l, r);
+        case BinaryOpType::sub:
+          return ir_->sub(l, r);
+        case BinaryOpType::mul:
+          return ir_->mul(l, r);
+        case BinaryOpType::div:
+        case BinaryOpType::truediv:
+          return ir_->div(l, r);
+        default:
+          QD_ASSERT(false && "unexpected scalarized op");
+      }
+    }
+    if (auto *u = stmt->cast<UnaryOpStmt>()) {
+      spirv::Value o = scalarize_dyn(u->operand, lane);
+      if (u->op_type == UnaryOpType::neg)
+        return ir_->make_value(spv::OpFNegate, ir_->f32_type(), o);
+      return ir_->call_glsl450(ir_->f32_type(), GLSLstd450FAbs, o);
+    }
+    auto found = env.find(stmt);
+    QD_ASSERT(found != env.end());
+    if (found->second.stype.id == v4t.id) {
+      return ir_->make_value(spv::OpVectorExtractDynamic, ir_->f32_type(), found->second, lane);
+    }
+    return found->second;
+  };
+  std::unordered_map<const AllocaStmt *, std::pair<spirv::Value, bool>> shadow_final;
+  std::unordered_map<ExternalPtrStmt *, spirv::Value> load_cache;
+  std::unordered_map<const Stmt *, const VecReduction *> red_by_store;
+  for (const auto &r : reductions) {
+    red_by_store[r.store] = &r;
+  }
+
+  for (const auto &stmt_up : body->statements) {
+    Stmt *stmt = stmt_up.get();
+    auto it = roles.find(stmt);
+    VecRole role = (it == roles.end()) ? VecRole::Inert : it->second;
+    switch (role) {
+      case VecRole::Inert:
+        break;
+      case VecRole::ScalarCompute: {
+        stmt->accept(this);
+        env[stmt] = ir_->query_value(stmt->raw_name());
+        break;
+      }
+      case VecRole::VectorCompute: {
+        if (auto *b = stmt->cast<BinaryOpStmt>()) {
+          spirv::Value va = env.at(b->lhs);
+          spirv::Value vb = env.at(b->rhs);
+          if (va.stype.id != v4t.id)
+            va = ir_->splat_f32(va);
+          if (vb.stype.id != v4t.id)
+            vb = ir_->splat_f32(vb);
+          spv::Op op = spv::OpFAdd;
+          if (b->op_type == BinaryOpType::add)
+            op = spv::OpFAdd;
+          else if (b->op_type == BinaryOpType::sub)
+            op = spv::OpFSub;
+          else if (b->op_type == BinaryOpType::mul)
+            op = spv::OpFMul;
+          else if (b->op_type == BinaryOpType::div || b->op_type == BinaryOpType::truediv)
+            op = spv::OpFDiv;
+          else
+            QD_ASSERT(false && "unexpected vector op");
+          env[stmt] = ir_->vec_f32_bin_op(op, va, vb);
+        } else if (auto *u = stmt->cast<UnaryOpStmt>()) {
+          spirv::Value vo = env.at(u->operand);
+          env[stmt] = (u->op_type == UnaryOpType::neg) ? ir_->vec_f32_neg(vo) : ir_->vec_f32_abs(vo);
+        } else {
+          QD_ASSERT(false && "unexpected vector stmt");
+        }
+        break;
+      }
+      case VecRole::VecLoad: {
+        auto *gls = stmt->cast<GlobalLoadStmt>();
+        auto *ep = gls->src->cast<ExternalPtrStmt>();
+        auto cached = load_cache.find(ep);
+        if (cached == load_cache.end()) {
+          cached = load_cache.emplace(
+                ep, ir_->load_variable_aligned(vec4_ptr(ep), v4t, 16, use_volatile_buffer_access_)).first;
+        }
+        env[stmt] = cached->second;
+        break;
+      }
+      case VecRole::ScalarMemLoad: {
+        auto *gls = stmt->cast<GlobalLoadStmt>();
+        auto *ep = gls->src->cast<ExternalPtrStmt>();
+        // coeff == 0: the element index is loop-invariant; reuse the j=b0
+        // evaluation hoisted before the loops.
+        spirv::Value elem = base_b0.at(ep);
+        spirv::Value base = scalar_base_by_arg.at(arg_key(ep));
+        spirv::Value p = ir_->make_value(spv::OpPtrAccessChain, f32ptr, base, elem);
+        p.flag = ValueKind::kPhysicalPtr;
+        spirv::Value v = ir_->load_variable_aligned(p, f32t, 4, use_volatile_buffer_access_);
+        ir_->register_value(stmt->raw_name(), v);
+        env[stmt] = v;
+        break;
+      }
+      case VecRole::VecStore: {
+        auto *gss = stmt->cast<GlobalStoreStmt>();
+        auto *ep = gss->dest->cast<ExternalPtrStmt>();
+        spirv::Value val = env.at(gss->val);
+        if (val.stype.id != v4t.id)
+          val = ir_->splat_f32(val);
+        ir_->store_variable_aligned(vec4_ptr(ep), val, 16);
+        break;
+      }
+      case VecRole::ReductionLoad: {
+        auto *ll = stmt->cast<LocalLoadStmt>();
+        env[stmt] = ir_->load_variable(ir_->query_value(ll->src->raw_name()), f32t);
+        break;
+      }
+      case VecRole::ReductionOp:
+        break;  // combined at the store
+      case VecRole::ReductionStore: {
+        auto *ls = stmt->cast<LocalStoreStmt>();
+        const VecReduction *r = red_by_store.at(ls);
+        spirv::Value acc = env.at(r->load);
+        spirv::Value acc0 = acc;
+        const bool load_lhs = (r->op->lhs == r->load);
+        const Stmt *x_stmt_full = load_lhs ? r->op->rhs : r->op->lhs;
+        if (r->fast) {
+          // Fast path: unrolled static lane extraction. The DAG is pure
+          // add/mul over loads, which the Apple MSL compiler keeps in program
+          // order (verified bitwise on the physics shapes: min_dot, K1, K3,
+          // K4 all match the scalar path bit-for-bit).
+          for (uint32_t lane = 0; lane < 4; ++lane) {
+            spirv::Value x = scalarize_static(x_stmt_full, lane);
+            switch (r->binop) {
+              case BinaryOpType::add:
+                acc = load_lhs ? ir_->add(acc, x) : ir_->add(x, acc);
+                break;
+              case BinaryOpType::sub:
+                acc = load_lhs ? ir_->sub(acc, x) : ir_->sub(x, acc);
+                break;
+              case BinaryOpType::mul:
+                acc = load_lhs ? ir_->mul(acc, x) : ir_->mul(x, acc);
+                break;
+              default:
+                QD_ASSERT(false && "unexpected reduction op");
+            }
+          }
+          ir_->store_variable(ir_->query_value(r->alloca_stmt->raw_name()), acc);
+          break;
+        }
+        // The accumulated operand may carry an explicit neg node (the
+        // frontend lowers `s -= X` to `s + neg(X)`); scalarize_dyn
+        // reproduces it verbatim as an OpFNegate per lane.
+        const Stmt *x_stmt = x_stmt_full;
+        // Order barrier: Apple's MSL compiler reassociates an exposed 4-op
+        // accumulator chain under fast-math (measured 1-2 ulp drift on
+        // `s -= a*b` and `s += x*c` shapes), but leaves loop-carried chains
+        // in program order. The lane updates therefore run in an inner loop
+        // with a RUNTIME bound (always 4 here: the vector loop only covers
+        // full groups, but that is not provable from the bound expression),
+        // so the chain stays loop-carried => bitwise-identical order.
+        spirv::Value eb = ir_->sub(e_, start_);
+        eb = ir_->sub(eb, ir_->mul(spirv::Value(w4), ir_->int_immediate_number(i32t, 4)));
+        spirv::Value bound = ir_->call_glsl450(i32t, GLSLstd450SMin, eb, ir_->int_immediate_number(i32t, 4));
+        spirv::Label ih = ir_->new_label(), ib = ir_->new_label(), ic = ir_->new_label(), im = ir_->new_label();
+        spirv::Label prehead = ir_->current_label();
+        ir_->make_inst(spv::OpBranch, ih);
+        ir_->start_label(ih);
+        spirv::PhiValue lane_phi = ir_->make_phi(i32t, 2);
+        spirv::PhiValue acc_phi = ir_->make_phi(ir_->f32_type(), 2);
+        lane_phi.set_incoming(0, ir_->const_i32_zero_, prehead);
+        acc_phi.set_incoming(0, acc0, prehead);
+        spirv::Value lane_cond = ir_->lt(lane_phi, bound);
+        ir_->make_inst(spv::OpLoopMerge, im, ic, spv::LoopControlMaskNone);
+        ir_->make_inst(spv::OpBranchConditional, lane_cond, ib, im);
+        ir_->start_label(ib);
+        push_loop_control_labels(ic, im);
+        spirv::Value x = scalarize_dyn(x_stmt, spirv::Value(lane_phi));
+        spirv::Value acc_next;
+        switch (r->binop) {
+          case BinaryOpType::add:
+            acc_next = load_lhs ? ir_->add(acc_phi, x) : ir_->add(x, acc_phi);
+            break;
+          case BinaryOpType::sub:
+            acc_next = load_lhs ? ir_->sub(acc_phi, x) : ir_->sub(x, acc_phi);
+            break;
+          case BinaryOpType::mul:
+            acc_next = load_lhs ? ir_->mul(acc_phi, x) : ir_->mul(x, acc_phi);
+            break;
+          default:
+            QD_ASSERT(false && "unexpected reduction op");
+        }
+        pop_loop_control_labels();
+        ir_->make_inst(spv::OpBranch, ic);
+        ir_->start_label(ic);
+        spirv::Value lane_next = ir_->add(lane_phi, ir_->const_i32_one_);
+        lane_phi.set_incoming(1, lane_next, ir_->current_label());
+        acc_phi.set_incoming(1, acc_next, ir_->current_label());
+        ir_->make_inst(spv::OpBranch, ih);
+        ir_->start_label(im);
+        // The loop exits from the head (condition false); the merge's only
+        // predecessor carries the head phi.
+        spirv::PhiValue acc_out = ir_->make_phi(ir_->f32_type(), 1);
+        acc_out.set_incoming(0, spirv::Value(acc_phi), ih);
+        acc = acc_out;
+        ir_->store_variable(ir_->query_value(r->alloca_stmt->raw_name()), acc);
+        break;
+      }
+      case VecRole::ShadowStore: {
+        auto *ls = stmt->cast<LocalStoreStmt>();
+        auto *al = ls->dest->cast<AllocaStmt>();
+        spirv::Value v = env.at(ls->val);
+        shadow[al] = v;
+        shadow_final[al] = {v, v.stype.id == v4t.id};
+        break;
+      }
+      case VecRole::ShadowLoad: {
+        auto *ll = stmt->cast<LocalLoadStmt>();
+        spirv::Value v = shadow.at(ll->src->cast<AllocaStmt>());
+        if (v.stype.id != v4t.id) {
+          // Scalar shadow values may feed plain scalar consumers through the
+          // normal visitor, which queries by name.
+          if (!ir_->check_value_existence(stmt->raw_name()))
+            ir_->register_value(stmt->raw_name(), v);
+        }
+        env[stmt] = v;
+        break;
+      }
+    }
+  }
+
+  pop_loop_control_labels();
+  ir_->make_inst(spv::OpBranch, continue_label);
+  ir_->start_label(continue_label);
+  spirv::Value next_value = ir_->add(w4, ir_->const_i32_one_);
+  w4.set_incoming(1, next_value, ir_->current_label());
+  ir_->make_inst(spv::OpBranch, head_label);
+  ir_->start_label(merge_label);
+
+  for (const auto &[al, val_and_vec] : shadow_final) {
+    spills->emplace_back(const_cast<AllocaStmt *>(al), val_and_vec);
+  }
+}
+
+bool TaskCodegen::try_emit_vectorized_range_for(RangeForStmt *for_stmt) {
+  if (!spirv_vectorize_enabled())
+    return false;
+
+  std::vector<VecMemGroup> groups;
+  std::vector<VecReduction> reductions;
+  std::unordered_map<const Stmt *, VecRole> roles;
+  std::string why;
+  if (!vec_analyze(for_stmt, &groups, &reductions, &roles, &why)) {
+    QD_DEBUG("spirv-vectorize: loop {} not vectorized: {}", for_stmt->raw_name(), why);
+    return false;
+  }
+  Block *body = for_stmt->body.get();
+  auto i32t = ir_->i32_type();
+  spirv::Value b0 = ir_->query_value(for_stmt->begin->raw_name());
+  spirv::Value e = ir_->query_value(for_stmt->end->raw_name());
+
+  // Guard against re-entrant vectorization attempts (the plain visitors we
+  // reuse may walk nested RangeForStmts of the SAME loop body -- there are
+  // none after vec_analyze, but stay defensive).
+  for_stmt_guard_ = true;
+  struct GuardReset {
+    TaskCodegen *self;
+    ~GuardReset() { self->for_stmt_guard_ = false; }
+  } guard_reset{this};
+
+  // ---- hoisted invariants (name scope shared with the prologue loop) ----
+  ir_->push_value_scope();
+
+  // Physical-storage-buffer base pointers per ndarray arg (loop-invariant).
+  std::unordered_map<int, spirv::Value> vec_base_by_arg, scalar_base_by_arg, base_u64_by_arg;
+  auto ensure_bases = [&](ExternalPtrStmt *ep) {
+    auto *al = ep->base_ptr->cast<ArgLoadStmt>();
+    const int key = al->arg_id[0] * 2 + (ep->is_grad ? 1 : 0);
+    if (vec_base_by_arg.count(key))
+      return;
+    std::vector<int> indices = al->arg_id;
+    indices.push_back(ep->is_grad ? TypeFactory::GRAD_PTR_POS_IN_NDARRAY : TypeFactory::DATA_PTR_POS_IN_NDARRAY);
+    spirv::Value addr_ptr = ir_->make_access_chain(ir_->get_pointer_type(ir_->u64_type(), spv::StorageClassUniform),
+                                                   get_buffer_value(BufferType::Args, PrimitiveType::i32), indices);
+    addr_ptr.flag = ValueKind::kVariablePtr;
+    spirv::Value base_u64 = ir_->load_variable(addr_ptr, ir_->u64_type());
+    spirv::Value vbase = ir_->make_value(
+        spv::OpConvertUToPtr, ir_->get_pointer_type(ir_->v4_f32_type(), spv::StorageClassPhysicalStorageBuffer),
+        base_u64);
+    vbase.flag = ValueKind::kPhysicalPtr;
+    spirv::Value sbase = ir_->make_value(
+        spv::OpConvertUToPtr, ir_->get_pointer_type(ir_->f32_type(), spv::StorageClassPhysicalStorageBuffer),
+        base_u64);
+    sbase.flag = ValueKind::kPhysicalPtr;
+    vec_base_by_arg.emplace(key, vbase);
+    scalar_base_by_arg.emplace(key, sbase);
+    // NOTE: vec4-typed PhysicalStorageBuffer pointers must NOT be consumed via
+    // OpPtrAccessChain: SPIRV-Cross scales the chain index by 1 (bytes), not
+    // by sizeof(float4). Vector addressing computes the byte address
+    // explicitly and converts per access; only the scalar base keeps the
+    // proven base+OpPtrAccessChain shape.
+    base_u64_by_arg.emplace(key, base_u64);
+  };
+  for (const auto &g : groups) ensure_bases(g.ptr);
+
+  // Element-index bases and ABSOLUTE alignment classes.
+  // Alignment must be judged on the absolute address (data_ptr + 4*elem):
+  // ndarray mirrors come out of a sub-allocating pool, so the data pointer
+  // itself may be 4-byte but not 16-byte aligned. For each arg the required
+  // element residue is t = ((16 - (data_ptr & 15)) & 15) >> 2 (the pointer
+  // is always element-aligned for f32); a group is alignable when all
+  // groups' residues (elem_base - t) agree mod 4, and k lanes are skipped
+  // so that start hits the residue.
+  std::unordered_map<ExternalPtrStmt *, spirv::Value> g0_vec, base_b0;
+  spirv::Value first_delta{};  // (elem_base_class - t) mod 4 of the first contiguous group
+  spirv::Value same_bool{};
+  auto arg_t_residue = [&](int key) -> spirv::Value {
+    spirv::Value base_u64 = base_u64_by_arg.at(key);
+    spirv::Value ptr_low =
+        ir_->make_value(spv::OpBitcast, i32t,
+                        ir_->make_value(spv::OpBitwiseAnd, ir_->u64_type(), base_u64,
+                                        ir_->uint_immediate_number(ir_->u64_type(), 15)));
+    // t = ((16 - ptr_low) & 15) >> 2
+    spirv::Value t16 = ir_->sub(ir_->int_immediate_number(i32t, 16), ptr_low);
+    t16 = ir_->make_value(spv::OpBitwiseAnd, i32t, t16, ir_->int_immediate_number(i32t, 15));
+    return ir_->make_value(spv::OpShiftRightLogical, i32t, t16, ir_->int_immediate_number(i32t, 2));
+  };
+  for (const auto &g : groups) {
+    spirv::Value base;
+    if (!vec_emit_linear_elem(g.ptr, for_stmt, b0, &base))
+      return false;  // validated during analysis; must not fail
+    base_b0.emplace(g.ptr, base);
+    if (g.coeff == 1) {
+      const int key = g.ptr->base_ptr->cast<ArgLoadStmt>()->arg_id[0] * 2 + (g.ptr->is_grad ? 1 : 0);
+      spirv::Value cls = ir_->make_value(spv::OpBitwiseAnd, i32t, base, ir_->int_immediate_number(i32t, 3));
+      spirv::Value tv = arg_t_residue(key);
+      // delta = (cls - t) & 3
+      // k must satisfy (base + k) == t (mod 4) => delta = (t - cls) & 3.
+      spirv::Value delta = ir_->sub(tv, cls);
+      delta = ir_->make_value(spv::OpBitwiseAnd, i32t, delta, ir_->int_immediate_number(i32t, 3));
+      if (!same_bool.id) {
+        first_delta = delta;
+        same_bool = ir_->eq(delta, delta);  // constant true
+      } else {
+        same_bool = ir_->logical_and(same_bool, ir_->eq(delta, first_delta));
+      }
+    }
+  }
+
+  // k = lanes to skip so that every group base is 16B-aligned at loop start;
+  // if the group residues disagree at runtime, fall back to fully scalar by
+  // making the vector loop empty.
+  spirv::Value eb0 = ir_->sub(e, b0);
+  spirv::Value k = ir_->select(same_bool, first_delta, eb0);
+  k = ir_->call_glsl450(i32t, GLSLstd450SMin, k, eb0);
+  spirv::Value start = ir_->add(b0, k);
+  spirv::Value n_vec =
+      ir_->make_value(spv::OpShiftRightLogical, i32t, ir_->sub(e, start), ir_->int_immediate_number(i32t, 2));
+  for (const auto &g : groups) {
+    if (g.coeff == 1) {
+      spirv::Value g0 = ir_->add(base_b0.at(g.ptr), k);
+      g0_vec.emplace(g.ptr, ir_->make_value(spv::OpShiftRightLogical, i32t, g0, ir_->int_immediate_number(i32t, 2)));
+    }
+  }
+
+  // ---- [1] scalar prologue [b0, start) ----
+  vec_emit_scalar_range_loop(b0, start, const_cast<RangeForStmt *>(for_stmt), body, nullptr);
+  ir_->pop_value_scope();
+
+  // ---- [2] vector main loop [start, start + 4*n_vec) ----
+  std::vector<std::pair<AllocaStmt *, std::pair<spirv::Value, bool>>> spills;
+  vec_emit_vector_loop(for_stmt, body, groups, reductions, roles, e, start, n_vec, g0_vec, base_b0,
+                       base_u64_by_arg, scalar_base_by_arg, &spills);
+
+  // ---- [3] scalar remainder [start + 4*n_vec, e) ----
+  spirv::Value main_end = ir_->add(start, ir_->make_value(spv::OpShiftLeftLogical, i32t, n_vec,
+                                                          ir_->int_immediate_number(i32t, 2)));
+  ir_->push_value_scope();
+  spirv::Value rem_var;
+  vec_emit_scalar_range_loop(main_end, e, const_cast<RangeForStmt *>(for_stmt), body, &rem_var);
+  ir_->pop_value_scope();
+  // Keep the loop-variable name alive after the loop (mirrors the single-loop
+  // baseline where the phi stays registered).
+  ir_->register_value(for_stmt->raw_name(), rem_var);
+
+  // ---- spills: non-carried locals keep "last iteration (lane 3)" semantics ----
+  for (const auto &[al, val_and_vec] : spills) {
+    spirv::Value ptr;
+    if (al->parent == body) {
+      ptr = ir_->alloca_variable(ir_->f32_type());
+    } else {
+      ptr = ir_->query_value(al->raw_name());
+    }
+    spirv::Value v = val_and_vec.second ? ir_->extract_lane_f32(val_and_vec.first, 3) : val_and_vec.first;
+    ir_->store_variable(ptr, v);
+    if (al->parent == body)
+      ir_->register_value(al->raw_name(), ptr);
+  }
+  return true;
+}
+
+bool TaskCodegen::vec_analyze(RangeForStmt *for_stmt, std::vector<VecMemGroup> *groups,
+                              std::vector<VecReduction> *reductions,
+                              std::unordered_map<const Stmt *, VecRole> *roles, std::string *why) const {
+  *why = "ok";
+  Block *body = for_stmt->body.get();
+  if (for_stmt->reversed) {
+    *why = "reversed";
+    return false;
+  }
+  if (for_stmt->is_bit_vectorized || for_stmt->strictly_serialized) {
+    *why = "special loop flags";
+    return false;
+  }
+
+  // -- 0. statement whitelist --
+  for (const auto &s_up : body->statements) {
+    Stmt *s = s_up.get();
+    bool ok = s->is<ConstStmt>() || s->is<AllocaStmt>() || s->is<LocalLoadStmt>() || s->is<LocalStoreStmt>() ||
+              s->is<BinaryOpStmt>() || s->is<UnaryOpStmt>() || s->is<GlobalLoadStmt>() || s->is<GlobalStoreStmt>() ||
+              s->is<LoopIndexStmt>() || s->is<ExternalPtrStmt>() || s->is<ExternalTensorShapeAlongAxisStmt>() ||
+              s->is<ArgLoadStmt>();
+    if (!ok) {
+      *why = fmt::format("stmt type {} not whitelisted", s->raw_name());
+      return false;
+    }
+  }
+
+  // -- 1. memory groups --
+  auto group_coeff = [&](ExternalPtrStmt *ep, int *coeff) -> bool {
+    if (!ep->element_shape.empty())
+      return false;
+    if (ep->indices.size() > 4)
+      return false;
+    auto *al = ep->base_ptr->cast<ArgLoadStmt>();
+    if (al == nullptr)
+      return false;
+    int64_t last = 0;
+    for (int i = 0; i < (int)ep->indices.size(); i++) {
+      int64_t c = 0;
+      if (!vec_affine_coeff(ep->indices[i], for_stmt, &c))
+        return false;
+      if (i + 1 == (int)ep->indices.size())
+        last = c;
+      else if (c != 0)
+        return false;
+    }
+    *coeff = (int)last;
+    return *coeff == 0 || *coeff == 1;
+  };
+
+  for (const auto &s_up : body->statements) {
+    Stmt *s = s_up.get();
+    Stmt *mem = nullptr;
+    bool is_store = false;
+    if (auto *gl = s->cast<GlobalLoadStmt>()) {
+      mem = gl;
+      if (gl->src->cast<ExternalPtrStmt>() == nullptr) {
+        *why = "load from non-ext-ptr";
+        return false;
+      }
+    } else if (auto *gs = s->cast<GlobalStoreStmt>()) {
+      mem = gs;
+      is_store = true;
+      if (gs->dest->cast<ExternalPtrStmt>() == nullptr) {
+        *why = "store to non-ext-ptr";
+        return false;
+      }
+    } else {
+      continue;
+    }
+    auto *ep = is_store ? s->cast<GlobalStoreStmt>()->dest->cast<ExternalPtrStmt>()
+                        : s->cast<GlobalLoadStmt>()->src->cast<ExternalPtrStmt>();
+    auto dt = mem->element_type().ptr_removed();
+    if (!dt->is_primitive(PrimitiveTypeID::f32)) {
+      *why = "non-f32 memory access";
+      return false;
+    }
+    int coeff = 0;
+    if (!group_coeff(ep, &coeff)) {
+      *why = "non-affine or strided access";
+      return false;
+    }
+    if (is_store && coeff != 1) {
+      *why = "loop-invariant or strided store";
+      return false;
+    }
+    VecMemGroup g;
+    g.ptr = ep;
+    g.coeff = coeff;
+    if (is_store)
+      g.store = s->cast<GlobalStoreStmt>();
+    else
+      g.load = s->cast<GlobalLoadStmt>();
+    g.arg_id = ep->base_ptr->cast<ArgLoadStmt>()->arg_id[0];
+    groups->push_back(g);
+  }
+  bool have_contig = false;
+  for (auto &g : *groups)
+    have_contig |= (g.coeff == 1);
+  if (!have_contig) {
+    *why = "no stride-1 group";
+    return false;
+  }
+
+  // -- 2. same-arg conflict rule --
+  {
+    std::unordered_map<int, const VecMemGroup *> representative;
+    for (const auto &g : *groups) {
+      auto it = representative.find(g.arg_id);
+      if (it == representative.end()) {
+        representative[g.arg_id] = &g;
+        continue;
+      }
+      const VecMemGroup &r = *it->second;
+      bool any_store = (g.store != nullptr) || (r.store != nullptr);
+      if (!any_store)
+        continue;  // two reads of the same array: always fine
+      if (g.coeff != r.coeff) {
+        *why = "mixed stride on stored arg";
+        return false;
+      }
+      if (g.coeff == 0) {
+        *why = "invariant store overlaps another access";
+        return false;
+      }
+      // coeff == 1 both: require structurally equal bases (index exprs with
+      // the loop index treated as equal-to-itself).
+      if (g.ptr->indices.size() != r.ptr->indices.size()) {
+        *why = "rank mismatch on stored arg";
+        return false;
+      }
+      for (int i = 0; i < (int)g.ptr->indices.size(); i++) {
+        if (!vec_struct_eq(g.ptr->indices[i], r.ptr->indices[i], for_stmt)) {
+          *why = "phase-offset overlap on stored arg";
+          return false;
+        }
+      }
+    }
+  }
+
+  // -- 3. affine set (offset-expression DAG) and user map --
+  std::unordered_set<const Stmt *> affine_set;
+  std::function<void(const Stmt *)> collect_affine = [&](const Stmt *n) {
+    if (affine_set.count(n))
+      return;
+    if (n->is<LoopIndexStmt>() || n->is<ConstStmt>() || n->is<ExternalTensorShapeAlongAxisStmt>()) {
+      affine_set.insert(n);
+      return;
+    }
+    if (auto *b = n->cast<BinaryOpStmt>()) {
+      int64_t c = 0;
+      if (!vec_affine_coeff(b, for_stmt, &c))
+        return;  // not an affine node after all (leave out; user rule will not involve it)
+      affine_set.insert(n);
+      collect_affine(b->lhs);
+      collect_affine(b->rhs);
+      return;
+    }
+    if (auto *u = n->cast<UnaryOpStmt>()) {
+      int64_t c = 0;
+      if (!vec_affine_coeff(u, for_stmt, &c))
+        return;
+      affine_set.insert(n);
+      collect_affine(u->operand);
+    }
+  };
+  for (const auto &g : *groups) {
+    for (auto *idx : g.ptr->indices)
+      collect_affine(idx);
+  }
+  std::unordered_multimap<const Stmt *, const Stmt *> users;
+  {
+    auto all = irpass::analysis::gather_statements(task_ir_, [](Stmt *) { return true; });
+    for (Stmt *st : all) {
+      for (Stmt *op : st->get_operands()) {
+        users.emplace(op, st);
+      }
+    }
+  }
+  auto user_in_body = [&](const Stmt *s) {
+    auto range = users.equal_range(const_cast<Stmt *>(s));
+    for (auto it = range.first; it != range.second; ++it) {
+      if (it->second->parent != body)
+        return false;
+    }
+    return true;
+  };
+  auto user_ok = [&](const Stmt *s, const std::function<bool(const Stmt *)> &pred) {
+    auto range = users.equal_range(const_cast<Stmt *>(s));
+    for (auto it = range.first; it != range.second; ++it)
+      if (!pred(it->second))
+        return false;
+    return true;
+  };
+
+  // Body values must not escape the loop (allocas may: spill handles them).
+  for (const auto &s_up : body->statements) {
+    Stmt *s = s_up.get();
+    if (s->is<AllocaStmt>())
+      continue;
+    if (!user_in_body(s)) {
+      *why = "value escapes the loop";
+      return false;
+    }
+  }
+  // Loop-index / shape / affine nodes may only feed offset expressions.
+  for (const auto &s_up : body->statements) {
+    Stmt *s = s_up.get();
+    if (!(s->is<LoopIndexStmt>() || s->is<ExternalTensorShapeAlongAxisStmt>() || affine_set.count(s)))
+      continue;
+    if (!user_ok(s, [&](const Stmt *u) {
+          return affine_set.count(u) > 0 || u->is<ExternalPtrStmt>();
+        })) {
+      *why = "loop-dependent value used outside offset expressions";
+      return false;
+    }
+  }
+  // ArgLoads only feed ExternalPtrs.
+  for (const auto &s_up : body->statements) {
+    Stmt *s = s_up.get();
+    if (!s->is<ArgLoadStmt>())
+      continue;
+    if (!user_ok(s, [](const Stmt *u) { return u->is<ExternalPtrStmt>(); })) {
+      *why = "argload used as value";
+      return false;
+    }
+  }
+
+  // -- 4. allocas: reductions / shadows / invariant loads --
+  std::unordered_map<AllocaStmt *, std::vector<LocalStoreStmt *>> stores_of;
+  std::unordered_map<AllocaStmt *, std::vector<std::pair<int, LocalLoadStmt *>>> loads_of;  // (pos, stmt)
+  std::unordered_map<Stmt *, int> pos;
+  for (int i = 0; i < (int)body->statements.size(); i++) {
+    Stmt *s = body->statements[i].get();
+    pos[s] = i;
+    if (auto *ls = s->cast<LocalStoreStmt>()) {
+      auto *al = ls->dest->cast<AllocaStmt>();
+      if (al == nullptr) {
+        *why = "store to non-alloca local";
+        return false;
+      }
+      stores_of[al].push_back(ls);
+    } else if (auto *ll = s->cast<LocalLoadStmt>()) {
+      auto *al = ll->src->cast<AllocaStmt>();
+      if (al == nullptr) {
+        *why = "load from non-alloca local";
+        return false;
+      }
+      loads_of[al].push_back({i, ll});
+    }
+  }
+  std::unordered_map<const Stmt *, VecRole> &role = *roles;
+  std::unordered_set<const AllocaStmt *> reduction_allocas;
+  for (auto &[al, ls] : stores_of) {
+    const bool inside = (al->parent == body);
+    if (ls.size() == 1 && loads_of[al].size() == 1) {
+      auto *st = ls[0];
+      auto *ld = loads_of[al][0].second;
+      auto *bin = st->val->cast<BinaryOpStmt>();
+      if (bin != nullptr && bin->element_type()->is_primitive(PrimitiveTypeID::f32) &&
+          (bin->op_type == BinaryOpType::add || bin->op_type == BinaryOpType::sub ||
+           bin->op_type == BinaryOpType::mul)) {
+        bool lhs_is_load = (bin->lhs == ld);
+        bool rhs_is_load = (bin->rhs == ld);
+        if (lhs_is_load || rhs_is_load) {
+          if (ld->src->cast<AllocaStmt>() == al) {
+            VecReduction r;
+            r.alloca_stmt = al;
+            r.load = ld;
+            r.op = bin;
+            r.store = st;
+            r.binop = bin->op_type;
+            r.load_is_lhs = lhs_is_load;
+            // fast iff the accumulated operand DAG is add/mul over loads
+            // only (no neg/sub nodes, no constant factors -- both shapes are
+            // reassociated by the Apple MSL compiler, see ReductionStore).
+            std::function<bool(const Stmt *)> fast_dag = [&](const Stmt *n) -> bool {
+              if (auto *nb = n->cast<BinaryOpStmt>()) {
+                if (nb->op_type != BinaryOpType::add && nb->op_type != BinaryOpType::mul)
+                  return false;
+                return fast_dag(nb->lhs) && fast_dag(nb->rhs);
+              }
+              return n->is<GlobalLoadStmt>();
+            };
+            const Stmt *xd = lhs_is_load ? bin->rhs : bin->lhs;
+            r.fast = fast_dag(xd);
+            reductions->push_back(r);
+            role[ld] = VecRole::ReductionLoad;
+            role[bin] = VecRole::ReductionOp;
+            role[st] = VecRole::ReductionStore;
+            reduction_allocas.insert(al);
+            continue;
+          }
+        }
+      }
+    }
+    // shadow: every load must be preceded by a store of the same alloca
+    int first_store = 1 << 30;
+    for (auto *st : ls)
+      first_store = std::min(first_store, pos[st]);
+    for (auto &[p, ld] : loads_of[al]) {
+      if (p < first_store) {
+        *why = "local read before write (cross-iteration value)";
+        return false;
+      }
+      role[ld] = VecRole::ShadowLoad;
+    }
+    for (auto *st : ls)
+      role[st] = VecRole::ShadowStore;
+    (void)inside;
+  }
+  // Reduction loads may only feed their own accumulate op.
+  for (const auto &r : *reductions) {
+    if (!user_ok(r.load, [&](const Stmt *u) { return u == r.op; })) {
+      *why = "reduction accumulator leaks";
+      return false;
+    }
+    // and the accumulate op may only feed its store
+    if (!user_ok(r.op, [&](const Stmt *u) { return u == r.store; })) {
+      *why = "accumulate op value reused";
+      return false;
+    }
+  }
+
+  // -- 5. value kinds and compute-role assignment --
+  std::unordered_map<const Stmt *, int> kind;  // 0 scalar, 1 vector
+  for (const auto &s_up : body->statements) {
+    Stmt *s = s_up.get();
+    if (role.count(s))
+      continue;
+    if (s->is<ConstStmt>()) {
+      role[s] = VecRole::ScalarCompute;
+      kind[s] = 0;
+    } else if (s->is<LoopIndexStmt>() || s->is<ExternalPtrStmt>() || s->is<ExternalTensorShapeAlongAxisStmt>() ||
+               s->is<AllocaStmt>()) {
+      role[s] = VecRole::Inert;
+    } else if (auto *al = s->cast<ArgLoadStmt>()) {
+      // Scalar uniform args: loop-invariant values (pointer ArgLoads stay
+      // Inert -- they only ever feed ExternalPtrs, enforced above).
+      role[s] = al->create_load ? VecRole::ScalarCompute : VecRole::Inert;
+      kind[s] = 0;
+    } else if (s->is<LocalLoadStmt>()) {
+      // Load of an alloca never stored inside the loop: loop-invariant scalar.
+      role[s] = VecRole::ScalarCompute;
+      kind[s] = 0;
+    } else if (auto *gl = s->cast<GlobalLoadStmt>()) {
+      int coeff = -1;
+      for (auto &g : *groups)
+        if (g.load == gl)
+          coeff = g.coeff;
+      if (coeff == 1) {
+        role[s] = VecRole::VecLoad;
+        kind[s] = 1;
+      } else {
+        role[s] = VecRole::ScalarMemLoad;
+        kind[s] = 0;
+      }
+    } else if (s->is<GlobalStoreStmt>()) {
+      role[s] = VecRole::VecStore;
+    } else if (auto *b = s->cast<BinaryOpStmt>()) {
+      int kl = 0, kr = 0;
+      auto lit = kind.find(b->lhs);
+      auto rit = kind.find(b->rhs);
+      kl = (lit == kind.end()) ? 0 : lit->second;
+      kr = (rit == kind.end()) ? 0 : rit->second;
+      if (kl == 1 || kr == 1) {
+        if (!b->element_type()->is_primitive(PrimitiveTypeID::f32) ||
+            !(b->op_type == BinaryOpType::add || b->op_type == BinaryOpType::sub ||
+              b->op_type == BinaryOpType::mul || b->op_type == BinaryOpType::div ||
+              b->op_type == BinaryOpType::truediv)) {
+          *why = "unsupported vector binary op";
+          return false;
+        }
+        role[s] = VecRole::VectorCompute;
+        kind[s] = 1;
+      } else {
+        role[s] = VecRole::ScalarCompute;
+        kind[s] = 0;
+      }
+    } else if (auto *u = s->cast<UnaryOpStmt>()) {
+      int ko = 0;
+      auto oit = kind.find(u->operand);
+      ko = (oit == kind.end()) ? 0 : oit->second;
+      if (ko == 1) {
+        if (!u->element_type()->is_primitive(PrimitiveTypeID::f32) ||
+            !(u->op_type == UnaryOpType::neg || u->op_type == UnaryOpType::abs)) {
+          *why = "unsupported vector unary op";
+          return false;
+        }
+        role[s] = VecRole::VectorCompute;
+        kind[s] = 1;
+      } else {
+        role[s] = VecRole::ScalarCompute;
+        kind[s] = 0;
+      }
+    } else {
+      *why = "unclassified stmt";
+      return false;
+    }
+  }
+  return true;
 }
 
 void TaskCodegen::visit(WhileStmt *stmt) {

@@ -110,6 +110,67 @@ class TaskCodegen : public IRVisitor {
   void visit(AdStackAccAdjointStmt *stmt) override;
 
  private:
+  // ---- C2: SPIR-V inner-loop vectorization (SIMD-within-thread) ----
+  // See the long comment above `TaskCodegen::vec_analyze` in spirv_codegen.cpp
+  // for the design and the safety rules.
+  struct VecMemGroup {
+    // Exactly one of load/store is set; `ptr` is the shared ExternalPtrStmt.
+    GlobalLoadStmt *load{nullptr};
+    GlobalStoreStmt *store{nullptr};
+    ExternalPtrStmt *ptr{nullptr};
+    int coeff{0};  // element-unit coefficient of the loop var: 1 = stride-1 contiguous, 0 = loop-invariant
+    int arg_id{-1};
+  };
+  struct VecReduction {
+    AllocaStmt *alloca_stmt{nullptr};
+    LocalLoadStmt *load{nullptr};
+    BinaryOpStmt *op{nullptr};
+    LocalStoreStmt *store{nullptr};
+    BinaryOpType binop{};
+    bool load_is_lhs{true};
+    // Fast path: the accumulated operand is a pure add/mul DAG over loads
+    // (no neg / sub / constant factors). Such chains survive Apple's MSL
+    // fast-math reassociation bitwise (verified on the physics shapes), so
+    // they can use cheap static lane extraction. Everything else takes the
+    // order-barrier path (inner runtime-bound lane loop).
+    bool fast{false};
+  };
+  enum class VecRole {
+    ScalarCompute,     // emit via the normal visitor (accept)
+    VectorCompute,     // lane-wise vector Binary/Unary op
+    VecLoad,           // stride-1 global load -> float4 load
+    ScalarMemLoad,     // loop-invariant global load -> scalar load (hoisted)
+    VecStore,          // stride-1 global store -> float4 store
+    ReductionLoad,     // scalar load of a carried reduction accumulator
+    ReductionOp,       // accumulate op (combined at the store)
+    ReductionStore,    // sequential 4-lane update of the scalar accumulator
+    ShadowStore,       // non-carried local store -> lane env value
+    ShadowLoad,        // non-carried local load -> lane env value
+    Inert,             // ExternalPtr / ArgLoad / shape / affine DAG node: no direct emission
+  };
+
+  bool spirv_vectorize_enabled() const;
+  bool try_emit_vectorized_range_for(RangeForStmt *for_stmt);
+  bool vec_analyze(RangeForStmt *for_stmt, std::vector<VecMemGroup> *groups, std::vector<VecReduction> *reductions,
+                   std::unordered_map<const Stmt *, VecRole> *roles, std::string *reject_reason) const;
+  bool vec_affine_coeff(const Stmt *stmt, const RangeForStmt *loop, int64_t *coeff) const;
+  bool vec_emit_affine(const Stmt *stmt, const RangeForStmt *loop, spirv::Value subst_j, spirv::Value *out);
+  bool vec_emit_linear_elem(ExternalPtrStmt *ep, const RangeForStmt *loop, spirv::Value subst_j, spirv::Value *out);
+  void vec_emit_scalar_range_loop(spirv::Value begin_val, spirv::Value end_val, RangeForStmt *for_stmt,
+                                  Block *body, spirv::Value *loop_var_out);
+  void vec_emit_vector_loop(const RangeForStmt *for_stmt, Block *body, const std::vector<VecMemGroup> &groups,
+                            const std::vector<VecReduction> &reductions,
+                            const std::unordered_map<const Stmt *, VecRole> &roles, spirv::Value e_val,
+                            spirv::Value start,
+                            spirv::Value n_vec, const std::unordered_map<ExternalPtrStmt *, spirv::Value> &g0_vec,
+                            const std::unordered_map<ExternalPtrStmt *, spirv::Value> &base_b0,
+                            const std::unordered_map<int, spirv::Value> &base_u64_by_arg,
+                            const std::unordered_map<int, spirv::Value> &scalar_base_by_arg,
+                            std::vector<std::pair<AllocaStmt *, std::pair<spirv::Value, bool>>> *spills);
+  // Re-entrancy guard: the plain visitors reused during vector emission must
+  // not recurse back into try_emit_vectorized_range_for.
+  bool for_stmt_guard_{false};
+
   void emit_headers();
   void generate_serial_kernel(OffloadedStmt *stmt);
   void gen_array_range(Stmt *stmt);
