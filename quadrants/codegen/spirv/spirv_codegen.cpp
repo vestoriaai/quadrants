@@ -347,6 +347,17 @@ void TaskCodegen::visit(Block *stmt) {
   }
 }
 
+void TaskCodegen::visit(FuncCallStmt *stmt) {
+  // A1 (mujocoqd/compiler-line): non-inlined real_func calls are unimplemented in the SPIR-V
+  // backend (cpu/llvm implements FuncCallStmt). Fail loudly with an actionable message
+  // instead of silently skipping the call and dying downstream on
+  // `query_value: Value "tmp" does not yet exist`.
+  QD_ERROR(
+      "real_func calls (non-inlined) are not supported on this backend (SPIR-V: metal/"
+      "vulkan). Use an inlined @qd.func instead, or @qd.func(early_return=True) for "
+      "guard-clause style code (mujocoqd/compiler-line M2).");
+}
+
 void TaskCodegen::visit(PrintStmt *stmt) {
   if (!caps_->get(DeviceCapability::spirv_has_non_semantic_info)) {
     return;

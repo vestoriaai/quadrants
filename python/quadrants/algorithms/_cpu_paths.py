@@ -24,6 +24,64 @@ from quadrants.types.annotations import template
 from quadrants.types.primitive_types import i32
 
 
+@_func
+def _cpu_sort(keys: template(), tmp_keys: template(), values: template(), tmp_values: template(),
+              scratch: template(), n: i32, has_values: template(), end_bit: template()):
+    """Serial bottom-up merge sort, in place on ``keys``/``values`` (``tmp_*`` = working copies).
+
+    Replaces the GPU LSD-radix staircase on the CPU backend: merge sort has no per-digit
+    scatter addressing to go wrong and is O(n log n) serial (~1.7e6 moves at n=1e5).
+    ``scratch``/``end_bit`` are accepted for signature compatibility with the GPU path and
+    unused here.
+    """
+    loop_config(serialize=True)
+    width = 1
+    while width < n:
+        lo = 0
+        while lo < n:
+            mid = lo + width
+            hi = lo + 2 * width
+            if mid > n:
+                mid = n
+            if hi > n:
+                hi = n
+            # merge keys[lo:mid) and keys[mid:hi) into tmp_keys[lo:hi)
+            i = lo
+            j = mid
+            t = lo
+            while i < mid and j < hi:
+                if keys[j] < keys[i]:
+                    tmp_keys[t] = keys[j]
+                    if has_values:
+                        tmp_values[t] = values[j]
+                    j = j + 1
+                else:
+                    tmp_keys[t] = keys[i]
+                    if has_values:
+                        tmp_values[t] = values[i]
+                    i = i + 1
+                t = t + 1
+            while i < mid:
+                tmp_keys[t] = keys[i]
+                if has_values:
+                    tmp_values[t] = values[i]
+                i = i + 1
+                t = t + 1
+            while j < hi:
+                tmp_keys[t] = keys[j]
+                if has_values:
+                    tmp_values[t] = values[j]
+                j = j + 1
+                t = t + 1
+            lo = lo + 2 * width
+        # copy tmp back into the primary arrays
+        for i in range(n):
+            keys[i] = tmp_keys[i]
+            if has_values:
+                values[i] = tmp_values[i]
+        width = width * 2
+
+
 def is_cpu() -> bool:
     """Host-side predicate, evaluated inside ``qd.static`` during kernel compilation."""
     return current_cfg().arch == _arch_cpu
@@ -49,6 +107,22 @@ def _cpu_reduce_add(arr: template(), out: template(), n: i32):
         for i in range(n):
             run = run + arr[i]
         out[0] = run
+
+
+@_func
+def _cpu_exclusive_scan_minmax(arr: template(), out: template(), n: i32, identity, is_min: template()):
+    """Serial exclusive min/max scan; ``identity`` is the compile-time identity constant
+    (``_typed_min_identity`` / ``_typed_max_identity`` for the dtype, mirrored from the GPU
+    staircase)."""
+    loop_config(serialize=True)
+    if n > 0:
+        run = identity
+        for i in range(n):
+            out[i] = run
+            if is_min:
+                run = min(run, arr[i])
+            else:
+                run = max(run, arr[i])
 
 
 @_func

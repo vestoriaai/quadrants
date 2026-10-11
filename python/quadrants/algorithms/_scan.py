@@ -22,7 +22,8 @@ digit-histogram scan.
 from quadrants.lang.impl import current_cfg, static
 from quadrants.lang.kernel_impl import func as _func
 from quadrants.lang.kernel_impl import kernel
-from quadrants.algorithms._cpu_paths import _cpu_exclusive_scan_add
+from quadrants.algorithms._reduce import _MAX_IDENTITY_BY_DTYPE, _MIN_IDENTITY_BY_DTYPE
+from quadrants.algorithms._cpu_paths import _cpu_exclusive_scan_add, _cpu_exclusive_scan_minmax
 from quadrants.lang.misc import cpu as _arch_cpu
 from quadrants.lang.misc import loop_config
 from quadrants.lang.ops import bit_cast
@@ -522,8 +523,11 @@ def exclusive_scan_min(
 ):
     """Graph-composable ``out[i] = min(arr[0:i])`` (identity ``+extremum`` from ``dtype``). **Experimental** (new API,
     may change). See :func:`exclusive_scan_add` for the top-level-call contract and arg semantics."""
-    wide = _scratch_dtype_for_width(_dtype_width_bytes(dtype))
-    _emit_scan(arr, out, scratch, n, log256_max_n, dtype, wide, _OP_MIN)
+    if static(current_cfg().arch == _arch_cpu):
+        _cpu_exclusive_scan_minmax(arr, out, n, _MIN_IDENTITY_BY_DTYPE[dtype], True)
+    else:
+        wide = _scratch_dtype_for_width(_dtype_width_bytes(dtype))
+        _emit_scan(arr, out, scratch, n, log256_max_n, dtype, wide, _OP_MIN)
 
 
 @_func(requires_top_level=True)
@@ -532,8 +536,11 @@ def exclusive_scan_max(
 ):
     """Graph-composable ``out[i] = max(arr[0:i])`` (identity ``-extremum`` from ``dtype``). **Experimental** (new API,
     may change). See :func:`exclusive_scan_add` for the top-level-call contract and arg semantics."""
-    wide = _scratch_dtype_for_width(_dtype_width_bytes(dtype))
-    _emit_scan(arr, out, scratch, n, log256_max_n, dtype, wide, _OP_MAX)
+    if static(current_cfg().arch == _arch_cpu):
+        _cpu_exclusive_scan_minmax(arr, out, n, _MAX_IDENTITY_BY_DTYPE[dtype], False)
+    else:
+        wide = _scratch_dtype_for_width(_dtype_width_bytes(dtype))
+        _emit_scan(arr, out, scratch, n, log256_max_n, dtype, wide, _OP_MAX)
 
 
 # ---------------------------------------------------------------------------------------------------------------------
