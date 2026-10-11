@@ -30,7 +30,7 @@ TORCH_SP="${QD_GATE_TORCH_SP:-/Users/mini0/Code/simtest/qd-render-poc/.venv/lib/
 TMP="$(mktemp -d /tmp/qds_union_gate.XXXXXX)"
 trap 'rm -rf "$TMP"' EXIT
 
-[[ -x "$PY" ]] || { echo "FATAL: no venv python at $PY (create .venv-consolidated, see BUILD.md)" >&2; exit 1; }
+[[ -x "$PY" ]] || { echo "FATAL: no venv python at $PY (create .venv-consolidated, see docs/build_robostudio.md)" >&2; exit 1; }
 
 PASS=0; NFAIL=0
 gate_pass() { echo "gate $1/6 [$2]: PASS"; (( PASS = PASS + 1 )); }

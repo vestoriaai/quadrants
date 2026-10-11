@@ -5,6 +5,12 @@ robostudio deploys. It replaces the overlay tree
 (`robostudio/.claude/worktrees/parallel-accel/scratch/quadrants_src`),
 which is now a frozen historical artifact (see "Retirement" below).
 
+Companions: `docs/build_robostudio.md` (the operational
+build/install/gate recipe — moved out of the robostudio worktree's
+`scratch/quadrants_c0s/BUILD.md`, now a stub) and
+`docs/robostudio_features.md` (the features ledger — every feature
+commit merged to this branch must update it in the same merge).
+
 ## What the wheel carries
 
 `1.3.4.devN+g<sha>` wheels built from this branch contain ALL patch
