@@ -226,9 +226,13 @@
   同 harness = 2.0 正确。→ **Apple MSL→GPU 编译器 miscompile"循环内条件累加"模式**,
   quadrants 各层(CHI IR/SPIR-V/MSL)均无责;47 行 MSL 可直接报 Apple。per-access
   `Volatile` MemoryAccess 已试、无效(SPIRV-Cross 未落进 MSL)。
-- **状态**:open(根因在 Apple 工具链;quadrants 侧缓解方向 = 代码生成层改写该模式,
-  如 select 无分支化/移动 load 位置,待评估)。与 A2(tile runtime-loop 错值)共享
-  "Apple 编译器对循环携带模式"怀疑。gate 已钉死,Apple 修复或缓解落地后翻绿。
+- **扰动矩阵(p1 去 else / p2 平凡条件 / p3 提载出分支 / p4 MSL 复合赋值)**:全部 4.0
+  ——触发条件就是"分支内 RMW"本身,对 MSL 微形状不敏感。
+- **用户级规避(即刻可用)**:条件累加一律写 `arr[i] += v`(静默原子降级,正确);
+  **避免**显式 `arr[i] = arr[i] + v`。
+- **状态**:open(根因=Apple 工具链;上游动作=以 a5_runner.m + MSL 报 Apple;quadrants
+  侧缓解 = 评估条件 RMW 的 select 无分支化 lower,需设计评审)。与 A2 共享"Apple 编译器
+  对循环携带模式"怀疑。gate 已钉死,Apple 修复或缓解落地后翻绿。
 
 ## A1/A2 — real_func SPIR-V 崩溃 / tile runtime-loop 错值(**open**)
 - A1:最小复现 `p0_realfunc.py`(metal 0/5,cpu 4/5);`print_ir` 定界 = CHI IR 正常,
