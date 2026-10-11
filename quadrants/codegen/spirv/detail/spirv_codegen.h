@@ -135,6 +135,22 @@ class TaskCodegen : public IRVisitor {
     // order-barrier path (inner runtime-bound lane loop).
     bool fast{false};
   };
+  // One reassociated reduction (opt-in `reassociate` flag): the k=4
+  // partial-sum phis carried through the C2 vector main loop. acc[0] seeds
+  // from the pre-loop accumulator (the prologue left it in the alloca);
+  // acc[1..3] seed from the op identity (+0.0, or 1.0 for mul). `next` holds
+  // the per-iteration lane updates, wired as the phis' backedge at the
+  // continue block. The in-loop alloca store is dropped; at loop exit acc[0]
+  // is parked in the alloca so the scalar remainder keeps chaining onto
+  // partial sum 0 (probe-exact order: prologue -> lane 0 -> tail), and the
+  // tree merge ((t + acc1) + (acc2 + acc3), multiplicative for mul) runs
+  // after the remainder in try_emit_vectorized_range_for.
+  struct VecReassoc {
+    AllocaStmt *alloca_stmt{nullptr};
+    BinaryOpType binop{};
+    spirv::PhiValue acc[4];
+    spirv::Value next[4];
+  };
   enum class VecRole {
     ScalarCompute,     // emit via the normal visitor (accept)
     VectorCompute,     // lane-wise vector Binary/Unary op
@@ -150,6 +166,8 @@ class TaskCodegen : public IRVisitor {
   };
 
   bool spirv_vectorize_enabled() const;
+  bool vec_reassociate_enabled() const;
+  bool vec_rea_qualifies(const VecReduction &r) const;
   bool try_emit_vectorized_range_for(RangeForStmt *for_stmt);
   bool vec_analyze(RangeForStmt *for_stmt, std::vector<VecMemGroup> *groups, std::vector<VecReduction> *reductions,
                    std::unordered_map<const Stmt *, VecRole> *roles, std::string *reject_reason) const;
@@ -166,7 +184,8 @@ class TaskCodegen : public IRVisitor {
                             const std::unordered_map<ExternalPtrStmt *, spirv::Value> &base_b0,
                             const std::unordered_map<int, spirv::Value> &base_u64_by_arg,
                             const std::unordered_map<int, spirv::Value> &scalar_base_by_arg,
-                            std::vector<std::pair<AllocaStmt *, std::pair<spirv::Value, bool>>> *spills);
+                            std::vector<std::pair<AllocaStmt *, std::pair<spirv::Value, bool>>> *spills,
+                            std::vector<VecReassoc> *reassoc);
   // Re-entrancy guard: the plain visitors reused during vector emission must
   // not recurse back into try_emit_vectorized_range_for.
   bool for_stmt_guard_{false};

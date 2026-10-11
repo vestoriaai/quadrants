@@ -1,7 +1,7 @@
 #!/bin/zsh
 # robostudio-main union gate runner — one command, all robostudio gate families.
 #
-# Reproduces (in order) the exact checks run at the 2026-10-11 consolidation:
+# Reproduces the consolidation checks plus gate 9 (reassociate flag).
 #   7  C2        probe_spirv_vectorize.py metal    -> ALL PASS (bitwise scalar==vec)
 #   8  R5        gate_r5_host_visible.py metal     -> RESULT: PASS (byte parity +
 #                  relative perf pins; small readback <=x0.5 default, 64MB <=x1.2)
@@ -36,8 +36,8 @@ trap 'rm -rf "$TMP"' EXIT
 [[ -x "$PY" ]] || { echo "FATAL: no venv python at $PY (create .venv-consolidated, see docs/build_robostudio.md)" >&2; exit 1; }
 
 PASS=0; NFAIL=0
-gate_pass() { echo "gate $1/8 [$2]: PASS"; (( PASS = PASS + 1 )); }
-gate_fail() { echo "gate $1/8 [$2]: FAIL -- $3"; (( NFAIL = NFAIL + 1 )); }
+gate_pass() { echo "gate $1/9 [$2]: PASS"; (( PASS = PASS + 1 )); }
+gate_fail() { echo "gate $1/9 [$2]: FAIL -- $3"; (( NFAIL = NFAIL + 1 )); }
 
 # wait_gpu_idle: 0 if idle (possibly after waiting), 1 if still busy after 5 min
 wait_gpu_idle() {
@@ -150,6 +150,19 @@ else
   gate_fail 8 "R5 host-visible readback" "gpu-busy"
 fi
 
-echo "UNION GATE: $PASS/8 PASS"
+# 9  reassociate flag (mujocoqd/reassociate-flag) ------------------------------
+# Three subprocess arms (scalar / vec / rea): OFF-path bitwise parity (hard),
+# non-bitwise reassociated reductions (hard), implication semantics (hard),
+# 1e-5 accuracy vs f64 (hard); in-process interleaved perf pin is WARN-only.
+if wait_gpu_idle; then
+  "$PY" -u "$ROOT/tests/robostudio/probe_reassociate_flag.py" metal >"$TMP/g9.log" 2>&1 \
+    && grep -q "ALL HARD GATES PASS" "$TMP/g9.log" \
+    && gate_pass 9 "reassociate flag" \
+    || { gate_fail 9 "reassociate flag" "output below"; tail -20 "$TMP/g9.log"; }
+else
+  gate_fail 9 "reassociate flag" "gpu-busy"
+fi
+
+echo "UNION GATE: $PASS/9 PASS"
 if (( NFAIL > 0 )); then echo "(logs kept in $TMP)"; trap - EXIT; exit 1; fi
 exit 0

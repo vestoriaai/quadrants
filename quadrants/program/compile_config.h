@@ -66,6 +66,19 @@ struct CompileConfig {
   // the scalar path. Metal/Vulkan only; physical-storage-buffer devices only.
   bool spirv_vectorize{false};
 
+  // mujocoqd/reassociate-flag: opt-in FP reassociation of the loop-carried
+  // scalar reduction accumulators inside the C2 vector main loop. When on,
+  // qualifying reductions (add/mul on either side, or sub with the
+  // accumulator on the LHS) become k=4 partial sums (stride-4) with a tree
+  // merge at loop exit, and the order-barrier inner lane loop is dropped for
+  // them: results are NO longer bitwise identical to the scalar path
+  // (probe-measured payoff 1.5-2.8x on under-occupied long-chain solver
+  // shapes; worst rel-err vs an f64 reference ~1e-6, inside the 1e-5 physics
+  // gate). Implies spirv_vectorize: the mechanism only exists inside the C2
+  // vector path, so a bare reassociate=true silently enabling nothing would
+  // be a footgun. Metal/Vulkan only.
+  bool reassociate{false};
+
   int saturating_grid_dim;
   int max_block_dim;
   int cpu_max_num_threads;

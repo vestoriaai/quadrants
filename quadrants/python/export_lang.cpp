@@ -274,6 +274,11 @@ void export_lang(nb::module_ &m) {
               "C2: SIMD-within-thread vectorization of serial innermost loops on the SPIR-V backends "
               "(Metal/Vulkan). Rewrites stride-1 ndarray inner loops into float4 vector loads/stores with a "
               "sequential scalar reduction accumulator (bitwise-identical results). Default off.")
+      .def_rw("reassociate", &CompileConfig::reassociate,
+              "Opt-in FP reassociation of loop-carried scalar reduction accumulators inside the C2 vector "
+              "main loop: qualifying reductions become k=4 partial sums (stride-4) with a tree merge at "
+              "loop exit (order-barrier dropped). Results are no longer bitwise identical; accuracy stays "
+              "well inside the 1e-5 physics gate. Implies spirv_vectorize. Default off.")
       .def_rw("flatten_if", &CompileConfig::flatten_if,
               "Flatten simple if statements into predicated (branchless) form.")
       .def_rw("make_thread_local", &CompileConfig::make_thread_local,
