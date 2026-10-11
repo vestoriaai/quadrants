@@ -332,6 +332,11 @@ class Kernel(FuncBase):
         self.materialized_kernels: dict[CompiledKernelKeyType, KernelCxx] = {}
         self.has_print = False
         self.use_graph: bool = False
+        # Opt-in flag set by `@qd.kernel(early_return=True)`. When True, the AST transformer rewrites early
+        # `return`s (inside runtime if/for/while) into single-exit form (`__ret{i}` slots + `__done` flag +
+        # guarded successors) before the regular walk, so warp-style guard-clause code compiles without
+        # manual restructuring. See EarlyReturnTransformer. Funcs use the parallel `Func.early_return`.
+        self.use_early_return: bool = False
         # Opt-in flag set by `@qd.kernel(graph=True, checkpoints=True)`. When True, the AST transformer enables
         # `qd.checkpoint(...)` recognition AND auto-wraps every top-level for-loop that isn't already inside a `with
         # qd.checkpoint(...)` block in an implicit no-yield checkpoint. When False, any use of `qd.checkpoint(...)` in

@@ -16,9 +16,11 @@ The per-block partials stage through a **caller-owned** scratch buffer (``u32`` 
 import struct
 
 from quadrants.lang.expr import make_constant_expr
-from quadrants.lang.impl import static
+from quadrants.lang.impl import current_cfg, static
 from quadrants.lang.kernel_impl import func as _func
 from quadrants.lang.kernel_impl import kernel
+from quadrants.algorithms._cpu_paths import _cpu_reduce_add
+from quadrants.lang.misc import cpu as _arch_cpu
 from quadrants.lang.misc import loop_config
 from quadrants.lang.ops import bit_cast
 from quadrants.lang.simt import block as _block
@@ -465,8 +467,12 @@ def reduce_add(
     count - the emitted reduce handles any count ``<= BLOCK_DIM ** log256_max_n``. Size ``scratch`` via
     :func:`reduce_scratch_slots` ``(capacity_n, log256_max_n)``.
     """
-    wide = _scratch_dtype_for_width(_dtype_width_bytes(dtype))  # compile-time (from the dtype template); not a static()
-    _emit_reduce(arr, out, scratch, n, log256_max_n, dtype, wide, _OP_ADD)
+    if static(current_cfg().arch == _arch_cpu):
+        # C5 (mujocoqd/compiler-line): CPU backend has no block/subgroup model — serial path.
+        _cpu_reduce_add(arr, out, n)
+    else:
+        wide = _scratch_dtype_for_width(_dtype_width_bytes(dtype))  # compile-time (from the dtype template); not a static()
+        _emit_reduce(arr, out, scratch, n, log256_max_n, dtype, wide, _OP_ADD)
 
 
 @_func(requires_top_level=True)

@@ -32,3 +32,21 @@ A lane is the position of a thread within its subgroup, numbered from 0 to the s
 ## Shared memory
 
 Shared memory is fast on-chip memory that every thread in one [block](#block) can read and write, used to pass data between threads that would otherwise only see their own registers and the slower global memory. On the memory-speed spectrum it sits between the two: slower than a thread's own registers, but much faster than global memory. It is small in size, private to a single block, and gone once the block finishes. Vendors call it shared memory (CUDA), local data share or LDS (AMD), or threadgroup memory (Metal). In Quadrants you allocate it with `qd.simt.block.SharedArray(shape, dtype)` and coordinate access to it with the block barrier `qd.simt.block.sync()`; see [block primitives](block.md).
+
+## Tuning notes: when `block_dim` matters (mujocoqd/compiler-line C1)
+
+`qd.loop_config(block_dim=N)` is **required** (not merely a hint) when a kernel uses the
+register tiles ([Tile16x16](tile.md) / Tile32x32): the tile distributes one row per lane
+across the subgroup, so the block must be sized to the tile (`block_dim=16` / `32`), and
+batched tile kernels iterate `nworld * TILE` top-level iterations, splitting `idx // TILE`
+into per-world cohorts (see `misc/demos/cholesky_blocked.py`).
+
+For kernels that do **not** use tiles or shared memory, `block_dim` changes GPU scheduling
+but is **not a performance lever for serial-inner-loop shapes**: measured on M-series
+Metal (physics-shaped kernels: per-world thread, runtime-range serial inner loops,
+data-dependent `while`), setting `block_dim` in {64, 128, 256} showed no measurable change
+(`bench_physics.py` / `bench_tune.py` in the mujoco-qo repo). The dominant factors for such
+shapes are data layout (SoA-contiguous; a transposed layout gave ~2x on a
+Jacobian-transpose kernel) and avoiding per-iteration register spilling — not the block
+size. Start tuning with layout and loop structure; reach for `block_dim` only once the
+kernel uses cross-lane primitives.

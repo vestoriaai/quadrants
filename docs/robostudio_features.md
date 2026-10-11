@@ -107,7 +107,16 @@
   to_numpy ≤7ms / from_numpy ≤5ms（实测 ~5.4/3.4ms 档）+ 1KB/4MB/64MB
   字节正确性扫（union runner gate 4/6）。
 
-## Union integration — capture walk defers to S-guard
+## Readback gate-4 perf pins — machine-variance caveat(mujocoqd/compiler-line A/B 实测,2026-10-11)
+- **数据(修正版)**:两次相邻构建实测 to_numpy 7.72 / 9.45ms、from_numpy 7.89 / 6.01ms
+  ——事后核查两次构建**都含** per-access volatile hunk(该 hunk 已随 C5 的 add -A 进
+  HEAD,"对照"未成立),因此这两组数字之差 = **纯机器态方差(±40%)**,与 volatile 改动
+  无关;union gate 4 的绝对毫秒钉值(≤7.0/≤5.0;原值 5.561/3.239 出自另一机器态)在本机
+  当前态下不可稳定满足。正确性字节扫全过,与后端改动无关。volatile-vs-plain 的真实性能
+  A/B 未做(可选后续)。
+- **结论/建议**:gate 4 的绝对 ms 钉值应改为**相对钉值**(如同跑 numpy memcpy 的 ≤2×)或
+  跑前记录机器基线;本轮 mujocoqd/compiler-line 的 5/6 中 gate 4 FAIL 判定为方差,非回归。
+- **状态**:open(钉值策略调整待用户裁决;本轮不静默放宽门限)。
 - **描述**：C0S 的 cache-miss 粗粒度捕获走查让位给 S-guard：带
   generation 戳的捕获交由精确收口点（`impl.subscript` →
   `_check_not_stale`）拒绝；粗走查仅继续拦截**无** generation 戳的捕获
@@ -161,3 +170,88 @@
   （p50 0.11→0.09s；cavity 仅 2 polish 题，总墙收益小，价值在解除
   retreator + 恢复 table 已验证的 4 组形状）。wheel=
   quadrants-1.3.4.dev25+g3297e86fe。
+
+---
+
+# mujocoqd/compiler-line 分支条目(2026-10-11 起,未合入 robostudio-main)
+
+> 来源战役:mujoco-qd 移植 P0(quadrants 替换 mujoco_warp kernel;方案与探针在
+> `/Users/mini0/Code/mujoqo/`)。基线 dev25 探针重跑后开工;每个 landed 条目
+> 带 gate 进 `tests/robostudio/`,合并前 union runner 复跑。
+
+## M2 — early_return 单出口 AST 改写(opt-in)
+- **描述**:`@qd.kernel(early_return=True)` / `@qd.func(early_return=True)`。变换器
+  `ast/ast_transformers/early_return_transformer.py`(新增)在 build_stmts 前把运行时
+  if/for/while 内的 return 机械改写为单出口(`__er_ret{i}` 按注解 `qd.cast` 零初始化 +
+  `__er_done` 标志 + 后继语句包 guard + 循环内 break)。**break 策略分治**:func 内一律
+  break(内联后嵌套,合法);kernel 最外层并行循环只 guard 不 break(前端禁最外层 break,
+  且 SIMT 下发散早退无收益)。`qd.static` 子树不动(static return 本就合法)。旗标贯穿:
+  kernel.py `use_early_return` / func.py `early_return` / kernel_impl 装饰器。函数体文件:
+  function_def_transformer.py(插桩点)、kernel_impl.py、kernel.py、func.py。
+- **背景需求**:mujoco_warp 全库 kernel/func 早退 ~1500 处,前端一律拒绝——移植最大单项
+  机械成本;`@qd.real_func` 的 Metal/SPIR-V 路径崩溃(A1)堵死了替代路。
+- **状态**:landed(分支)+ verified — gate `probe_early_return_forms.py` 8 形态
+  **metal + cpu 双 ALL PASS**(守卫式/while+return/void/静态旁路/元组/嵌套 break/
+  无注解负例/跨调用 flag 重置)。改写正确性基准 = 原语义纯 Python 孪生。
+
+## M4 — build_Return 元组注解崩溃修复
+- **描述**:`ast_transformer.py` build_Return func 分支:`-> tuple[...]` 解析为多槽
+  return_type 时,`return a, b` 求值成不可变 tuple,逐槽 `qd.cast` 原地赋值即
+  TypeError。修复:tuple 归一为 list。
+- **背景需求**:A4(mujoco-qd P0);上游 test_return.py 元组注解用例仅标
+  cpu/cuda/amdgpu,同一根源。
+- **状态**:landed(分支)+ verified — 带注解元组 @qd.func 单出口形式 metal 数值
+  正确;早退形态由 M2 改写器承接。
+
+## C3 — Tile16x16 matmul_ / matmul_at_ / zero_upper_
+- **描述**:`simt/_tile.py` 工厂新增三方法。`matmul_(A,B,alpha)`:self += alpha·A@B;
+  `matmul_at_(A,B,alpha)`:self += alpha·A@Bᵀ(转置由 lane/寄存器索引互换自然获得,
+  分块分解尾更新 `W -= L_ik@L_jkᵀ` 的标配);`zero_upper_()`:cholesky_ 保留上三角,
+  本方法按 lane 清上三角。外层 k 为 runtime range(寄存器压力经验沿 _trsm)。
+- **背景需求**:mujoco-qd Newton 分块 Cholesky 的列 outer 公式仅 17–36 GF/s;
+  tile-tile 乘法是进入真分块路径的前提。
+- **状态**:landed(分支)+ verified — gate `probe_tile_matmul.py`:unit A@B ±alpha
+  vs numpy 1.9e-6;blocked 2×2 分解+求解(A@Bᵀ 更新)1e-6 级,metal ALL PASS
+  (tile 仅 GPU 后端,CPU 按设计报错)。
+
+## M6 — Metal/Vulkan 静默失效选项响亮警告
+- **描述**:`lang/misc.py` init() 在 arch 选定后,metal/vulkan 上请求 `debug=True` /
+  `check_out_of_bound=True` 时 `_qd_core.warn`(warning_code=INERT_DEBUG_OPTS)——
+  此前文档写明"never(无 in-kernel assertion 机制)"但用户零感知。
+- **背景需求**:mujoco-qd P0 D1;移植期任何越界都是未定义行为而用户以为有检查。
+- **状态**:landed(分支)+ verified — metal+debug=True 触发警告,普通 init 不触发。
+
+## A5 — Metal 循环携带内存依赖被破坏(**open,最高严重度**)
+- **现象(最小复现 `tests/robostudio/probe_metal_loopdep.py`)**:同一数组元素在
+  runtime 循环内经 if 条件读改写(`acc[0] = acc[0] + xs[i]`),Metal 丢更新(4.0 vs
+  正确 6.0;cpu 同代码正确)。判别矩阵:无条件嵌套 ✓、`+=` 增广 ✓(静默原子)、
+  显式 RMW + 分支 ✗(serialize/嵌套皆错)、cpu 全对。每次迭代读到循环前的旧值 =
+  load 被跨迭代缓存/外提。`qd.cast` 形初始化不改变行为(非 LICM 层)。
+- **影响**:极常用模式(物理接触遍历、直方图、链表遍历)静默错结果。
+- **归属定案(2026-10-11,决定性实验)**:`QD_DUMP_MSL=1` 导出的 MSL **逐行核验语义正确**
+  (load 在 if 内/循环内);把该 MSL 喂给独立 ObjC harness
+  (`mujoqo/_probe/a5_runner.m`,newLibraryWithSource 全新编译、单线程、struct 布局
+  _Static_assert 校验)脱离 quadrants 全栈直接执行:**仍 4.0**;对照内核(无条件累加)
+  同 harness = 2.0 正确。→ **Apple MSL→GPU 编译器 miscompile"循环内条件累加"模式**,
+  quadrants 各层(CHI IR/SPIR-V/MSL)均无责;47 行 MSL 可直接报 Apple。per-access
+  `Volatile` MemoryAccess 已试、无效(SPIRV-Cross 未落进 MSL)。
+- **扰动矩阵(p1 去 else / p2 平凡条件 / p3 提载出分支 / p4 MSL 复合赋值)**:全部 4.0
+  ——触发条件就是"分支内 RMW"本身,对 MSL 微形状不敏感。
+- **用户级规避(即刻可用)**:条件累加一律写 `arr[i] += v`(静默原子降级,正确);
+  **避免**显式 `arr[i] = arr[i] + v`。
+- **状态**:open(根因=Apple 工具链;上游动作=以 a5_runner.m + MSL 报 Apple;quadrants
+  侧缓解 = 评估条件 RMW 的 select 无分支化 lower,需设计评审)。与 A2 共享"Apple 编译器
+  对循环携带模式"怀疑。gate 已钉死,Apple 修复或缓解落地后翻绿。
+
+## A1/A2 — real_func SPIR-V 崩溃 / tile runtime-loop 错值(**open,机制假设已获 MSL 证据**)
+- A1:最小复现 `p0_realfunc.py`(metal 0/5,cpu 4/5);`print_ir` 定界 = CHI IR 正常,
+  崩在 `spirv_ir_builder.cpp query_value`(SSA 使用先于定义)→ SPIR-V 后端函数调用
+  发射层。
+- A2:MSL diff 定位(dev25+ wheel,QD_DUMP_MSL=1,`p0_block_chol.py` runtime 版 vs
+  `/tmp` 静态展开版,m=48):runtime 版在 for 头部携带 **16 个 tile 寄存器的长 phi 链**
+  (`_1990=_1991, _1993=_1994, ...`, rank-1 内循环跨迭代携带全部 tile 行寄存器),静态版
+  无此结构(直线 SSA)。与 A5 同家族:**Apple 编译器对运行时循环携带值(长 phi 链 /
+  循环携带内存依赖)处理有缺陷**。
+- **缓解设计(已定)**:tile 存活跨循环迭代时**必须静态展开块循环**(mujoco-warp 的
+  matrix_size_static 工厂模式天然满足);文档 tile.md 加限制说明 + 长期报 Apple。
+- **状态**:open — A2 缓解=文档+lint(可选);A1 待 C++ 深挖。复现/gate 已固化。

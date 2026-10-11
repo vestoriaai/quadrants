@@ -37,6 +37,9 @@ if _TYPE_CHECKING:
         def solve_triangular_(self, B: "_TileProto", lower: bool = True) -> None: ...  # noqa: E704
         def _get_col(self, k: Any) -> Any: ...  # noqa: E704
         def _set_col(self, k: Any, val: Any) -> None: ...  # noqa: E704
+        def matmul_(self, A: "_TileProto", B: "_TileProto", alpha: Any) -> None: ...  # noqa: E704
+        def matmul_at_(self, A: "_TileProto", B: "_TileProto", alpha: Any) -> None: ...  # noqa: E704
+        def zero_upper_(self) -> None: ...  # noqa: E704
         def _load(self, arr: Any, row_start: Any, row_end: Any, col_start: Any, col_end: Any) -> None: ...  # noqa: E704
         def _store(
             self, arr: Any, row_start: Any, row_end: Any, col_start: Any, col_end: Any
@@ -409,6 +412,53 @@ def _make_tile_class(N: int, dtype):
             if not lower:
                 raise TypeError(f"{name}.solve_triangular_: only lower=True is supported")
             B._trsm(self)
+
+        @qd.func
+        def matmul_(self, A, B, alpha):
+            """In-place ``self = self + alpha * (A @ B)``.
+
+            All three tiles are register-resident NxN.  Use ``alpha=1.0`` to accumulate and
+            ``alpha=-1.0`` for the accumulate-subtract form blocked factorizations need
+            (``self -= A @ B``).  The outer ``k`` loop is a runtime ``range(N)`` (register-pressure
+            rationale mirrors ``_trsm``); per column, ``A``'s column is read via the static cascade
+            and ``B``'s row ``k`` — which lives in lane ``k``'s registers — is broadcast per column
+            with a subgroup shuffle.
+            """
+            for k in range(N):
+                a_col = A._get_col(k)
+                for j in qd.static(range(N)):
+                    bkj = qd.simt.subgroup.shuffle(B.r[j], qd.u32(k))
+                    self.r[j] = self.r[j] + alpha * (a_col * bkj)
+
+        @qd.func
+        def matmul_at_(self, A, B, alpha):
+            """In-place ``self = self + alpha * (A @ B^T)``.
+
+            The accumulate-subtract form ``alpha=-1`` is exactly the blocked-Cholesky trailing
+            update ``W -= L_ik @ L_jk^T``.  (A@B without transpose is ``matmul_``.)  Per column
+            ``k``: ``b_col`` is lane ``t`` holding ``B[t,k]``, so the static-``j`` shuffle of
+            ``b_col`` from lane ``j`` yields exactly ``B[j,k]`` — the transpose falls out of the
+            lane/register index swap.
+            """
+            for k in range(N):
+                a_col = A._get_col(k)
+                b_col = B._get_col(k)
+                for j in qd.static(range(N)):
+                    bjk = qd.simt.subgroup.shuffle(b_col, qd.u32(j))
+                    self.r[j] = self.r[j] + alpha * (a_col * bjk)
+
+        @qd.func
+        def zero_upper_(self):
+            """Zero the strictly-upper triangle in place (each lane owns row ``tid``).
+
+            ``cholesky_`` leaves the input's upper triangle untouched; blocked callers that store the
+            factor back to a dense array can call this right after ``cholesky_`` so the stored tile is
+            a clean lower-triangular factor instead of factor-above / stale-input-below-diagonal mix.
+            """
+            tid = qd.i32(qd.simt.subgroup.invocation_id())
+            for j in qd.static(range(N)):
+                if tid < j:
+                    self.r[j] = qd.cast(0.0, dtype)
 
         @qd.func
         def _resolve_vec2d(self, arr: qd.template(), row_start, row_stop, col):

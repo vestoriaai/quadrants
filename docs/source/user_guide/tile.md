@@ -233,3 +233,26 @@ Results on RTX PRO 6000 Blackwell, 4096 environments, N=92, f32:
 | baseline (scalar, shared mem) | 64 | 2766 | 1.00x |
 | blocked (scalar, shared mem) | 16 | 2556 | 1.08x |
 | **tile16 (Tile16x16, no shared memory)** | 16 | 533 | **5.19x** |
+
+## Known limitation: tiles in runtime loops (mujocoqd/compiler-line A2)
+
+A tile whose registers are carried across iterations of a **runtime** (non-`qd.static`)
+loop can be miscompiled by the Apple MSL compiler at block counts ≥ 3 — the loop-carried
+register state forms long phi chains that the MSL→GPU compiler mishandles (silent wrong
+results; the identical instruction sequence with `qd.static` unrolling is correct). The
+same compiler family also miscompiles conditional read-modify-write of one array element
+inside runtime loops on Metal (A5, see `tests/robostudio/probe_metal_loopdep.py`).
+
+Rules until fixed upstream (Apple toolchain):
+
+- carry tiles across **`qd.static`** loops only — static unrolling keeps the register state
+  in straight-line code (the blocked-Cholesky demo pattern);
+- when the block count is only known at runtime, prefer restructuring to fixed-size
+  specializations (a compile-time factory keyed on the size), or keep the tile state in a
+  `SharedArray` across iterations instead of in registers;
+- conditional read-modify-write of a single array element inside a runtime loop: write
+  `arr[i] += v` (augmented form lowers to an atomic) — the explicit
+  `arr[i] = arr[i] + v` form loses updates on Metal.
+
+Gate: `tests/robostudio/probe_tile_matmul.py` / `probe_metal_loopdep.py` pin both defects;
+`p0_block_chol.py` (mujocoqo repo) shows the static-vs-runtime correctness split at m=48.

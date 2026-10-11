@@ -34,7 +34,7 @@ _NONE = AutodiffMode.NONE
 class Func(FuncBase):
     function_counter = 1  # MUST start from >= 1, because 0 means "kernel".
 
-    def __init__(self, _func: Callable, _classfunc=False, _pyfunc=False, is_real_function=False) -> None:
+    def __init__(self, _func: Callable, _classfunc=False, _pyfunc=False, is_real_function=False, early_return=False) -> None:
         super().__init__(
             func=_func,
             is_classfunc=_classfunc,
@@ -48,6 +48,9 @@ class Func(FuncBase):
         self.classfunc = _classfunc
         self.pyfunc = _pyfunc
         self.is_real_function = is_real_function
+        # Opt-in flag set by `@qd.func(early_return=True)`: rewrite early `return`s into single-exit form
+        # before the regular AST walk (see EarlyReturnTransformer). Mirrors Kernel.use_early_return.
+        self.early_return = early_return
         self.cxx_function_by_id: dict[int, FunctionCxx] = {}
         self.has_print = False
 

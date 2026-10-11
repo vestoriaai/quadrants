@@ -65,6 +65,11 @@ class TaskCodegen : public IRVisitor {
 
   void visit(OffloadedStmt *) override;
   void visit(Block *stmt) override;
+  // A1 (mujocoqd/compiler-line): real_func calls lower to FuncCallStmt, which the SPIR-V
+  // backend does not implement (cpu/llvm does). Without this override the permissive
+  // visitor skips the call silently and the result use dies with a confusing
+  // `query_value: Value "tmp" does not yet exist` runtime error.
+  void visit(FuncCallStmt *stmt) override;
   void visit(PrintStmt *stmt) override;
   void visit(ConstStmt *const_stmt) override;
   void visit(AllocaStmt *alloca) override;

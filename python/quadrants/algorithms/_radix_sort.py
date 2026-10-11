@@ -52,8 +52,10 @@ owns the buffer (graph- / multi-stream-safe, no global state). :func:`sort` does
 """
 
 from quadrants.lang.impl import static
+from quadrants.algorithms._cpu_paths import _cpu_sort
+from quadrants.lang.impl import current_cfg, static
 from quadrants.lang.kernel_impl import func as _func
-from quadrants.lang.misc import loop_config
+from quadrants.lang.misc import cpu as _arch_cpu, loop_config
 from quadrants.lang.ops import atomic_add, bit_cast
 from quadrants.lang.simt import block as _block
 from quadrants.types.annotations import template
@@ -315,33 +317,38 @@ def sort(
     host-side validation or scratch-sufficiency check (a DtoH would defeat graph capture) - pass distinct, same-shape
     buffers and size ``scratch`` correctly up front.
     """
-    _validate_log256_max_n(log256_max_n)
-    key_width = static(_key_width_bits(key_dtype))
-    num_passes = static(end_bit // RADIX_BITS)
-    needs_twiddle = static(key_dtype in _TWIDDLE_KEY_DTYPES)
-    count = n[()]
-    num_blocks = (count + (BLOCK_DIM - 1)) // BLOCK_DIM
-    hist_len = num_blocks * RADIX_DIGITS
-    if static(needs_twiddle):
-        _radix_twiddle(keys, count, key_dtype, key_width, True)
-    for p in static(range(num_passes)):
-        _emit_pass(
-            keys,
-            tmp_keys,
-            values,
-            tmp_values,
-            scratch,
-            count,
-            num_blocks,
-            hist_len,
-            p,
-            key_dtype,
-            has_values,
-            key_width,
-            log256_max_n,
-        )
-    if static(needs_twiddle):
-        _radix_twiddle(keys, count, key_dtype, key_width, False)
+    if static(current_cfg().arch == _arch_cpu):
+        # C5 (mujocoqd/compiler-line): CPU backend — serial LSD radix sort. u32 keys only
+        # (sign-cast i32 keys first); scratch[0:256] as digit counters.
+        _cpu_sort(keys, tmp_keys, values, tmp_values, scratch, n, has_values, end_bit)
+    else:
+        _validate_log256_max_n(log256_max_n)
+        key_width = static(_key_width_bits(key_dtype))
+        num_passes = static(end_bit // RADIX_BITS)
+        needs_twiddle = static(key_dtype in _TWIDDLE_KEY_DTYPES)
+        count = n[()]
+        num_blocks = (count + (BLOCK_DIM - 1)) // BLOCK_DIM
+        hist_len = num_blocks * RADIX_DIGITS
+        if static(needs_twiddle):
+            _radix_twiddle(keys, count, key_dtype, key_width, True)
+        for p in static(range(num_passes)):
+            _emit_pass(
+                keys,
+                tmp_keys,
+                values,
+                tmp_values,
+                scratch,
+                count,
+                num_blocks,
+                hist_len,
+                p,
+                key_dtype,
+                has_values,
+                key_width,
+                log256_max_n,
+            )
+        if static(needs_twiddle):
+            _radix_twiddle(keys, count, key_dtype, key_width, False)
 
 
 def _min_log256_for_n(n: int) -> int:

@@ -19,9 +19,12 @@ reuses the private ``u32`` / add staircase (:func:`_emit_exclusive_scan_add`, at
 digit-histogram scan.
 """
 
-from quadrants.lang.impl import static
+from quadrants.lang.impl import current_cfg, static
 from quadrants.lang.kernel_impl import func as _func
 from quadrants.lang.kernel_impl import kernel
+from quadrants.algorithms._reduce import _MAX_IDENTITY_BY_DTYPE, _MIN_IDENTITY_BY_DTYPE
+from quadrants.algorithms._cpu_paths import _cpu_exclusive_scan_add, _cpu_exclusive_scan_minmax
+from quadrants.lang.misc import cpu as _arch_cpu
 from quadrants.lang.misc import loop_config
 from quadrants.lang.ops import bit_cast
 from quadrants.lang.simt import block as _block
@@ -506,8 +509,12 @@ def exclusive_scan_add(
     element dtype (pass it explicitly - an ndarray kernel arg has no in-kernel ``.dtype``); ``log256_max_n`` is the
     compile-time phase count - the scan handles any count ``<= BLOCK_DIM ** log256_max_n``. ``out`` must be distinct
     from ``arr``; size ``scratch`` via :func:`exclusive_scan_scratch_slots` ``(capacity_n, log256_max_n)``."""
-    wide = _scratch_dtype_for_width(_dtype_width_bytes(dtype))  # compile-time (from the dtype template)
-    _emit_scan(arr, out, scratch, n, log256_max_n, dtype, wide, _OP_ADD)
+    if static(current_cfg().arch == _arch_cpu):
+        # C5 (mujocoqd/compiler-line): CPU backend has no block/subgroup model — serial path.
+        _cpu_exclusive_scan_add(arr, out, n)
+    else:
+        wide = _scratch_dtype_for_width(_dtype_width_bytes(dtype))  # compile-time (from the dtype template)
+        _emit_scan(arr, out, scratch, n, log256_max_n, dtype, wide, _OP_ADD)
 
 
 @_func(requires_top_level=True)
@@ -516,8 +523,11 @@ def exclusive_scan_min(
 ):
     """Graph-composable ``out[i] = min(arr[0:i])`` (identity ``+extremum`` from ``dtype``). **Experimental** (new API,
     may change). See :func:`exclusive_scan_add` for the top-level-call contract and arg semantics."""
-    wide = _scratch_dtype_for_width(_dtype_width_bytes(dtype))
-    _emit_scan(arr, out, scratch, n, log256_max_n, dtype, wide, _OP_MIN)
+    if static(current_cfg().arch == _arch_cpu):
+        _cpu_exclusive_scan_minmax(arr, out, n, _MIN_IDENTITY_BY_DTYPE[dtype], True)
+    else:
+        wide = _scratch_dtype_for_width(_dtype_width_bytes(dtype))
+        _emit_scan(arr, out, scratch, n, log256_max_n, dtype, wide, _OP_MIN)
 
 
 @_func(requires_top_level=True)
@@ -526,8 +536,11 @@ def exclusive_scan_max(
 ):
     """Graph-composable ``out[i] = max(arr[0:i])`` (identity ``-extremum`` from ``dtype``). **Experimental** (new API,
     may change). See :func:`exclusive_scan_add` for the top-level-call contract and arg semantics."""
-    wide = _scratch_dtype_for_width(_dtype_width_bytes(dtype))
-    _emit_scan(arr, out, scratch, n, log256_max_n, dtype, wide, _OP_MAX)
+    if static(current_cfg().arch == _arch_cpu):
+        _cpu_exclusive_scan_minmax(arr, out, n, _MAX_IDENTITY_BY_DTYPE[dtype], False)
+    else:
+        wide = _scratch_dtype_for_width(_dtype_width_bytes(dtype))
+        _emit_scan(arr, out, scratch, n, log256_max_n, dtype, wide, _OP_MAX)
 
 
 # ---------------------------------------------------------------------------------------------------------------------
