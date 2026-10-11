@@ -162,11 +162,9 @@ if ARM:
     a32 = np.float32(0.5)
 
     # Compile every form once (covers both the analyze verdicts and, on the
-    # dump arm, the SPIR-V dumps of all tasks on disk). k_ew_c0same joins in
-    # the defect-2 fix commit (it trips the remainder duplicate-registration
-    # until then).
+    # dump arm, the SPIR-V dumps of all tasks on disk).
     for kern, args in ((k_ew_arg, (a32, nv)), (k_ew_extemp, (a32, nv)), (k_ew_c0, (c1, nv)),
-                       (k_red_arg, (a32, nv)), (k_red_extemp, (a32, nv)),
+                       (k_ew_c0same, (nv,)), (k_red_arg, (a32, nv)), (k_red_extemp, (a32, nv)),
                        (k_red_c0hoisted, (c1, nv))):
         y = dev(np.zeros((nw, nv), dtype=np.float32))
         kern(x2, y, *args)
@@ -258,6 +256,18 @@ if r.returncode == 0:
             vec4_tasks.append((os.path.basename(f), n_v4))
 gate("G2 k_elementwise actually vectorizes (float4 in dumped SPIR-V)", bool(vec4_tasks),
      f"{vec4_tasks}" if vec4_tasks else "no float4 access found in any k_ew_arg task")
+
+# G3 (defect 2: vector-walk registrations leaked into the remainder walk) -------
+# k_ew_c0same keeps its coeff-0 read IN the body (multi-site same-array read
+# defeats the invariant hoister) -> the vector walk registers it as a
+# ScalarMemLoad; pre-fix the remainder walk's re-registration raised
+# "register_value: tmpNN already exists". Pre-fix evidence: that RuntimeError
+# on the vec arm while the scalar arm ran clean.
+g3_bad = [n for n in ("k_ew_c0same",) if hashes["scalar"].get(n) != hashes["vec"].get(n)]
+gate("G3 coeff-0 in-body read: bitwise scalar==vec, no dup registration", not g3_bad,
+     "" if not g3_bad else f"mismatch: {g3_bad}")
+gate("G3 no IR-builder errors on any form", not any(ir_err.values()),
+     "" if not any(ir_err.values()) else f"{ir_err}")
 
 print(f"\nC2 EMITTER-FIXES GATE arch={ARCH}: "
       f"{'ALL HARD GATES PASS' if not fails else 'FAIL: ' + ', '.join(fails)}")

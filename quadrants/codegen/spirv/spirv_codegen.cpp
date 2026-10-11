@@ -2923,10 +2923,19 @@ bool TaskCodegen::try_emit_vectorized_range_for(RangeForStmt *for_stmt) {
   ir_->pop_value_scope();
 
   // ---- [2] vector main loop [start, start + 4*n_vec) ----
+  // Scope the vector walk's name registrations (ScalarMemLoad loads and
+  // ScalarCompute re-emissions): the remainder walk below re-visits the very
+  // same statements and must register them fresh; leaking the vector walk's
+  // entries tripped register_value's duplicate guard on the first in-body
+  // scalar-valued statement ("tmpNN already exists",
+  // mujocoqd/c2-emitter-fixes defect 2). Everything the post-loop code needs
+  // by name (allocas, task-level values) was registered before this push.
+  ir_->push_value_scope();
   std::vector<std::pair<AllocaStmt *, std::pair<spirv::Value, bool>>> spills;
   std::vector<VecReassoc> reassoc;
   vec_emit_vector_loop(for_stmt, body, groups, reductions, roles, e, start, n_vec, g0_vec, base_b0,
                        base_u64_by_arg, scalar_base_by_arg, &spills, &reassoc);
+  ir_->pop_value_scope();
 
   // ---- [3] scalar remainder [start + 4*n_vec, e) ----
   spirv::Value main_end = ir_->add(start, ir_->make_value(spv::OpShiftLeftLogical, i32t, n_vec,
