@@ -525,3 +525,90 @@
   改动,无前端改动。
 - **状态**:landed(分支 `mujocoqd/reassociate-flag`,未 merge)+ verified(硬门 5/5 +
   union gate 9/9 + test_return 46/46;默认 OFF,OFF 路径逐位不变由 G1 复验)。
+
+---
+
+# mujocoqd/subgroup-cpu-support 条目(2026-10-11;分支 `mujocoqd/subgroup-cpu-support`,design-first 草稿 → 实现)
+
+> 来源需求:用户指令"整体支持 subgroup"。Metal 侧已由探针线②证实全栈可用(24/24,零
+> handback,原子替换 pin 6.2–7.4×);缺口在 CPU 侧——三种形态全报错:block.sync →
+> trace 期 ValueError("not supported for arch");subgroup 集体操作 →
+> `Program::subgroup_size()`=0 断言;裸 SharedArray → `codegen_llvm.cpp
+> TaskCodeGenLLVM::visit(AllocaStmt)`(is_shared 分支)把共享 alloca lower 成
+> addrspace(3) ExternalLinkage 全局,CPU JIT 无后备存储 → kernel JIT
+> 失败("Function not found",jit_cpu.cpp lookup)。三个 expected-error 探针钉在
+> `probe_algorithms_cpu.py`。本线按 C5 余项里的 native 让渡规格(a)/(b) 落 CPU 侧语义。
+
+## 语义设计(定案)
+
+**subgroup 层 = 虚拟组语义(group_size=1)**:CPU 上每线程 = 自己的 subgroup。
+`Program::subgroup_size()` 对 cpu 返回 1(native,一处);`invocation_id()≡0`、
+`elect()≡1`、shuffle/broadcast 全系 = identity、`ballot/ballot_first_n` = bit0、
+reduce 系 = 自身、inclusive = 自身、exclusive = 单位元、segmented = 自身、
+`all_true/any_true/all_equal` = 谓词自身/恒 1、`bitonic_sort_kv` = 恒等
+(`log2_size=0` 在 reductions.py/sorting.py 本来就是文档化的退化情形,静态展开空环)。
+`subgroup.sync()` = no-op(单 lane 子组屏障平凡收敛);`subgroup.mem_fence()` =
+真实 `std::atomic_thread_fence(seq_cst)`(保守超集)。**逐位确定**。
+选择理由:候选 (i) 每 thread 独立 subgroup 是唯一零成本可移植且诚实的方案;
+候选 (ii) 虚拟 32-lane 串行模拟需要协程化 straight-line 代码,不成立且重。
+
+**block 层 = 真并发虚拟 block(每 virtual thread 一条真实线程)**:GPU 语义
+"block_dim 个虚拟线程同时执行循环体,SharedArray 是 block 窗口,barrier 收敛"在
+CPU 上按字面兑现——`cpu_block_parallel_for`(runtime.cpp 新增)把 [begin,end) 按
+block_dim 切 block,**逐个** block 生成 `n_live` 条 std::thread(vt=0..n_live-1,
+vt 即 `block.thread_idx()`,iteration = block 基址 + vt),barrier =
+mutex+condvar 代际屏障(经 `RuntimeContext::block_barrier` 交付),block 之间
+join(SharedArray 窗口不跨 block 交叠,GPU 一致)。CUDA 侧模型逐条对齐:
+`block.sync` 收敛同 block 全部虚拟线程且带内存可见性(屏障自带 happens-before);
+SharedArray 跨虚拟线程可见。block 级集体(`block.reduce_* / *_scan_* /
+sync_*_nonzero / radix_rank`)**零改动**——block.py 的共享内存骨架在
+`SUBGROUP_SIZE=1`(`NUM_SUBGROUPS=block_dim`,每线程 publish 自槽 + 屏障 +
+thread-0 顺序折叠)下自动正确。**响亮拒绝**:非 range-for 任务(serial/struct_for)
+上的 block-tier 操作、`rand` 进 block-tier 循环(rand 状态按 cpu_thread_id 索引,
+vt 会越界)、`block_dim∉[1,1024]`、`block.global_thread_idx()`(维持 ValueError)
+——全部编译期/trace 期报错,无静默错值路径。
+选择理由:barrier 分离的写读模式(write-all → sync → read)在"顺序逐迭代执行"
+模型下**本质上不可实现**(thread 0 读时 thread 255 尚未执行),顺序模拟必然静默
+错值;真线程 + 真屏障是唯一字面正确的兑现。CPU 侧不要求性能(每 block spawn
+线程),换语义诚实。FP 语义:block 级 reduce/scan = thread-0 顺序折叠,同 launch
+内逐位确定(确定性断言进 gate);vs GPU 树形归约 = 既有"容差桶"裁定(1e-7 rel),
+整数路径逐位一致。
+
+**实现落点(C5 规格 (b) 变体:共享 alloca → addrspace(0) 零初始化模块全局)**:
+`visit(AllocaStmt)` is_shared 分支对 cpu arch 生成 PrivateLinkage + 零初始化的
+addrspace(0) 全局(JIT 可链接;bls_buffer 同款先例)——比规格原文的"arena 指针 +
+运行时 arena 分配"更小:因 block 串行推进,每 (task, alloca) 一个全局即等价于
+per-block 窗口,免掉 RuntimeContext arena 指针、offset 累计与 per-block malloc。
+`make_cpu_multithreaded_range_for` 对 block-tier 任务跳过(保住用户
+[begin,end) 与 block_dim);`TaskCodeGenCPU` 预扫 body(is_shared alloca /
+cpu barrier internal call / RandStmt / AdStackAllocaStmt)后派发
+`cpu_block_parallel_for`,adstack `static_num_threads` 按 max(num_cpu_threads,
+block_dim) 放大(vt 作 cpu_thread_id 时槽位不越界)。python 侧:`subgroup.py`
+CPU 分支(映射表)+ `block.py` CPU 分支(`cpu_block_barrier` /
+`cpu_block_mem_fence` / `linear_thread_idx` / `sync_*_nonzero` 走既有 emulated
+路径)。新 internal op:`cpu_block_barrier`、`cpu_block_mem_fence`(均
+PLAIN_OP + runtime context)。**无新 compile_config 旗标**(后端完备性,非 opt-in)。
+
+## 资格矩阵(CPU 兑现方式 / 响亮拒绝)
+
+| 操作面 | CPU 兑现 |
+|---|---|
+| subgroup 数据移动/投票/reduce/scan/segmented/sort/lanemask | 全部兑现(group_size=1 恒等语义,逐位确定) |
+| subgroup.sync / mem_fence | no-op / seq_cst fence |
+| block.sync / mem_fence / thread_idx | 真屏障(代际 CV)/ seq_cst fence / vt |
+| block.reduce_* / *_scan_* / sync_*_nonzero / radix_rank | block.py 骨架零改动自动正确(SUBGROUP_SIZE=1) |
+| SharedArray(配合 loop_config(block_dim) 的 range-for) | addrspace(0) 零初始化全局,block 窗口语义 |
+| block.global_thread_idx | 响亮 ValueError(维持) |
+| rand / 非 range-for 任务上的 block-tier / block_dim>1024 | 响亮编译期错误 |
+
+## 门禁计划
+新探针 `tests/robostudio/probe_subgroup_cpu.py`(cpu 单臂,宿主参考按
+group_size=1 语义重算;block-tier 用真块参考 + 确定性断言 + f32 1e-7 容差桶);
+`probe_algorithms_cpu.py` 三个 staircase expected-error 钉翻绿为正值门
+(sync+SharedArray 置换读、block.reduce_all_add 全输出 256、裸 SharedArray
+自槽往返);union runner 第 10 门 = metal 臂(既有 probe_subgroup_metal)+
+cpu 臂(probe_subgroup_cpu + probe_algorithms_cpu),label /10 同步;
+`test_return.py` 46/46。文档:user_guide/subgroup.md 可用性矩阵加 CPU 列 +
+CPU 数值语义节;block.md CPU 节。
+
+- **状态**:design-first 草稿已写入,待实现 → 门禁 → 回填 footprint 与数字。
