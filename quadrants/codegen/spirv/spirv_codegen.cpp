@@ -3040,7 +3040,14 @@ bool TaskCodegen::vec_analyze(RangeForStmt *for_stmt, std::vector<VecMemGroup> *
     }
     auto *ep = is_store ? s->cast<GlobalStoreStmt>()->dest->cast<ExternalPtrStmt>()
                         : s->cast<GlobalLoadStmt>()->src->cast<ExternalPtrStmt>();
-    auto dt = mem->element_type().ptr_removed();
+    // NOTE: mem->element_type() is only meaningful for GlobalLoadStmt; a
+    // GlobalStoreStmt produces no value, so its ret_type stays unset
+    // (unknown) and used to reject EVERY store-bearing inner loop as
+    // "non-f32 memory access" -- reduction loops (no in-body store)
+    // vectorized while elementwise loops never did (mujocoqd/c2-emitter-fixes
+    // defect 3). Judge the dtype on the ext-ptr pointee, which both loads
+    // and stores carry.
+    auto dt = ep->element_type().ptr_removed();
     if (!dt->is_primitive(PrimitiveTypeID::f32)) {
       *why = "non-f32 memory access";
       return false;

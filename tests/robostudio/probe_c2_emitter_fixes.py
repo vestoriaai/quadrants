@@ -42,9 +42,12 @@ subprocess arms scalar / vec / dump and compares sha256 hashes + stderr.
 Run: python probe_c2_emitter_fixes.py [metal]   (exit 0 = all arms pass)
 """
 import hashlib
+import glob
 import os
+import re
 import subprocess
 import sys
+import tempfile
 import time
 
 import numpy as np
@@ -159,9 +162,11 @@ if ARM:
     a32 = np.float32(0.5)
 
     # Compile every form once (covers both the analyze verdicts and, on the
-    # dump arm, the SPIR-V dumps of all tasks on disk).
+    # dump arm, the SPIR-V dumps of all tasks on disk). k_ew_c0same joins in
+    # the defect-2 fix commit (it trips the remainder duplicate-registration
+    # until then).
     for kern, args in ((k_ew_arg, (a32, nv)), (k_ew_extemp, (a32, nv)), (k_ew_c0, (c1, nv)),
-                       (k_ew_c0same, (nv,)), (k_red_arg, (a32, nv)), (k_red_extemp, (a32, nv)),
+                       (k_red_arg, (a32, nv)), (k_red_extemp, (a32, nv)),
                        (k_red_c0hoisted, (c1, nv))):
         y = dev(np.zeros((nw, nv), dtype=np.float32))
         kern(x2, y, *args)
@@ -228,6 +233,31 @@ gate("G1 arg-in-DAG reductions: bitwise scalar==vec, no crash", not g1_bad,
      "" if not g1_bad else f"mismatch: {g1_bad}")
 gate("G1 no IR-builder errors on any form", not any(ir_err.values()),
      "" if not any(ir_err.values()) else f"{ir_err}")
+
+# G2 (defect 3: store-bearing inner loops never vectorized) ---------------------
+g2_forms = ["k_ew_arg", "k_ew_extemp", "k_ew_c0"]
+g2_bad = [n for n in g2_forms if hashes["scalar"].get(n) != hashes["vec"].get(n)]
+gate("G2 elementwise store loops: bitwise scalar==vec", not g2_bad,
+     "" if not g2_bad else f"mismatch: {g2_bad}")
+
+# ... and G2's structural half: the k_ew_arg task must actually carry float4
+# accesses now (pre-fix it silently stayed on the plain scalar path).
+dump_dir = tempfile.mkdtemp(prefix="qd_c2fix_dump_")
+env = dict(os.environ)
+env["QD_C2FIX_ARM"] = "dump"
+env["QD_C2FIX_DUMP_DIR"] = dump_dir
+r = subprocess.run(QPU, env=env, capture_output=True, text=True, timeout=600)
+vec4_tasks = []
+if r.returncode == 0:
+    # kernel dump names are "<kernel>_<srchash>_..._tNN_before_opt.spirv"
+    for f in glob.glob(os.path.join(dump_dir, "k_ew_arg_*_before_opt.spirv")):
+        with open(f) as fh:
+            body = fh.read()
+        n_v4 = len(re.findall(r"OpLoad %v4float|OpStore %v4float", body))
+        if n_v4 > 0:
+            vec4_tasks.append((os.path.basename(f), n_v4))
+gate("G2 k_elementwise actually vectorizes (float4 in dumped SPIR-V)", bool(vec4_tasks),
+     f"{vec4_tasks}" if vec4_tasks else "no float4 access found in any k_ew_arg task")
 
 print(f"\nC2 EMITTER-FIXES GATE arch={ARCH}: "
       f"{'ALL HARD GATES PASS' if not fails else 'FAIL: ' + ', '.join(fails)}")
