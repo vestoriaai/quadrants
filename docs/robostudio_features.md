@@ -173,7 +173,7 @@
 
 ---
 
-# mujocoqd/compiler-line 条目(2026-10-11;**已合入 robostudio-main**,merge 33e7dabf --no-ff)
+# mujocoqd/algorithms-2 条目(2026-10-11;**已合入 robostudio-main**,--no-ff)+ 下述 compiler-line 条目(2026-10-11;已合入,merge 33e7dabf --no-ff)
 
 > 来源战役:mujoco-qd 移植 P0(quadrants 替换 mujoco_warp kernel;方案与探针在
 > `/Users/mini0/Code/mujoqo/`)。基线 dev25 探针重跑后开工;每个 landed 条目带 gate 进
