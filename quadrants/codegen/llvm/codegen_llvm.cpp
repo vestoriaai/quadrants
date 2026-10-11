@@ -151,12 +151,33 @@ void TaskCodeGenLLVM::visit(AllocaStmt *stmt) {
     auto tensor_type = alloca_type->cast<TensorType>();
     auto type = tlctx->get_data_type(tensor_type);
     if (stmt->is_shared) {
-      auto base = new llvm::GlobalVariable(*module, type, false, llvm::GlobalValue::ExternalLinkage, nullptr,
-                                           fmt::format("shared_array_t{}_s{}", task_codegen_id, stmt->id), nullptr,
-                                           llvm::GlobalVariable::NotThreadLocal, 3 /*addrspace=shared*/);
-      base->setAlignment(llvm::MaybeAlign(8));
-      auto ptr_type = llvm::PointerType::get(type, 0);
-      llvm_val[stmt] = builder->CreatePointerCast(base, ptr_type);
+      if (arch_is_cpu(compile_config.arch)) {
+        // CPU block-tier ("virtual block") backing store. The GPU branch below declares the
+        // shared array as an addrspace(3) ExternalLinkage global - a declaration with no
+        // definition, which the CPU ORC JIT cannot link (kernel JIT fails with
+        // "Function ... not found"). On CPU we instead emit a *defined* addrspace(0) module
+        // global with a zero initializer (same trick as `bls_buffer` in codegen_cpu.cpp), which
+        // the JIT links from .bss. `cpu_block_parallel_for` (runtime.cpp) runs one block's
+        // virtual threads at a time and joins them before the next block starts, so this single
+        // per-(task, alloca) global plays exactly the role of the GPU's per-block shared-memory
+        // window: concurrently live only within one block. Zero-initialized (GPU shared memory
+        // is uninitialized garbage) - strictly more defined; well-formed kernels (write before
+        // read, barrier-separated) behave identically. Reached only for tasks the codegen_cpu
+        // pre-scan classified as block-tier; anything else fails loudly there.
+        auto *base = new llvm::GlobalVariable(*module, type, false, llvm::GlobalValue::PrivateLinkage,
+                                              llvm::ConstantAggregateZero::get(type),
+                                              fmt::format("shared_array_t{}_s{}", task_codegen_id, stmt->id), nullptr,
+                                              llvm::GlobalVariable::NotThreadLocal, 0 /*addrspace=generic*/);
+        base->setAlignment(llvm::MaybeAlign(8));
+        llvm_val[stmt] = base;
+      } else {
+        auto base = new llvm::GlobalVariable(*module, type, false, llvm::GlobalValue::ExternalLinkage, nullptr,
+                                             fmt::format("shared_array_t{}_s{}", task_codegen_id, stmt->id), nullptr,
+                                             llvm::GlobalVariable::NotThreadLocal, 3 /*addrspace=shared*/);
+        base->setAlignment(llvm::MaybeAlign(8));
+        auto ptr_type = llvm::PointerType::get(type, 0);
+        llvm_val[stmt] = builder->CreatePointerCast(base, ptr_type);
+      }
     } else {
       llvm_val[stmt] = create_entry_block_alloca(type);
     }

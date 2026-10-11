@@ -358,6 +358,63 @@ std::string OffloadedStmt::task_type_name(TaskType tt) {
   return offloaded_task_type_name(tt);
 }
 
+namespace {
+
+// Recursive body walk shared by `OffloadedStmt::uses_block_tier_ops` / `uses_rand_stmt`.
+// `block_tier` is set by a shared alloca (`qd.simt.block.SharedArray` lowers to
+// `AllocaStmt(is_shared=true)`) or by a CPU block barrier / fence internal call; `has_rand` by
+// a `RandStmt`. Container statements are recursed into so barriers nested under `if` / inner
+// loops are still seen.
+void scan_block_tier_facts(const Block *block, bool *block_tier, bool *has_rand) {
+  for (const auto &s : block->statements) {
+    if (const auto *alloca = s->cast<AllocaStmt>(); alloca && alloca->is_shared) {
+      *block_tier = true;
+    } else if (const auto *internal_call = s->cast<InternalFuncStmt>(); internal_call) {
+      if (internal_call->func_name == "cpu_block_barrier" || internal_call->func_name == "cpu_block_mem_fence") {
+        *block_tier = true;
+      }
+    } else if (s->is<RandStmt>()) {
+      *has_rand = true;
+    }
+    if (const auto *if_stmt = s->cast<IfStmt>()) {
+      if (if_stmt->true_statements) {
+        scan_block_tier_facts(if_stmt->true_statements.get(), block_tier, has_rand);
+      }
+      if (if_stmt->false_statements) {
+        scan_block_tier_facts(if_stmt->false_statements.get(), block_tier, has_rand);
+      }
+    } else if (const auto *range_for = s->cast<RangeForStmt>()) {
+      scan_block_tier_facts(range_for->body.get(), block_tier, has_rand);
+    } else if (const auto *while_stmt = s->cast<WhileStmt>()) {
+      scan_block_tier_facts(while_stmt->body.get(), block_tier, has_rand);
+    } else if (const auto *struct_for = s->cast<StructForStmt>()) {
+      scan_block_tier_facts(struct_for->body.get(), block_tier, has_rand);
+    }
+  }
+}
+
+}  // namespace
+
+bool OffloadedStmt::uses_block_tier_ops() const {
+  if (!body) {
+    return false;
+  }
+  bool block_tier = false;
+  bool has_rand = false;
+  scan_block_tier_facts(body.get(), &block_tier, &has_rand);
+  return block_tier;
+}
+
+bool OffloadedStmt::uses_rand_stmt() const {
+  if (!body) {
+    return false;
+  }
+  bool block_tier = false;
+  bool has_rand = false;
+  scan_block_tier_facts(body.get(), &block_tier, &has_rand);
+  return has_rand;
+}
+
 std::unique_ptr<Stmt> OffloadedStmt::clone() const {
   auto new_stmt = std::make_unique<OffloadedStmt>(task_type, device, kernel_);
   new_stmt->snode = snode;

@@ -14,13 +14,17 @@
 #endif
 
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <cmath>
 #include <cstdarg>
 #include <cstdlib>
 #include <algorithm>
+#include <mutex>
+#include <thread>
 #include <type_traits>
 #include <cstring>
+#include <vector>
 
 #include "quadrants/inc/constants.h"
 #include "quadrants/inc/cuda_kernel_utils.inc.h"
@@ -223,6 +227,7 @@ STRUCT_FIELD_ARRAY(PhysicalCoordinates, val);
 STRUCT_FIELD(RuntimeContext, runtime);
 STRUCT_FIELD(RuntimeContext, result_buffer)
 STRUCT_FIELD(RuntimeContext, cpu_assert_failed)
+STRUCT_FIELD(RuntimeContext, block_barrier)
 
 #include "quadrants/runtime/llvm/runtime_module/atomic.h"
 
@@ -1791,6 +1796,185 @@ void cpu_parallel_range_for(RuntimeContext *context,
   auto runtime = context->runtime;
   runtime->parallel_for(runtime->thread_pool, (end - begin + block_dim - 1) / block_dim, num_threads,
                         &range_task_context, cpu_parallel_range_for_task);
+}
+
+// --- CPU block-tier ("virtual block") support ------------------------------------------
+//
+// GPU block semantics realized literally at the CPU thread level. A loop annotated with
+// `qd.loop_config(block_dim=N)` whose body uses `qd.simt.block.SharedArray` / `block.sync()` /
+// block collectives is executed one block at a time, with the block's `block_dim` virtual
+// threads running CONCURRENTLY - one std::thread each, virtual thread `vt` observes
+// `qd.simt.block.thread_idx() == vt` (via `cpu_thread_id`) and runs iteration `base + step*vt`.
+// `qd.simt.block.sync()` waits on a per-block generation barrier published in
+// `RuntimeContext::block_barrier`; the mutex/condvar sync provides both convergence and the
+// memory happens-before edge, matching the GPU contract "after the barrier every thread sees
+// every other thread's pre-barrier writes". Blocks are joined before the next block starts, so
+// the addrspace(0) globals `TaskCodeGenLLVM::visit(AllocaStmt)` emits for shared allocas are
+// concurrently live only within one block - exactly the GPU's per-block shared-memory window
+// (GPU leaves shared memory uninitialized across blocks; CPU keeps the zero-initialized values,
+// strictly more defined, and indistinguishable for barrier-separated produce/consume kernels).
+//
+// Why real threads instead of the thread pool: the pool cannot host an intra-job barrier (a job
+// waiting at a barrier would deadlock the worker while pending sibling jobs sit in the queue),
+// and sequential per-iteration execution cannot realize the contract at all - a thread at the
+// barrier would need values from later iterations that have not run yet, i.e. silent wrong
+// values. CPU-side performance is explicitly not the goal here; honest semantics are (one
+// thread spawn per virtual thread per block).
+//
+// Contract guards live at codegen time (codegen_cpu.cpp): only range-for tasks, block_dim in
+// [1, 1024], no `qd.rand` in the body (rand states are indexed by cpu_thread_id).
+
+struct CpuBlockBarrier {
+  std::mutex mu;
+  std::condition_variable cv;
+  int count{0};
+  int arrived{0};
+  uint32_t generation{0};
+  // The launcher's shared context: its `cpu_assert_failed` flag lets barrier waiters retire
+  // when a sibling virtual thread aborted early (codegen emits an early return after each
+  // failed runtime assert), so a failing thread can never deadlock the survivors at a barrier
+  // it will no longer reach.
+  RuntimeContext *root_context{nullptr};
+};
+
+struct CpuBlockTaskContext {
+  RuntimeContext *context;
+  range_for_xlogue prologue{nullptr};
+  RangeForBodyFn *body{nullptr};
+  range_for_xlogue epilogue{nullptr};
+  std::size_t tls_size{1};
+  CpuBlockBarrier *barrier{nullptr};
+  // First iteration index of the current block under `step` (step==1: ascending base;
+  // step==-1: descending base). Virtual thread `vt` runs iteration `iter_base + step * vt`.
+  int iter_base{0};
+  int step{1};
+};
+
+void cpu_block_virtual_thread_main(CpuBlockTaskContext *tc, int vt) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wvla-cxx-extension"
+  alignas(8) char tls_buffer[tc->tls_size];
+#pragma clang diagnostic pop
+  auto *tls_ptr = &tls_buffer[0];
+
+  RuntimeContext this_thread_context = *tc->context;
+  // Virtual thread index, observed by `qd.simt.block.thread_idx()` (== `linear_thread_idx`).
+  // The adstack slot space is sized for `block_dim` rows by codegen_cpu.cpp, so slot `vt` is
+  // in bounds; `rand_states[cpu_thread_id]` indexing is guarded by the codegen-time no-rand
+  // rule for block-tier tasks.
+  this_thread_context.cpu_thread_id = vt;
+  this_thread_context.cpu_assert_failed = 0;
+
+  const int iter = tc->iter_base + tc->step * vt;
+  if (tc->prologue) {
+    tc->prologue(&this_thread_context, tls_ptr);
+    if (this_thread_context.cpu_assert_failed) {
+      tc->context->cpu_assert_failed = 1;
+      return;
+    }
+  }
+  tc->body(&this_thread_context, tls_ptr, iter);
+  if (this_thread_context.cpu_assert_failed) {
+    tc->context->cpu_assert_failed = 1;
+    return;
+  }
+  if (tc->epilogue) {
+    tc->epilogue(&this_thread_context, tls_ptr);
+    if (this_thread_context.cpu_assert_failed) {
+      tc->context->cpu_assert_failed = 1;
+    }
+  }
+}
+
+void cpu_block_parallel_for(RuntimeContext *context,
+                            int begin,
+                            int end,
+                            int step,
+                            int block_dim,
+                            range_for_xlogue prologue,
+                            RangeForBodyFn *body,
+                            range_for_xlogue epilogue,
+                            std::size_t tls_size) {
+  if (step != 1 && step != -1) {
+    quadrants_printf(context->runtime, "step must not be %d\n", step);
+    exit(-1);
+  }
+  if (block_dim <= 0) {
+    quadrants_assert_runtime(context->runtime, false,
+                             "cpu_block_parallel_for: block_dim must be positive; annotate the loop with "
+                             "qd.loop_config(block_dim=N)");
+    return;
+  }
+  CpuBlockTaskContext tc;
+  tc.context = context;
+  tc.prologue = prologue;
+  tc.body = body;
+  tc.epilogue = epilogue;
+  tc.tls_size = tls_size;
+  tc.step = step;
+
+  const int total = end - begin;
+  if (total <= 0) {
+    context->block_barrier = nullptr;
+    return;
+  }
+  const int num_blocks = (total + block_dim - 1) / block_dim;
+  for (int b = 0; b < num_blocks; b++) {
+    const int base = (step == 1) ? (begin + b * block_dim) : (end - 1 - b * block_dim);
+    const int n_live = std::min(block_dim, (step == 1) ? (end - base) : (base - begin + 1));
+    CpuBlockBarrier bar;
+    bar.count = n_live;
+    bar.root_context = context;
+    tc.barrier = &bar;
+    tc.iter_base = base;
+    context->block_barrier = &bar;
+    if (n_live == 1) {
+      // Single-virtual-thread block: run inline, no thread spawn (the barrier degenerates to a
+      // no-op - count == 1 arrivals immediately).
+      cpu_block_virtual_thread_main(&tc, 0);
+    } else {
+      std::vector<std::thread> threads;
+      threads.reserve(n_live - 1);
+      for (int vt = 1; vt < n_live; vt++) {
+        threads.emplace_back([&tc, vt] { cpu_block_virtual_thread_main(&tc, vt); });
+      }
+      cpu_block_virtual_thread_main(&tc, 0);
+      for (auto &t : threads) {
+        t.join();
+      }
+    }
+  }
+  context->block_barrier = nullptr;
+}
+
+// `qd.simt.block.sync()` on CPU: arrive at (and wait for) the current block's barrier.
+void cpu_block_barrier(RuntimeContext *context) {
+  auto *bar = (CpuBlockBarrier *)context->block_barrier;
+  quadrants_assert_runtime(context->runtime, bar != nullptr,
+                           "cpu_block_barrier: no live block barrier (block.sync outside a CPU block-tier dispatch)");
+  if (bar == nullptr || context->cpu_assert_failed) {
+    // A sibling virtual thread hit a runtime assert and returned early: retire immediately so
+    // the barrier cannot deadlock on the missing arrivals.
+    return;
+  }
+  std::unique_lock<std::mutex> lock(bar->mu);
+  const uint32_t my_generation = bar->generation;
+  if (++bar->arrived == bar->count) {
+    bar->arrived = 0;
+    ++bar->generation;
+    lock.unlock();
+    bar->cv.notify_all();
+  } else {
+    bar->cv.wait(lock, [&] { return bar->generation != my_generation || bar->root_context->cpu_assert_failed; });
+  }
+}
+
+// `qd.simt.block.mem_fence()` (and `subgroup.mem_fence()`) on CPU: a full compiler + hardware
+// fence. Over-strict for the subgroup-scope ask (one virtual thread) but correct - same
+// reasoning as the CUDA / AMDGPU workgroup-scope lowering in the subgroup docs.
+void cpu_block_mem_fence(RuntimeContext *context) {
+  (void)context;
+  std::atomic_thread_fence(std::memory_order_seq_cst);
 }
 
 void gpu_parallel_range_for(RuntimeContext *context,
