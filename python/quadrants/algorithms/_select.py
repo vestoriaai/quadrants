@@ -32,11 +32,15 @@ dtype (the scan operates on flags-as-counts). There is no module-level shared sc
 buffer.
 """
 
+from quadrants.lang.impl import current_cfg, static
 from quadrants.lang.kernel_impl import func as _func
 from quadrants.lang.ops import bit_cast
+from quadrants.lang.misc import cpu as _arch_cpu
 from quadrants.lang.simt.reductions import _bin_add
 from quadrants.types.annotations import template
 from quadrants.types.primitive_types import i32, u32
+
+from ._cpu_paths import _cpu_select
 
 from ._reduce import (
     _OP_ADD,
@@ -142,9 +146,13 @@ def select(
     ``out`` (size ``out`` for the all-selected case) and the count lands in ``num_out[0]``. ``scratch`` is a ``u32``
     buffer sized via :func:`select_scratch_slots` ``(capacity_n)`` (it stages the per-element indices plus the scan
     partials); no dtype is needed because the scatter ``out[idx] = arr[i]`` lowers per-field for any element dtype."""
-    _emit_select_scan(flags, scratch, n, log256_max_n)
-    _select_scatter_phase(arr, flags, scratch, 0, out, n)
-    _select_count_phase(flags, scratch, 0, n, num_out)
+    if static(current_cfg().arch == _arch_cpu):
+        # C5 (mujocoqd/compiler-line): CPU backend has no block/subgroup model — serial path.
+        _cpu_select(arr, flags, out, num_out, n)
+    else:
+        _emit_select_scan(flags, scratch, n, log256_max_n)
+        _select_scatter_phase(arr, flags, scratch, 0, out, n)
+        _select_count_phase(flags, scratch, 0, n, num_out)
 
 
 def select_scratch_slots(n: int) -> int:
