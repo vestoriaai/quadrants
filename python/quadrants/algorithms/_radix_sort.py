@@ -52,7 +52,7 @@ owns the buffer (graph- / multi-stream-safe, no global state). :func:`sort` does
 """
 
 from quadrants.lang.impl import static
-from quadrants.algorithms._cpu_paths import _cpu_sort
+from quadrants.algorithms._cpu_paths import _cpu_radix_sort
 from quadrants.lang.impl import current_cfg, static
 from quadrants.lang.kernel_impl import func as _func
 from quadrants.lang.misc import cpu as _arch_cpu, loop_config
@@ -318,9 +318,13 @@ def sort(
     buffers and size ``scratch`` correctly up front.
     """
     if static(current_cfg().arch == _arch_cpu):
-        # C5 (mujocoqd/compiler-line): CPU backend — serial LSD radix sort. u32 keys only
-        # (sign-cast i32 keys first); scratch[0:256] as digit counters.
-        _cpu_sort(keys, tmp_keys, values, tmp_values, scratch, n, has_values, end_bit)
+        # C5 (mujocoqd/algorithms-2): CPU backend — serial LSD radix sort with the same twiddle /
+        # digit / end_bit semantics as the GPU staircase below (scratch[0:256] digit counters).
+        # The block-tier GPU path itself cannot lower on the CPU backend (no shared-memory /
+        # barrier / subgroup substrate — see _cpu_paths module docstring and the algorithms
+        # ledger entry for the three-layer evidence chain).
+        key_width = static(_key_width_bits(key_dtype))
+        _cpu_radix_sort(keys, tmp_keys, values, tmp_values, scratch, n, has_values, end_bit, key_dtype, key_width)
     else:
         _validate_log256_max_n(log256_max_n)
         key_width = static(_key_width_bits(key_dtype))
