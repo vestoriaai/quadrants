@@ -423,3 +423,46 @@
   (warp 级/分块),属新立项。旗标默认 OFF,A/B 工具链与 bitwise 机制保留。
 - **状态**:open(性能线)/landed(机制线)—— 如需重开:先在非带宽墙形状(如 nworld 小、
   L2 驻留、算力密集)找收益点,或立项"顺序重结合 opt-in 旗标"(须用户裁定量语义)。
+
+## 探针线(2026-10-11,纯 python 探针,零 native 改动)— ①重结合收益量化 ②subgroup Metal 可用性
+- **背景**:C2 性能定案的重开路线①(顺序重结合 opt-in 旗标,量语义待裁)+ M5 第 4 项
+  (subgroup 归约)的前置可用性验证。分支 `mujocoqd/reassoc-subgroup-probe`
+  (worktree `/Users/mini0/Code/quadrants-worktrees/reassoc-subgroup-probe`,基线
+  43e39634,venv4 dev55 native overlay,import 头 commit=68bd7965,
+  `probe_algorithms_cpu.py` ALL PASS 后开工)。
+- **①`tests/robostudio/probe_reassociate_payoff.py`**:纯源码层 A/B(同 kernel 的
+  顺序累加版 vs 手写重结合版:4 部分和步距 4 + 树形合并 + 标量尾,不改编译器),
+  M4 Metal,8 形状 × 5 计时窗口。计时纪律:GPU 空闲 + load 门(统一内存上重 CPU 负载
+  挤占带宽、且对 rea 臂 MLP 更敏感 → 系统性低估)、ABA 锚定轮(每轮 seq×2 夹 rea,
+  两针差 >25% 弃轮;实测同 kernel 双峰 ~3.8× 模式切换)、perf 尺度两臂一致性门
+  (防「快是因为算错」)、nw=1 vs numpy f64 精度表。
+- **①结论(旗标语义建议)**:(a) **值得开**:欠占用(per-world 线程)+ 长链(m≥48)
+  的 solver 形状 —— symmatvec(Gram 形,下三角)flops:load 最高、收益最稳
+  ~2.1×(4 窗口 1.42–2.21×);matvec m=48(per-world)2.2–2.8×;chol_dot m=64
+  ~1.5–1.6×。(b) **不值得开**:流式大 nworld(对照组 1.00±0.01×,复证 DRAM 墙)、
+  短链 chol m=32/48(0.84–1.34×)、满占用 (w,i) 并行消融(跨窗口双峰 0.26–3.91×
+  且两臂互换 = 计时/编译态伪迹,无方向信号;TLP 已藏延迟时 ILP 无空间,多累加器
+  寄存器压力有害)。(c) **数值代价**:重结合版误差 ≤ 顺序版(6/8 形状),worst
+  1.8e-6 rel vs f64,1e-5 物理门下余量 6×;逐位差异 17–100% 输出(契约 = 非 bitwise)。
+  (d) **codegen 落点**:C2 vec 机制的 order-barrier 反面 —— 在
+  `spirv_codegen.cpp` 的 vec_analyze/try_emit_vectorized_range_for 处,对循环携带标量
+  归约累加器,旗标开时以 k=4 部分和 + 步距 4 展开(复用 prologue/main/remainder 骨架,
+  去掉 order-barrier 内层顺序环)替代顺序累加,出口树形合并;新 compile_config 旗标
+  `reassociate`(默认 OFF,进 offline-cache key);安全白名单沿用 C2 语句集;
+  **k=4 不取 k=8**(m=48 实测 k=8 一致差于 k=4:部分和链更短 + 寄存器压力)。
+- **②`tests/robostudio/probe_subgroup_metal.py`**:逐 API 最小 Metal kernel 正确性
+  (线性派发 lane=w%32,宿主串行参考)+ 约束计数 perf pin。
+- **②结论:subgroup 在 Metal 全栈可用**(24/24 PASS,零 RAISED,无 handback 项):
+  invocation_id/elect/broadcast/broadcast_first/shuffle/shuffle_xor/shuffle_up/
+  shuffle_down/ballot_first_n/**ballot(u64 形也过,MSL 2.3 int64)**/all_true/
+  any_true/all_equal/reduce_add/reduce_all_add/reduce_min/reduce_max/inclusive_add/
+  exclusive_add/segmented_reduce_add/lanemask_lt/**sync + SharedArray**
+  (loop_config(block_dim=32) 每 kernel 显式标注)/mem_fence/bitonic_sort_kv 全部数值
+  对照通过。perf pin:atomic 链(每元素一次原子)vs 局部和 + reduce_add + elect 单原子
+  = **6.2–7.4×**(两臂同 32-lanes/world 映射,仅原子流量不同)。前端人机工学坑(记录,
+  非缺陷):shuffle/broadcast/shuffle_up/down 的 index/offset 实参必须 u32 类型
+  (python int 报 QuadrantsTypeError: expected u32 for argument #2;探针内以 qd.u32()
+  显式转换绕过)。**数值语义单列**:subgroup.reduce = 并行树归约 = 重结合同桶
+  (bitwise 不保序,精度类 ~1e-7 rel 不变),若进生产路径其量语义与①旗标同一裁决。
+- **状态**:probe 全部跑通(exit 0);两文件为探针交付物,不落任何生产路径;旗标语义
+  裁决与 subgroup 归约立项待用户决策。
