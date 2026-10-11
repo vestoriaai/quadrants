@@ -1,0 +1,132 @@
+# robostudio_features.md — features ledger for robostudio-main
+
+> **维护约定（本文件头即规则）**：每一个合并进 robostudio-main 的
+> feature commit，**必须在同一次 merge 里更新本账本**——新条目（含
+> 描述/背景需求/状态三栏）或既有条目的状态推进。合并 PR/分支时核对
+> 此项；账本与分支内容不一致 = 合并不完整。
+>
+> 每条目格式：**描述**（做什么 + 触碰哪些文件）/**背景需求**（为什么：
+> 哪个战役/事故要求的）/**状态**（landed / verified / 哪个 gate 名）。
+> 逐 commit 谱系见 `git log robostudio-main` 与
+> `docs/consolidation_robostudio_main.md`。
+
+## S2 — loop-var assignment guard
+- **描述**：运行时循环变量（range-for/struct-for/mesh-for target）在循环体内
+  被赋值时，AST 前端直接抛清晰的 `QuadrantsSyntaxError`；此前会 lower 成
+  `LocalStoreStmt(LoopIndexStmt)` 撞 dest-type assert（晦涩 RuntimeError），
+  增广赋值形态更是未捕获 C++ 异常直接杀死进程。ndrange/grouped 目标保持
+  可赋值（alloca-backed）。文件：`python/quadrants/lang/ast/ast_transformer.py`
+  （注册点）、`ast_transformer_utils.py`（`register_loop_var` /
+  `check_assign_not_loop_var`）。移植自 overlay `patches/s2_fix.patch`。
+- **背景需求**：robostudio S2 战役（2026-10-08）：parallel-reduction 内核
+  在循环里写累加变量触发进程 abort（exit 134），scratch/bspline 线首发。
+  `register_loop_var` 即原 install_qds.sh overlay 检测 marker。
+- **状态**：landed（1d645464）+ verified — gate `probe_s2_loopvar_assign`
+  RESULT: PASS（union runner gate 1/6）。
+
+## S3 — static-if branch-name join
+- **描述**：`qd.static` 分支只在编译期执行一次，语义上其绑定应落入外层
+  作用域；原来 `build_stmts` 的 per-block scope 吞掉绑定，join 之后用该名
+  即报 `Name "y" is not defined`。现 static 分支以 `scope_guard=False` 在
+  外层作用域构建（运行时 if 的 alloca 仍分支内，不提升）。文件：
+  `python/quadrants/lang/ast/ast_transformer.py`（build_If）、
+  `ast_transformer_utils.py`（build_stmts 签名）。移植自 overlay
+  `patches/s3_fix.patch`。
+- **背景需求**：robostudio S2/S3 战役（2026-10-09，quadrants 坑清单
+  "static-if 作用域"）：内核族大量使用 `if qd.static(...)` 分支配置 +
+  join 后使用模式，全数被 NameError 挡死。`scope_guard` 为第二 marker。
+- **状态**：landed（2d9a99ca）+ verified — gate `probe_s3_static_if_forms`
+  10/10（union runner gate 2/6）。
+
+## C0S — cache-epoch + dead-runtime capture walk
+- **描述**：编译产物缓存按 SNodeTree 生命周期分段：`KernelCompilationManager`
+  的 `cache_epoch_` 混入内核 key，`Program::add_snode_tree`(id≥1) 与
+  `destroy_snode_tree` 递增（单一 tree 的常规程序永不 bump，盘上 key 稳定）；
+  python 侧同事件清 `materialized_kernels` + `compiled_kernel_data_by_key`
+  （round-2 修复：launch 直查 compiled_kernel_data_by_key）。死亡 runtime
+  防护：field 记录出生 runtime（`_qd_owner_runtime`），cache-miss 浅走
+  py_args 拒绝已清 runtime 的捕获（后被 union 整合收窄，见下条）。文件：
+  `quadrants/compilation_manager/kernel_compilation_manager.{cpp,h}`、
+  `quadrants/program/program.cpp`、`python/quadrants/_snode/fields_builder.py`、
+  `python/quadrants/lang/impl.py`、`kernel.py`。移植自 overlay
+  `patches/c0s_fix.patch`（overlay 提交 a3be630..5059321）。
+- **背景需求**：robostudio C0 战役（多 init / 多 SNodeTree 家族事故，
+  curobo_alignment_plan C0-D；upstream taichi 1.7.4 同样崩）：旧缓存跨
+  tree 复用 → 脏 field 绑定 → OOB/SIGSEGV。该修复是已部署 dev7 wheel
+  的一部分——不移植则整合 wheel 静默倒退。
+- **状态**：landed（6ea5ec4b）+ verified — gate `battery_c0s_multi_init
+  --single-init` 4 arms PASS（union runner gate 6/6）；多 init 形态语义
+  变更见 S-guard 条。
+
+## S-guard — stale-field refusal（含语义变更诚实注记）
+- **描述**：`PyQuadrants.generation` 每次 reset() 递增；`Field` 创建时记录
+  generation，全部宿主路径（getitem/setitem/from_numpy/to_numpy/to_torch/
+  fill/copy_from，ScalarField + MatrixField）经 `_check_not_stale()` 拒绝
+  已 finalize 程序的 field；`impl.subscript` 为 field 进 IR 的唯一收口点
+  同样拒绝；reset() 在仍有存活 field 时告警。文件：
+  `python/quadrants/lang/field.py`、`impl.py`、`matrix.py`、
+  `tests/python/test_stale_field.py`（4 测试）。cherry-pick 自
+  overnight/inv-cache-keys@80445172（port/sguard-stale-field）。
+- **背景需求**：夜探 Inv1/Inv2（2026-10-11，tech_debt_todo T25b/S-guard）：
+  `qd.init#2` finalize Program#1 并重置进程级 HostMemoryPool，Python Field
+  存活带裸 SNode 指针 = use-after-free（同 arch 也炸）——robostudio C0-D /
+  多家族事故的机制定案，S=响亮 stale-field 检测为对尺寸修复。
+- **语义变更（诚实注记）**：re-init 后复用旧 field 从"碰巧能跑"（实为
+  UAF、靠池内存未覆写伪装成正确值）变为**响亮拒绝**
+  （QuadrantsRuntimeError "finalized"）。C0S battery 的多 init 形态
+  （a2b/ab_a/jit_heavy 重建陈旧家族并重发）因此按设计 RAISE；受支持契约
+  = one-init-per-process（`--single-init` 形态 4/4 PASS）。这是**行为
+  变更**：依赖"re-init 后旧家族继续出正确值"的流程须改为重建对象或
+  单 init。
+- **状态**：landed（b778ab20）+ verified — `tests/python/test_stale_field.py`
+  4/4（union runner gate 5/6，需 `-p xdist -n0`）；生产 venv 直查拒绝行为
+  亦验证。
+
+## u8 DLPack
+- **描述**：`to_dlpack` 导出 u8/i8/u16/i16/u32/u64 ndarray（G1 类型矩阵
+  双向写可见、G2 零拷贝、G3 device 忠实、G4 别名契约、G5 端到端内核
+  样本）。文件：`quadrants/python/dlpack_funcs.cpp`。谱系：upstream
+  feat/u8-dlpack@4b2e3c77（经 feat/readback 成为基座；overlay 侧移植
+  f0447a0 zero-drift）。
+- **背景需求**：qd-render-poc R4/§3.3：u8 渲染样本管线需要 uint8 与
+  torch 的 DLPack 互操作。
+- **状态**：landed + verified — gate `gate_u8_dlpack`：cpu ALL GATES
+  PASS；metal **恰好**钉死的 f64 cell 失败（qd SPIR-V 无 f64，T19；
+  f64 全绿之日须有意更新 pin）——union runner gate 3/6。
+
+## readback R2/R3
+- **描述**：R2 = metal `readback_data` 对 host-visible 源走 direct map
+  路径；R3a = 外部数组镜像缓冲持久池（64MiB 容量上限、drain 点回收，
+  免每次 readback 的 `newBufferWithLength` 往返）；R3b = per-call commit
+  模型文档化。文件：`quadrants/rhi/metal/metal_device.{h,mm}`、
+  `quadrants/runtime/gfx/runtime.{h,cpp}`、`python/quadrants/lang/_ndarray.py`。
+  谱系：feat/readback@4fe1bbe2+7aaaa7d7（分支基座）。
+- **背景需求**：T8（cuRobo 对标读回杠杆）：to_numpy 64MB 5.56ms vs torch
+  2.12ms 的余量分解；每次读回都付一次 buffer 分配往返。
+- **状态**：landed + verified — gate `gate_readback_r2r3`：64MB
+  to_numpy ≤7ms / from_numpy ≤5ms（实测 ~5.4/3.4ms 档）+ 1KB/4MB/64MB
+  字节正确性扫（union runner gate 4/6）。
+
+## Union integration — capture walk defers to S-guard
+- **描述**：C0S 的 cache-miss 粗粒度捕获走查让位给 S-guard：带
+  generation 戳的捕获交由精确收口点（`impl.subscript` →
+  `_check_not_stale`）拒绝；粗走查仅继续拦截**无** generation 戳的捕获
+  （外来/前代 field 对象的安全网）。文件：`python/quadrants/lang/kernel.py`。
+- **背景需求**：两修复合并的次序冲突：粗走查先开火会拒绝"携带但未读"
+  陈旧 field 的内核，破坏 S-guard 自己的
+  `test_kernel_not_reading_stale_members_still_compiles`（scan_nd 不读
+  field，必须照常编译）。
+- **状态**：landed（60003393）+ verified — stale battery 4/4（gate 5/6）。
+
+## Gate suite — tests/robostudio/ + run_robostudio_gates.sh
+- **描述**：分支内自助验证套件：S2 探针、S3 形态矩阵、u8 门（cpu+metal，
+  钉死 f64 期望失败）、readback 性能 pin、stale-field pytest battery、
+  C0S `--single-init` battery，一条命令跑完全部并要求 6/6。文件：
+  `tests/robostudio/{probe_s2_loopvar_assign,probe_s3_static_if_forms,
+  gate_u8_dlpack,gate_readback_r2r3,battery_c0s_multi_init}.py`、
+  `_gpu_busy.sh`、`run_robostudio_gates.sh`（前五个为验证整合时的原脚本
+  逐字 vendored；readback 门自 post_install_gate.sh 的 heredoc 逐字提取）。
+- **背景需求**：整合后复查：分支自称 source of truth 却无法自证——
+  探针散在 robostudio worktree / simtest 第三仓 / overlay 树，宝可失。
+- **状态**：landed（2efc351a）+ verified — `UNION GATE: 6/6 PASS`
+  （consolidated wheel 实跑两次）。
