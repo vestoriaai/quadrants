@@ -219,9 +219,16 @@
   显式 RMW + 分支 ✗(serialize/嵌套皆错)、cpu 全对。每次迭代读到循环前的旧值 =
   load 被跨迭代缓存/外提。`qd.cast` 形初始化不改变行为(非 LICM 层)。
 - **影响**:极常用模式(物理接触遍历、直方图、链表遍历)静默错结果。
-- **状态**:open — 与 A2(tile runtime-loop ≥3 次外层迭代错值)同属"SPIR-V/Metal
-  路径循环携带依赖被破坏",共享调查;前端 CHI IR 正确(A1 print_ir 定界同法)。
-  gate 已钉死,修复后翻绿即闭环。
+- **归属定案(2026-10-11,决定性实验)**:`QD_DUMP_MSL=1` 导出的 MSL **逐行核验语义正确**
+  (load 在 if 内/循环内);把该 MSL 喂给独立 ObjC harness
+  (`mujoqo/_probe/a5_runner.m`,newLibraryWithSource 全新编译、单线程、struct 布局
+  _Static_assert 校验)脱离 quadrants 全栈直接执行:**仍 4.0**;对照内核(无条件累加)
+  同 harness = 2.0 正确。→ **Apple MSL→GPU 编译器 miscompile"循环内条件累加"模式**,
+  quadrants 各层(CHI IR/SPIR-V/MSL)均无责;47 行 MSL 可直接报 Apple。per-access
+  `Volatile` MemoryAccess 已试、无效(SPIRV-Cross 未落进 MSL)。
+- **状态**:open(根因在 Apple 工具链;quadrants 侧缓解方向 = 代码生成层改写该模式,
+  如 select 无分支化/移动 load 位置,待评估)。与 A2(tile runtime-loop 错值)共享
+  "Apple 编译器对循环携带模式"怀疑。gate 已钉死,Apple 修复或缓解落地后翻绿。
 
 ## A1/A2 — real_func SPIR-V 崩溃 / tile runtime-loop 错值(**open**)
 - A1:最小复现 `p0_realfunc.py`(metal 0/5,cpu 4/5);`print_ir` 定界 = CHI IR 正常,

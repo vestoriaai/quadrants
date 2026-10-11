@@ -2465,8 +2465,17 @@ spirv::Value TaskCodegen::load_buffer(const Stmt *ptr, DataType dt, bool is_vola
   // per-load opt-in for `qd.volatile_load`: the OpLoad itself carries the `Volatile` `MemoryAccess` mask so the
   // SPIR-V optimiser cannot forward / merge this specific read with prior reads of the same address, even when
   // the surrounding buffer is not blanket-decorated.
-  auto val_bits = is_volatile ? ir_->load_variable_volatile(buf_ptr, ir_->get_primitive_type(qd_buffer_type))
-                              : ir_->load_variable(buf_ptr, ir_->get_primitive_type(qd_buffer_type));
+  //
+  // A5 (mujocoqd/compiler-line): the blanket *variable-level* Volatile decoration alone does not stop
+  // MoltenVK/SPIRV-Cross from caching an element load across a loop-carried read-modify-write when the RMW sits
+  // inside a branch (conditional accumulate into one array element loses every iteration but the last; cpu is
+  // correct on the identical code).  The per-*access* `Volatile` mask does propagate into MSL as a re-read on
+  // every use, so on Metal every buffer load takes the volatile path.  Perf: re-read semantics only block
+  // load caching; measure with the usual bench suite and revisit by restricting to aliases-of-written buffers
+  // if it regresses.
+  const bool volatile_access = is_volatile || use_volatile_buffer_access_;
+  auto val_bits = volatile_access ? ir_->load_variable_volatile(buf_ptr, ir_->get_primitive_type(qd_buffer_type))
+                                  : ir_->load_variable(buf_ptr, ir_->get_primitive_type(qd_buffer_type));
   if (dt->is_primitive(PrimitiveTypeID::u1))
     return ir_->cast(ir_->bool_type(), val_bits);
   return qd_buffer_type == dt ? val_bits : ir_->make_value(spv::OpBitcast, ir_->get_primitive_type(dt), val_bits);
