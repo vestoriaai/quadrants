@@ -130,3 +130,29 @@
   探针散在 robostudio worktree / simtest 第三仓 / overlay 树，宝可失。
 - **状态**：landed（2efc351a）+ verified — `UNION GATE: 6/6 PASS`
   （consolidated wheel 实跑两次）。
+
+## Blit-pool fix — ext-arr mirror homogeneity（粘性 h2d map 失败根修）
+- **描述**：`GfxRuntime` 的外部数组镜像改为**无条件 host 可见**
+  （`host_write=true`，含 detected access==NONE 的死参数——它们自身的
+  blit/d2h 门仍按 access 跳过，但其镜像会在 drain 时进入
+  `ext_mirror_cache_` 池）。修复前：access==NONE 的参数拿到 Private
+  （Metal）镜像 → 该镜像入池（池**只按 size 键控**）→ first-fit 把它
+  发给后续需要 blit 的活参数 → `map()` 对 Private 永远 invalid_usage →
+  抛 "Failed to map ext arr data buffer for host_to_device blit"，毒化
+  条目回池、重试再抓再败 = **粘性、按问题确定、重试不可恢复**。附带
+  `MetalMemory::mapped_ptr` 的 QD_BLIT_DEBUG 诊断（区分 can_map=false 与
+  contents nil）与 h2d 失败消息的 arg_id/size/alloc_id。文件：
+  `quadrants/runtime/gfx/runtime.cpp`（镜像分配 + 失败消息）、
+  `runtime.h`（池不变量注释）、`quadrants/rhi/metal/metal_device.mm`
+  （诊断）。
+- **背景需求**：cavity T26 战役（2026-10-11）：4 组分裂（4×287 MiB 驻留
+  ESDF 场）下 mppi_coll 的 host_to_device blit 从 ~10 发射起成簇粘性
+  失败——189 集中 idx 1/3/4/8/9/10 每个新进程必现（全是 16 发射的
+  iters_used=5 题；4 发射题幸免），重试不可恢复，与 ~2.25% 随机 flake
+  不同；robostudio 被迫把 cavity 接线退到 n_group=1（575 MiB）。探针
+  `probe_blit_4group.py`（n_group=4 复现 8/10 失败 / n_group=1 全净）+
+  QD_BLIT_DEBUG 定位：每次失败都是同一个 can_map=false 的 672000B 池
+  条目。
+- **状态**：landed + verified — 同一复现 n_group=4 修后 **0 失败**
+  （10/10 过）；`UNION GATE: 6/6 PASS`（含 stale battery）。 cavity
+  4-group 全量验证见 ledger 更新时的记录。

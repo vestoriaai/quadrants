@@ -34,8 +34,16 @@ MAKEFLAGS=-j8 NO_PROXY="*" .venv-build/bin/python build.py wheel
 cp dist/quadrants-*.whl "$WT/scratch/quadrants_src/dist/"   # hand-off point
 ```
 
-- RelWithDebInfo matches the deployed dev7 lineage (`.so` carries
-  `.debug_info`); sccache makes rebuilds ~1 min (no full C++ recompile).
+- **Build type honesty (2026-10-11 correction)**: the
+  `-DCMAKE_BUILD_TYPE:STRING=RelWithDebInfo` in CMAKE_ARGS does NOT
+  stick — the pre-configured `build/cp312-*/CMakeCache.txt` holds
+  `Release` and the override is ignored (sccache makes this invisible).
+  Wheels from this repo are therefore Release (-O3, no debug info); the
+  retired overlay's dev7 was RelWithDebInfo. The difference is debug
+  info only — every gate (4-family, 6-gate union, readback perf pins)
+  passes identically on both. For a true RelWithDebInfo build: delete
+  `build/cp312-*` first, then rebuild.
+- sccache makes rebuilds ~1 min (no full C++ recompile).
 - The old overlay re-apply scripts (`apply_s2_patch.py` etc.) are
   RETIRED — the fixes are merged in-tree; do not re-apply them.
 - First-time LLVM fetch is rate-limited: pull via
