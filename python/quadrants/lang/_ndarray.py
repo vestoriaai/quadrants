@@ -62,6 +62,12 @@ class Ndarray:
     # this default.
     _qd_layout: tuple[int, ...] | None = None
 
+    # R5: instance-level True (set by ScalarNdarray/VectorNdarray/MatrixNdarray when the user passes
+    # ``host_visible=True``) marks a host-mappable backing buffer; to_numpy/from_numpy then take the
+    # direct map+memcpy fast path and skip the bridge kernel. Class default keeps the attribute access
+    # branchless for every non-opt-in ndarray.
+    _qd_host_visible: bool = False
+
     def __init__(self):
         self.host_accessor = None
         # `_physical_shape` is the underlying storage shape (matches the C++ ndarray buffer). `shape` is exposed
@@ -229,6 +235,12 @@ class Ndarray:
         Returns:
             numpy.ndarray: The result numpy array, in canonical axis order.
         """
+        if self._qd_host_visible:
+            # R5 fast path: the backing buffer is host-mappable, so after a stream drain the
+            # data is read directly from mapped memory -- no bridge kernel, no ext-arr mirror.
+            arr = np.empty(shape=tuple(self.shape), dtype=to_numpy_type(self.dtype))
+            impl.get_runtime().prog.ndarray_copy_to_host(self.arr, arr.ctypes.data, arr.nbytes)
+            return arr
         arr = np.zeros(shape=tuple(self.shape), dtype=to_numpy_type(self.dtype))
         from quadrants._kernels import ndarray_to_ext_arr  # pylint: disable=C0415
 
@@ -243,6 +255,12 @@ class Ndarray:
         Returns:
             numpy.ndarray: The result numpy array.
         """
+        if self._qd_host_visible:
+            # R5 fast path: matrix/vector ndarrays are always AOS, so the physical buffer is
+            # C-contiguous over total_shape -- a plain memcpy equals the bridge kernel's bytes.
+            arr = np.empty(shape=self.arr.total_shape(), dtype=to_numpy_type(self.dtype))
+            impl.get_runtime().prog.ndarray_copy_to_host(self.arr, arr.ctypes.data, arr.nbytes)
+            return arr
         arr = np.zeros(shape=self.arr.total_shape(), dtype=to_numpy_type(self.dtype))
         from quadrants._kernels import (  # pylint: disable=C0415
             ndarray_matrix_to_ext_arr,  # pylint: disable=C0415
@@ -272,6 +290,13 @@ class Ndarray:
             raise ValueError(f"Mismatch shape: {canonical_shape} expected, but {tuple(arr.shape)} provided")
         if not arr.flags.c_contiguous:
             arr = np.ascontiguousarray(arr)
+
+        if self._qd_host_visible:
+            # R5 fast path: host write into the mapped buffer after draining; the write is
+            # visible to every subsequently enqueued kernel (same contract as the mirror
+            # record-time memcpy).
+            impl.get_runtime().prog.ndarray_copy_from_host(self.arr, arr.ctypes.data, arr.nbytes)
+            return
 
         from quadrants._kernels import ext_arr_to_ndarray  # pylint: disable=C0415
 
@@ -333,6 +358,11 @@ class Ndarray:
             )
         if not arr.flags.c_contiguous:
             arr = np.ascontiguousarray(arr)
+
+        if self._qd_host_visible:
+            # R5 fast path (see _ndarray_from_numpy).
+            impl.get_runtime().prog.ndarray_copy_from_host(self.arr, arr.ctypes.data, arr.nbytes)
+            return
 
         from quadrants._kernels import (  # pylint: disable=C0415
             ext_arr_to_ndarray_matrix,  # pylint: disable=C0415
@@ -458,7 +488,7 @@ class ScalarNdarray(Ndarray):
         shape (Tuple[int]): Shape of the ndarray.
     """
 
-    def __init__(self, dtype, arr_shape):
+    def __init__(self, dtype, arr_shape, host_visible=False):
         super().__init__()
         self.dtype = cook_dtype(dtype)
         if impl.is_python_backend():
@@ -471,8 +501,14 @@ class ScalarNdarray(Ndarray):
             self.arr = torch.zeros(shape=arr_shape, dtype=dtype_to_torch_dtype(dtype))
         else:
             self.arr = impl.get_runtime().prog.create_ndarray(
-                self.dtype, arr_shape, layout=Layout.NULL, zero_fill=True, dbg_info=_qd_core.DebugInfo(get_traceback())
+                self.dtype,
+                arr_shape,
+                layout=Layout.NULL,
+                zero_fill=True,
+                dbg_info=_qd_core.DebugInfo(get_traceback()),
+                host_visible=host_visible,
             )
+            self._qd_host_visible = host_visible
         self._physical_shape = tuple(self.arr.shape)
         self.element_type = dtype
 

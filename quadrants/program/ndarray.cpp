@@ -27,13 +27,15 @@ Ndarray::Ndarray(Program *prog,
                  const DataType type,
                  const std::vector<int> &shape_,
                  ExternalArrayLayout layout_,
-                 const DebugInfo &dbg_info_)
+                 const DebugInfo &dbg_info_,
+                 bool host_visible)
     : dtype(type),
       shape(shape_),
       layout(layout_),
       dbg_info(dbg_info_),
       nelement_(std::accumulate(std::begin(shape_), std::end(shape_), 1, std::multiplies<>())),
       element_size_(data_type_size(dtype)),
+      host_visible_(host_visible),
       prog_(prog) {
   // Now that we have two shapes which may be concatenated differently
   // depending on layout, total_shape_ comes handy.
@@ -50,7 +52,7 @@ Ndarray::Ndarray(Program *prog,
                  "Ndarray index might be out of int32 boundary but int64 indexing is "
                  "not supported yet.");
   }
-  ndarray_alloc_ = prog->allocate_memory_on_device(nelement_ * element_size_, prog->result_buffer);
+  ndarray_alloc_ = prog->allocate_memory_on_device(nelement_ * element_size_, prog->result_buffer, host_visible);
 }
 
 Ndarray::Ndarray(DeviceAllocation &devalloc,

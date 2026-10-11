@@ -121,7 +121,12 @@ class LlvmProgramImpl : public ProgramImpl {
     return runtime_exec_->fill_ndarray(alloc, size, data);
   }
 
-  DeviceAllocation allocate_memory_on_device(std::size_t alloc_size, uint64 *result_buffer) override {
+  // R5: LLVM backends allocate host-accessible memory regardless; host_visible
+  // needs no routing here.
+  DeviceAllocation allocate_memory_on_device(std::size_t alloc_size,
+                                             uint64 *result_buffer,
+                                             bool host_visible = false) override {
+    (void)host_visible;
     return runtime_exec_->allocate_memory_on_device(alloc_size, result_buffer);
   }
 

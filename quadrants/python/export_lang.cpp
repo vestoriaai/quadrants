@@ -521,11 +521,19 @@ void export_lang(nb::module_ &m) {
       .def(
           "create_ndarray",
           [&](Program *program, const DataType &dt, const std::vector<int> &shape, ExternalArrayLayout layout,
-              bool zero_fill, DebugInfo dbg_info) -> Ndarray * {
-            return program->create_ndarray(dt, shape, layout, zero_fill, dbg_info);
+              bool zero_fill, DebugInfo dbg_info, bool host_visible) -> Ndarray * {
+            return program->create_ndarray(dt, shape, layout, zero_fill, dbg_info, host_visible);
           },
           nb::arg("dt"), nb::arg("shape"), nb::arg("layout") = ExternalArrayLayout::kNull, nb::arg("zero_fill") = false,
-          nb::arg("dbg_info") = DebugInfo(), nb::rv_policy::reference)
+          nb::arg("dbg_info") = DebugInfo(), nb::arg("host_visible") = false, nb::rv_policy::reference)
+      .def("ndarray_copy_to_host",
+           [](Program *program, const Ndarray *ndarray, uintptr_t dst, std::size_t dst_bytes) {
+             program->ndarray_copy_to_host(ndarray, reinterpret_cast<void *>(dst), dst_bytes);
+           })
+      .def("ndarray_copy_from_host",
+           [](Program *program, Ndarray *ndarray, uintptr_t src, std::size_t src_bytes) {
+             program->ndarray_copy_from_host(ndarray, reinterpret_cast<const void *>(src), src_bytes);
+           })
       .def("delete_ndarray", &Program::delete_ndarray)
       .def("get_ndarray_data_ptr_as_int",
            [](Program *program, Ndarray *ndarray) { return program->get_ndarray_data_ptr_as_int(ndarray); })
@@ -649,6 +657,7 @@ void export_lang(nb::module_ &m) {
       .def("write_int", &Ndarray::write_int)
       .def("write_float", &Ndarray::write_float)
       .def("total_shape", &Ndarray::total_shape)
+      .def("is_host_visible", &Ndarray::is_host_visible)
       .def("element_shape", &Ndarray::get_element_shape)
       .def("element_data_type", &Ndarray::get_element_data_type)
       .def_ro("dtype", &Ndarray::dtype)

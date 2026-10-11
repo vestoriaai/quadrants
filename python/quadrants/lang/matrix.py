@@ -1872,7 +1872,7 @@ class MatrixNdarray(Ndarray):
         >>> arr = qd.MatrixNdarray(2, 2, qd.f32, shape=(3, 3))
     """
 
-    def __init__(self, n, m, dtype, shape):
+    def __init__(self, n, m, dtype, shape, host_visible=False):
         self.n = n
         self.m = m
         super().__init__()
@@ -1888,7 +1888,9 @@ class MatrixNdarray(Ndarray):
             Layout.AOS,
             zero_fill=True,
             dbg_info=qd_python_core.DebugInfo(get_traceback()),
+            host_visible=host_visible,
         )
+        self._qd_host_visible = host_visible
 
     @property
     def element_shape(self):
@@ -2028,7 +2030,7 @@ class VectorNdarray(Ndarray):
         >>> a = qd.VectorNdarray(3, qd.f32, (3, 3))
     """
 
-    def __init__(self, n, dtype, shape):
+    def __init__(self, n, dtype, shape, host_visible=False):
         self.n = n
         super().__init__()
         # TODO(zhanlue): remove self.dtype and migrate its usages to element_type
@@ -2042,7 +2044,9 @@ class VectorNdarray(Ndarray):
             Layout.AOS,
             zero_fill=True,
             dbg_info=qd_python_core.DebugInfo(get_traceback()),
+            host_visible=host_visible,
         )
+        self._qd_host_visible = host_visible
 
     @property
     def element_shape(self):

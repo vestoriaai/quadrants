@@ -1041,12 +1041,16 @@ def field(dtype, shape=None, *args, **kwargs):
 
 
 @python_scope
-def ndarray(dtype, shape, needs_grad=False):
+def ndarray(dtype, shape, needs_grad=False, host_visible=False):
     """Defines a Quadrants ndarray with scalar elements.
 
     Args:
         dtype (Union[DataType, MatrixType]): Data type of each element. This can be either a scalar type like qd.f32 or a compound type like qd.types.vector(3, qd.i32).
         shape (Union[int, tuple[int]]): Shape of the ndarray.
+        host_visible (bool): Opt-in (R5). Allocate this ndarray's backing buffer host-mappable
+            (Metal ``MTLStorageModeShared``) so ``to_numpy`` / ``from_numpy`` skip the
+            bridge-kernel copy and become a plain map+memcpy. Use for per-step host
+            traffic buffers (e.g. obs/readback); leave the default for GPU-only data.
 
     Example:
         The code below shows how a Quadrants ndarray with scalar elements can be declared and defined::
@@ -1079,12 +1083,12 @@ def ndarray(dtype, shape, needs_grad=False):
         raise QuadrantsRuntimeError(f"{shape} is not a valid shape for ndarray")
     if dtype in all_types:
         dt = cook_dtype(dtype)
-        x = ScalarNdarray(dt, shape)
+        x = ScalarNdarray(dt, shape, host_visible=host_visible)
     elif isinstance(dtype, MatrixType):
         if dtype.ndim == 1:
-            x = VectorNdarray(dtype.n, dtype.dtype, shape)
+            x = VectorNdarray(dtype.n, dtype.dtype, shape, host_visible=host_visible)
         else:
-            x = MatrixNdarray(dtype.n, dtype.m, dtype.dtype, shape)
+            x = MatrixNdarray(dtype.n, dtype.m, dtype.dtype, shape, host_visible=host_visible)
         dt = dtype.dtype
     else:
         raise QuadrantsRuntimeError(f"{dtype} is not supported as ndarray element type")

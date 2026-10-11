@@ -304,15 +304,30 @@ class QD_DLL_EXPORT Program {
   }
 
   // TODO: do we still need result_buffer?
-  DeviceAllocation allocate_memory_on_device(std::size_t alloc_size, uint64 *result_buffer) {
-    return program_impl_->allocate_memory_on_device(alloc_size, result_buffer);
+  DeviceAllocation allocate_memory_on_device(std::size_t alloc_size,
+                                             uint64 *result_buffer,
+                                             bool host_visible = false) {
+    return program_impl_->allocate_memory_on_device(alloc_size, result_buffer, host_visible);
   }
+
+  // R5: copies the ndarray's whole backing buffer to/from a host pointer
+  // (numpy side). Requires the ndarray to have been created with
+  // host_visible=true; the gfx backends map that to host-mappable storage
+  // (Metal MTLStorageModeShared), so the bridge-kernel copy is unnecessary:
+  // drain the stream, then map + memcpy. Ordering: the drain guarantees
+  // pending kernel writes are visible before the host read (to_host), and
+  // host writes complete before any subsequently enqueued kernel runs
+  // (from_host) -- the same visibility contract the ext-arr mirror path
+  // already relies on.
+  void ndarray_copy_to_host(const Ndarray *ndarray, void *dst, std::size_t dst_bytes);
+  void ndarray_copy_from_host(Ndarray *ndarray, const void *src, std::size_t src_bytes);
 
   Ndarray *create_ndarray(const DataType type,
                           const std::vector<int> &shape,
                           ExternalArrayLayout layout = ExternalArrayLayout::kNull,
                           bool zero_fill = false,
-                          const DebugInfo &dbg_info = DebugInfo());
+                          const DebugInfo &dbg_info = DebugInfo(),
+                          bool host_visible = false);
 
   std::string get_kernel_return_data_layout() {
     return program_impl_->get_kernel_return_data_layout();

@@ -114,7 +114,12 @@ class ProgramImpl {
     return kDeviceNullPtr;
   }
 
-  virtual DeviceAllocation allocate_memory_on_device(std::size_t alloc_size, uint64 *result_buffer) {
+  // R5: `host_visible=true` asks for host-mappable backing memory (Metal maps
+  // `host_read` allocations to MTLStorageModeShared). Backends that allocate
+  // host memory anyway may ignore it.
+  virtual DeviceAllocation allocate_memory_on_device(std::size_t alloc_size,
+                                                     uint64 *result_buffer,
+                                                     bool host_visible = false) {
     return kDeviceNullAllocation;
   }
 
