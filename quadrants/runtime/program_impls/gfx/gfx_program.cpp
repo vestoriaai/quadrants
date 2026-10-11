@@ -22,9 +22,16 @@ void GfxProgramImpl::materialize_snode_tree(SNodeTree *tree, uint64 *result_buff
   snode_tree_mgr_->materialize_snode_tree(tree);
 }
 
-DeviceAllocation GfxProgramImpl::allocate_memory_on_device(std::size_t alloc_size, uint64 *result_buffer) {
+DeviceAllocation GfxProgramImpl::allocate_memory_on_device(std::size_t alloc_size,
+                                                           uint64 *result_buffer,
+                                                           bool host_visible) {
   DeviceAllocation alloc;
-  RhiResult res = get_compute_device()->allocate_memory({alloc_size, /*host_write=*/false, /*host_read=*/false,
+  // R5: host_visible ndarrays (obs/readback buffers) get host_read=true so the
+  // Metal backend allocates MTLStorageModeShared and the bridge-kernel copy in
+  // to_numpy/from_numpy can be skipped for them. Everything else keeps the
+  // GPU-private (Private on Metal) allocation as before.
+  RhiResult res = get_compute_device()->allocate_memory({alloc_size, /*host_write=*/false,
+                                                         /*host_read=*/host_visible,
                                                          /*export_sharing=*/false},
                                                         &alloc);
   QD_ASSERT(res == RhiResult::success);

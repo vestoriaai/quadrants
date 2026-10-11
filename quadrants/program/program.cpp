@@ -462,8 +462,9 @@ Ndarray *Program::create_ndarray(const DataType type,
                                  const std::vector<int> &shape,
                                  ExternalArrayLayout layout,
                                  bool zero_fill,
-                                 const DebugInfo &dbg_info) {
-  auto arr = std::make_unique<Ndarray>(this, type, shape, layout, dbg_info);
+                                 const DebugInfo &dbg_info,
+                                 bool host_visible) {
+  auto arr = std::make_unique<Ndarray>(this, type, shape, layout, dbg_info, host_visible);
   if (zero_fill) {
     Arch arch = compile_config().arch;
     if (arch_is_cpu(arch) || arch == Arch::cuda || arch == Arch::amdgpu) {
@@ -493,6 +494,57 @@ void Program::delete_ndarray(Ndarray *ndarray) {
   if (ndarrays_.count(ndarray) && !program_impl_->used_in_kernel(ndarray->ndarray_alloc_.alloc_id)) {
     ndarrays_.erase(ndarray);
   }
+}
+
+// R5 host-visible readback fast path. The ndarray was allocated host-mappable
+// (Metal: MTLStorageModeShared), so the bridge-kernel copy (ndarray_to_ext_arr /
+// ext_arr_to_ndarray) is unnecessary: drain the stream, then map + memcpy.
+// Visibility contract is the one MetalDevice::readback_data (R2) already relies
+// on: `contents` are valid after waitUntilCompleted; host writes made before a
+// command buffer is enqueued are visible to it.
+void Program::ndarray_copy_to_host(const Ndarray *ndarray, void *dst, std::size_t dst_bytes) {
+  const std::size_t nbytes = ndarray->get_element_size() * ndarray->get_nelement();
+  if (dst == nullptr || dst_bytes != nbytes) {
+    throw QuadrantsRuntimeError("ndarray_copy_to_host: dst_bytes=" + std::to_string(dst_bytes) +
+                                " != ndarray size " + std::to_string(nbytes) + " bytes");
+  }
+  if (!ndarray->is_host_visible()) {
+    throw QuadrantsRuntimeError(
+        "ndarray_copy_to_host requires an ndarray created with host_visible=True (default ndarrays are "
+        "GPU-private on Metal and need the bridge-kernel readback)");
+  }
+  synchronize();
+  DeviceAllocation alloc = ndarray->get_device_allocation();
+  void *mapped{nullptr};
+  RhiResult res = alloc.device->map_range(alloc.get_ptr(0), nbytes, &mapped);
+  if (res != RhiResult::success || mapped == nullptr) {
+    throw QuadrantsRuntimeError("ndarray_copy_to_host: failed to map host-visible ndarray buffer");
+  }
+  memcpy(dst, mapped, nbytes);
+  alloc.device->unmap(alloc);
+}
+
+void Program::ndarray_copy_from_host(Ndarray *ndarray, const void *src, std::size_t src_bytes) {
+  const std::size_t nbytes = ndarray->get_element_size() * ndarray->get_nelement();
+  if (src == nullptr || src_bytes != nbytes) {
+    throw QuadrantsRuntimeError("ndarray_copy_from_host: src_bytes=" + std::to_string(src_bytes) +
+                                " != ndarray size " + std::to_string(nbytes) + " bytes");
+  }
+  if (!ndarray->is_host_visible()) {
+    throw QuadrantsRuntimeError(
+        "ndarray_copy_from_host requires an ndarray created with host_visible=True (default ndarrays are "
+        "GPU-private on Metal and need the bridge-kernel upload)");
+  }
+  // Drain first: no pending kernel may race the host write into this buffer.
+  synchronize();
+  DeviceAllocation alloc = ndarray->get_device_allocation();
+  void *mapped{nullptr};
+  RhiResult res = alloc.device->map_range(alloc.get_ptr(0), nbytes, &mapped);
+  if (res != RhiResult::success || mapped == nullptr) {
+    throw QuadrantsRuntimeError("ndarray_copy_from_host: failed to map host-visible ndarray buffer");
+  }
+  memcpy(mapped, src, nbytes);
+  alloc.device->unmap(alloc);
 }
 
 intptr_t Program::get_ndarray_data_ptr_as_int(const Ndarray *ndarray) {

@@ -23,7 +23,8 @@ class QD_DLL_EXPORT Ndarray {
                    const DataType type,
                    const std::vector<int> &shape,
                    ExternalArrayLayout layout = ExternalArrayLayout::kNull,
-                   const DebugInfo &dbg_info = DebugInfo());
+                   const DebugInfo &dbg_info = DebugInfo(),
+                   bool host_visible = false);
 
   /* Constructs a Ndarray from an existing DeviceAllocation.
    * It doesn't handle the allocation and deallocation.
@@ -74,12 +75,20 @@ class QD_DLL_EXPORT Ndarray {
   const std::vector<int> &total_shape() const {
     return total_shape_;
   }
+  /* R5: true iff this ndarray's backing memory was allocated host-accessible
+   * (`host_read` set; Metal maps that to MTLStorageModeShared). Such buffers
+   * can be read/written directly from the host after a stream drain, skipping
+   * the bridge-kernel copies. See Program::ndarray_copy_to_host. */
+  bool is_host_visible() const {
+    return host_visible_;
+  }
   ~Ndarray();
 
  private:
   std::size_t nelement_{1};
   std::size_t element_size_{1};
   std::vector<int> total_shape_;
+  bool host_visible_{false};
 
   Program *prog_{nullptr};
 };
