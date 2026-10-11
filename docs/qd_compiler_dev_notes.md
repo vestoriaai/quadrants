@@ -140,3 +140,18 @@
 6. **逐位 A/B 的正确姿势**:one-init-per-process ⇒ 双臂必须子进程;hash 对照 ndarray
    bytes;覆盖 nv ∈ {1,3,5,23,24,25}(tiny/remainder/跨 arg class 不一致/对齐 prologue)。
    参考实现:tests/robostudio/probe_spirv_vectorize.py。
+7. **快路径 lane 析因陷阱(c2-emitter-fixes ①)**:还原累加 DAG 的叶子若含**循环不变
+   uniform**(被 cache-loop-invariant-global-vars 上提出循环的 load / 体内 coeff-0 load /
+   标量 kernel arg),Apple MSL fast-math 会把四条 lane 积和析因重排为
+   `(x0+x1+x2+x3)*c`——§7.2 "acc + x*c 常数因子形态"的 uniform 叶子特化,实测
+   `s += x[j]*c` 漂 ~2 ulp。对策 = fast 资格收紧到"体内 stride-1 load 叶子",其余回落
+   order-barrier lane 环(参考 vec_analyze fast_dag)。
+8. **GlobalStoreStmt 的 ret_type 恒为 unknown(c2-emitter-fixes ③)**:store 不产值,
+   `stmt->element_type()` 对它无意义;dtype 判定要走 ext-ptr pointee
+   (`ep->element_type().ptr_removed()`)。误用会以 "non-f32 memory access" 的误导性
+   理由拒掉**所有**含体内 store 的可向量化循环(症状:只有还原循环向量化)。
+9. **C2 三遍发射的名字作用域(c2-emitter-fixes ②)**:同一循环体被 scalar prologue /
+   vector main / scalar remainder 走三遍,每遍体内语句重发射并按 raw_name 重注册——
+   每遍都必须包 push/pop_value_scope(prologue 与 vector walk 均已包),漏包则
+   `register_value "tmpNN already exists"`。循环后按名查询的只有 alloca 与任务级值,
+   注册于 push 之前,不受 pop 影响。
