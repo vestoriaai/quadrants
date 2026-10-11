@@ -1,8 +1,9 @@
 #!/bin/zsh
 # robostudio-main union gate runner — one command, all robostudio gate families.
 #
-# Reproduces the consolidation checks plus gate 9 (reassociate flag) and
-# gate 10 (simt.subgroup/block on Metal + CPU - mujocoqd/subgroup-cpu-support).
+# Reproduces the consolidation checks plus gate 9 (reassociate flag),
+# gate 10 (simt.subgroup/block on Metal + CPU - mujocoqd/subgroup-cpu-support)
+# and gate 11 (C2 emitter fixes - mujocoqd/c2-emitter-fixes).
 #   7  C2        probe_spirv_vectorize.py metal    -> ALL PASS (bitwise scalar==vec)
 #   8  R5        gate_r5_host_visible.py metal     -> RESULT: PASS (byte parity +
 #                  relative perf pins; small readback <=x0.5 default, 64MB <=x1.2)
@@ -37,8 +38,8 @@ trap 'rm -rf "$TMP"' EXIT
 [[ -x "$PY" ]] || { echo "FATAL: no venv python at $PY (create .venv-consolidated, see docs/build_robostudio.md)" >&2; exit 1; }
 
 PASS=0; NFAIL=0
-gate_pass() { echo "gate $1/10 [$2]: PASS"; (( PASS = PASS + 1 )); }
-gate_fail() { echo "gate $1/10 [$2]: FAIL -- $3"; (( NFAIL = NFAIL + 1 )); }
+gate_pass() { echo "gate $1/11 [$2]: PASS"; (( PASS = PASS + 1 )); }
+gate_fail() { echo "gate $1/11 [$2]: FAIL -- $3"; (( NFAIL = NFAIL + 1 )); }
 
 # wait_gpu_idle: 0 if idle (possibly after waiting), 1 if still busy after 5 min
 wait_gpu_idle() {
@@ -189,6 +190,19 @@ fi
   || { G10_OK=0; echo "  algorithms cpu: expected ALL PASS:"; grep "^\[FAIL\]" "$TMP/g10_algos.log" || tail -8 "$TMP/g10_algos.log"; }
 (( G10_OK )) && gate_pass 10 "subgroup stack (metal+cpu)" || gate_fail 10 "subgroup stack (metal+cpu)" "see arms above"
 
-echo "UNION GATE: $PASS/10 PASS"
+# 11 C2 emitter fixes (mujocoqd/c2-emitter-fixes) ----------------------------------------------
+# Three HEAD C2 defects, one hard-gate arm each: arg-in-DAG env miss (G1),
+# k_elementwise store-loop admission + real float4 vectorization (G2), and the
+# coeff-0 remainder duplicate-registration (G3). Scalar arm = flags OFF.
+if wait_gpu_idle; then
+  "$PY" -u "$ROOT/tests/robostudio/probe_c2_emitter_fixes.py" metal >"$TMP/g11.log" 2>&1 \
+    && grep -q "ALL HARD GATES PASS" "$TMP/g11.log" \
+    && gate_pass 11 "c2-emitter-fixes" \
+    || { gate_fail 11 "c2-emitter-fixes" "output below"; tail -16 "$TMP/g11.log"; }
+else
+  gate_fail 11 "c2-emitter-fixes" "gpu-busy"
+fi
+
+echo "UNION GATE: $PASS/11 PASS"
 if (( NFAIL > 0 )); then echo "(logs kept in $TMP)"; trap - EXIT; exit 1; fi
 exit 0
