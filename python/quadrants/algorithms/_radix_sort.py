@@ -4,7 +4,9 @@
 The sort is exposed as the graph-composable ``@qd.func`` :func:`sort`: call it at the **top level** of your own
 ``@qd.kernel`` to compose the sort inline with other phases in one compiled kernel / captured graph (the qipc path); it
 takes the count as a device-resident 0-d ``n`` and the params as templates, and does no host-side validation. Size the
-caller-owned ``u32`` scratch with :func:`sort_scratch_slots`.
+caller-owned ``u32`` scratch with :func:`sort_scratch_slots`. Stable, frozen API (contract in
+``docs/source/user_guide/algorithms.md``). On the CPU backend ``sort`` dispatches at compile time to a serial LSD radix
+(``_cpu_paths``) with the same external semantics — twiddle, ``end_bit``, stability, NaN ordering and scratch contract.
 
 The body is a fixed sequence of top-level ``for`` loops - each of which Quadrants offloads as its own serialized GPU
 launch, giving the implicit grid-wide synchronization the algorithm needs between phases. (This replaces an earlier
@@ -52,7 +54,7 @@ owns the buffer (graph- / multi-stream-safe, no global state). :func:`sort` does
 """
 
 from quadrants.lang.impl import static
-from quadrants.algorithms._cpu_paths import _cpu_sort
+from quadrants.algorithms._cpu_paths import _cpu_radix_sort
 from quadrants.lang.impl import current_cfg, static
 from quadrants.lang.kernel_impl import func as _func
 from quadrants.lang.misc import cpu as _arch_cpu, loop_config
@@ -291,8 +293,6 @@ def sort(
 ):
     """Whole LSB radix sort as one ``@qd.func`` - the composable form; see module docstring.
 
-    **Experimental** - this API is new and may change in a future release.
-
     Call it at the **top level** of your own ``@qd.kernel`` (e.g. a qipc ``graph=True`` parent that chains it with other
     phases). Each phase helper's single top-level ``for`` stays its own offloaded GPU launch, so the inter-phase
     grid-wide synchronization survives and every phase is captured as a node in the parent's graph. A
@@ -318,9 +318,13 @@ def sort(
     buffers and size ``scratch`` correctly up front.
     """
     if static(current_cfg().arch == _arch_cpu):
-        # C5 (mujocoqd/compiler-line): CPU backend — serial LSD radix sort. u32 keys only
-        # (sign-cast i32 keys first); scratch[0:256] as digit counters.
-        _cpu_sort(keys, tmp_keys, values, tmp_values, scratch, n, has_values, end_bit)
+        # C5 (mujocoqd/algorithms-2): CPU backend — serial LSD radix sort with the same twiddle /
+        # digit / end_bit semantics as the GPU staircase below (scratch[0:256] digit counters).
+        # The block-tier GPU path itself cannot lower on the CPU backend (no shared-memory /
+        # barrier / subgroup substrate — see _cpu_paths module docstring and the algorithms
+        # ledger entry for the three-layer evidence chain).
+        key_width = static(_key_width_bits(key_dtype))
+        _cpu_radix_sort(keys, tmp_keys, values, tmp_values, scratch, n, has_values, end_bit, key_dtype, key_width)
     else:
         _validate_log256_max_n(log256_max_n)
         key_width = static(_key_width_bits(key_dtype))

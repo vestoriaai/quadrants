@@ -5,6 +5,10 @@ from ._radix_sort import (
     sort,
     sort_scratch_slots,
 )
+from ._segmented import (
+    sort_segmented,
+    sort_segmented_scratch_slots,
+)
 from ._reduce import (
     reduce_add,
     reduce_max,
@@ -40,4 +44,6 @@ __all__ = [
     "select_scratch_slots",
     "sort",
     "sort_scratch_slots",
+    "sort_segmented",
+    "sort_segmented_scratch_slots",
 ]

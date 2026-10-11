@@ -7,7 +7,7 @@ The algorithms here operate at device-level, using all available gpu cores, and 
 
 Each function is a kernel-side qd.func functions, which must be launched from inside a qd.kernel. They are fully compatible with graph. Every op requires caller-owned **scratch**, covered in a later section.
 
-> **Experimental.** These device-wide algorithms are a new addition and should be considered experimental: their signatures and semantics may change in a future release. (This does not apply to the **deprecated** `parallel_sort` and `PrefixSumExecutor`, which are on their own removal track.)
+> **Stable API.** The `reduce_{add,min,max}`, `exclusive_scan_{add,min,max}`, `select`, `sort` and `sort_segmented` families are frozen: their signatures, semantics and scratch contracts below are committed, and future work is additive (new ops / new dtype coverage, never a signature change). `reduce_by_key_add` remains **experimental** until its `min` / `max` variants land, and the **deprecated** `parallel_sort` / `PrefixSumExecutor` stay on their own removal track.
 
 ## What's available
 
@@ -17,12 +17,15 @@ Each function is a kernel-side qd.func functions, which must be launched from in
 | `qd.algorithms.exclusive_scan_{add,min,max}(arr, out, scratch, n, dtype, log256_max_n)` | `out[i] = sum/min/max(arr[0:i])` (three-pass Blelloch-style scan; 32-bit + 64-bit scalars; identity derived from `dtype` for min / max). | yes | no |
 | `qd.algorithms.select(arr, flags, out, num_out, scratch, n, log256_max_n)` | Stream compaction: copy `arr[i]` to a dense prefix of `out` for every `flags[i] == 1` (`flags` must be exactly 0/1; no `dtype` - the scatter is dtype-agnostic). | yes | no |
 | `qd.algorithms.sort(keys, tmp_keys, values, tmp_values, scratch, n, key_dtype, has_values, end_bit, log256_max_n)` | LSB radix sort (32-bit / 64-bit scalar keys, optional key-value). | yes | no |
+| `qd.algorithms.sort_segmented(keys, tmp_keys, values, tmp_values, segment_ids, tmp_seg, scratch, n, num_segments, key_dtype, has_values, end_bit, log256_max_n)` | Segmented stable sort: every contiguous segment `[segment_ids[j], segment_ids[j+1])` sorted by key (values riding along), segments in order. | yes | no |
 | `qd.algorithms.reduce_by_key_add(keys_in, values_in, keys_out, values_out, num_runs, scratch, n, value_dtype, log256_max_n)` | Collapse each consecutive run of equal keys into `(key, sum_of_values)` (`value_dtype` only for the `values_out` zero-init). | yes | no |
 | `qd.algorithms.{reduce,exclusive_scan,select,reduce_by_key,sort}_scratch_slots(...)` | Host- and kernel-callable helpers returning the scratch slot count each op needs. | yes | yes |
 | `qd.algorithms.parallel_sort` | Odd-even merge sort (in-place, key or key-value). **Deprecated**: prefer `sort`. | no | yes |
 | `qd.algorithms.PrefixSumExecutor` | Inclusive in-place prefix sum (i32 only). **Deprecated**: prefer `exclusive_scan_add`. | no | yes |
 
-These algorithms run on all of Quadrants' GPU backends (CUDA, AMDGPU, Vulkan, Metal); they are GPU-only and are not available on the CPU backend. (On Metal only 32-bit dtypes are supported - no `i64` / `u64` / `f64`; `PrefixSumExecutor` is CUDA / Vulkan only.) The `*_scratch_slots` helpers are plain integer arithmetic, so they also run on the host / CPU.
+These algorithms run on all of Quadrants' GPU backends (CUDA, AMDGPU, Vulkan, Metal) **and on the CPU backend**, where each op dispatches at kernel-compile time (`qd.static`) to a serial implementation with the same signatures and external semantics (results may differ in association order for floating-point adds, as on GPU). Backend dtype coverage: CUDA / AMDGPU / Vulkan / CPU support the full 32-bit + 64-bit scalar set; **Metal supports 32-bit dtypes only** (no `i64` / `u64` / `f64` keys or values). `PrefixSumExecutor` remains CUDA / Vulkan only. The `*_scratch_slots` helpers are plain integer arithmetic, so they run on the host, on every backend, and inside kernels.
+
+CPU-backend call-form note: the counts `n` / `num_segments` are documented as 0-d `i32` ndarrays (read on-device); on the CPU backend they may equivalently be a host `int` or an `i32` scalar kernel argument - all three forms compile to the same serial path. (On the GPU backends the 0-d ndarray form is required: the count is read on-device.)
 
 ## Composable `@qd.func` ops
 
@@ -97,6 +100,19 @@ scratch = qd.ndarray(qd.u32, shape=qd.algorithms.reduce_scratch_slots(N, D))
 # 8-byte reduce: same slot count, u64 buffer.
 scratch64 = qd.ndarray(qd.u64, shape=qd.algorithms.reduce_scratch_slots(N, D))
 ```
+
+**Budget formulas** (`B = BLOCK_DIM = 256`; `D` = the `log256_max_n` the op is compiled for; `cdiv(a, b) = ceil(a / b)`; all counts are `u32` slots, dtype-width-independent):
+
+| Op | Exact scratch budget `f(N, D)` |
+|----|--------------------------------|
+| `reduce_{add,min,max}` | `max(1, sum_{i=1..D-1} cdiv(cdiv(...cdiv(N)...), B))` - the cdiv-by-256 chain applied `D-1` times, each intermediate summed |
+| `exclusive_scan_{add,min,max}` | same chain as `reduce` (identical closed form), `>= 1` |
+| `select` | `N + b0 + sum_{i>=1} cdiv-chain(b0)` where `b0 = cdiv(N, B)` (one write index per element plus the scan partials), `>= 1` |
+| `reduce_by_key_add` | `N` for `N <= B`, else the scan-partial staircase `sum` over `cdiv(N / B^i)` (see `reduce_by_key_scratch_slots`) |
+| `sort` | `cdiv(N, B) * B + sum_{i=1..D-1} cdiv-chain(cdiv(N, B) * B)` (tile histograms are `cdiv(N,B)*256` slots; the staircase stacks above) |
+| `sort_segmented` | `N + sort(N, D)` (`N` rank slots plus the whole sort footprint; the rank scan's partials reuse the sort region sequentially) |
+
+Each `*_scratch_slots(...)` helper *is* this formula in branch-free arithmetic - call it instead of transcribing it; the table exists so the footprint is auditable and so an allocation can be sanity-checked against `helper(N, D) <= N + cdiv(N,B)*B + 512` style back-of-envelope bounds. Asymptotically every op is `~N + O(N/256)` u32 slots (a few MB at `N = 10^7`).
 
 **No on-device check.** The composable `@qd.func` forms run directly as device code, so they do **no** scratch-sufficiency check. Size `scratch` correctly up front with the matching helper - `reduce_scratch_slots(N, log256_max_n)`, `exclusive_scan_scratch_slots(N, log256_max_n)`, `select_scratch_slots(N)`, `reduce_by_key_scratch_slots(N)`, or `sort_scratch_slots(N, log256_max_n)` - for the capacity you compile the op against. An undersized buffer corrupts the output (or reads / writes out of bounds) rather than raising.
 
@@ -315,6 +331,51 @@ n.fill(N)
 run(keys, tmp_keys, values, tmp_values, scratch, n)
 print(keys.to_numpy())     # [1 1 2 3 4 5 6 9]
 print(values.to_numpy())   # [1 3 6 0 2 4 7 5]   (original indices; stable for the tied 1s)
+```
+
+### `qd.algorithms.sort_segmented`
+
+Segmented stable key-value sort: every contiguous segment is sorted by key ascending with stable tie order, values riding along, and segments keep their order. Segments are the contiguous ranges `[segment_ids[j], segment_ids[j+1])` for `j < num_segments` - the caller supplies `num_segments + 1` non-decreasing `qd.i32` start offsets with `segment_ids[0] == 0` and the end sentinel `segment_ids[num_segments] == n` (the exact array shape warp's `segmented_sort_pairs` / CUB `DeviceSegmentedSort` consume). Empty segments (`segment_ids[j] == segment_ids[j+1]`) are no-ops. This is the mujoco SAP-broadphase primitive.
+
+`sort_segmented(keys, tmp_keys, values, tmp_values, segment_ids, tmp_seg, scratch, n, num_segments, key_dtype, has_values, end_bit, log256_max_n)`
+
+Everything shared with `sort` (call site, `n` / `num_segments` as 0-d `i32` ndarrays, `key_dtype` / `has_values` / `end_bit` / `log256_max_n` compile-time params, key dtypes, twiddle / NaN ordering, stability, ping-pong discipline) follows the `sort` contract above. Per-op specifics:
+
+- `segment_ids`: 1-D `qd.i32` tensor with `num_segments + 1` entries (read-only; only the first `num_segments + 1` entries are ever touched).
+- `tmp_seg`: 1-D `qd.i32` work tensor, shape `>= n`; contents on return are garbage (it holds the segment-start flags and one ping-pong half of the per-element run-rank).
+- `scratch`: `sort_segmented_scratch_slots(N, log256_max_n)` = `N + sort_scratch_slots(N, log256_max_n)` u32 slots.
+- **No 64-bit composite key.** The implementation is a lexicographic LSD radix over `(run-rank, key)`: the run-rank (index of the segment containing each element) is derived once from the start flags by an exclusive scan, then byte passes run over the key digits (minor) and the rank digits (major), moving keys, values and rank in lock-step. Everything stays on 32-bit digits, so the op works on Metal where the classic `segment_id << 32 | key` composite cannot exist.
+- `num_segments == 0` sorts nothing. `num_segments >= 1` with the sentinel covers `[0, n)` exactly.
+
+Example - sort each world's geom projections by their SAP cell (values = geom indices):
+
+```python
+i32_1d = qd.types.ndarray(qd.i32, ndim=1)
+u32_1d = qd.types.ndarray(qd.u32, ndim=1)
+f32_1d = qd.types.ndarray(qd.f32, ndim=1)
+i32_0d = qd.types.ndarray(qd.i32, ndim=0)
+
+@qd.kernel
+def run(keys: u32_1d, tmp_keys: u32_1d, values: f32_1d, tmp_values: f32_1d,
+        seg: i32_1d, tmp_seg: i32_1d, scratch: u32_1d, n: i32_0d, nseg: i32_0d):
+    qd.algorithms.sort_segmented(keys, tmp_keys, values, tmp_values, seg, tmp_seg, scratch,
+                                 n, nseg, qd.u32, True, 32, D)
+
+NW, NG = 4, 8
+N = NW * NG
+keys       = qd.ndarray(qd.u32, shape=N)     # per-world projection keys
+tmp_keys   = qd.ndarray(qd.u32, shape=N)
+values     = qd.ndarray(qd.f32, shape=N)     # e.g. geom indices
+tmp_values = qd.ndarray(qd.f32, shape=N)
+seg        = qd.ndarray(qd.i32, shape=(NW + 1,))   # start offsets + sentinel n
+tmp_seg    = qd.ndarray(qd.i32, shape=N)
+scratch    = qd.ndarray(qd.u32, shape=(qd.algorithms.sort_segmented_scratch_slots(N, D),))
+n          = qd.ndarray(qd.i32, shape=()); n.fill(N)
+nseg       = qd.ndarray(qd.i32, shape=()); nseg.fill(NW)
+# seg[i] = i * NG  (fixed-size per-world segments)
+
+run(keys, tmp_keys, values, tmp_values, seg, tmp_seg, scratch, n, nseg)
+# each world's NG-key block is now sorted by key, stable, geom indices permuted in lock-step
 ```
 
 ### `qd.algorithms.reduce_by_key_add`
