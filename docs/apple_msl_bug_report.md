@@ -179,3 +179,13 @@ Any MSL code that conditionally accumulates into an array/buffer element inside 
 - Single thread, single threadgroup: the lost update is a **loop-carried dependence on one thread**, not a data race.
 - The unconditional row of the matrix rules out a general problem with non-atomic device RMW or pointer aliasing; the failure is specific to the conditional form.
 - Reproduction rate: 100% (deterministic, reproduces on every run).
+
+## Ecosystem context (added 2026-10-11)
+
+A public-search sweep (2026-10-11) found no prior report of this specific
+miscompile; the Xcode 26 release notes list no matching known issue. Related
+evidence that generated-MSL projects routinely hit the MSL optimizer:
+gfx-rs/wgpu#4972 ("Metal Shading Language compiler treats infinite loops as
+UB") and its follow-up #6518, where the workaround is inserting side-effect
+markers so loops are not optimized away. This report appears to be new
+information for the loop-carried-dependence class specifically.
