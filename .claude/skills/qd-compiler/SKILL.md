@@ -25,7 +25,7 @@ description: quadrants(Taichi fork)编译器/运行时源码开发的能力速�
 ## A 系列 bug 家族速查(修复/规避已在主线,详见需求清单)
 
 - **A5/A11/A12(Apple MSL loop-carried 族)**:条件 RMW 用 `+=`;原子写后消费放下一个 launch;串行嵌套循环 store 用 atomic。归因 = 独立 MSL harness(`_probe/a5_runner.m` 模式)。
-- **A10(自家 codegen)**:嵌套 loop-carried 循环**一律行序(i-outer)**,列序双后端 nan——codegen 侧待修(下一 native 线首项)。
+- **A10(已复核 2026-10-12,非编译器 bug)**:列序"nan"系证据算法次序错误(除数 `U[j,j]` 由同层更晚迭代写入;numpy 孪生同样 nan,qd ≡ 孪生,双后端双 wheel)——**无 codegen 缺陷**,原"下一 native 线首项"撤销。行序律保留 = 算法数据依赖结构(除数须先写后读);正确列序(对角先算)亦可用。语义钉 = union gate 13。
 - **A2**:Tile 跨 runtime 回边错值(钉死)→ 静态展开;A1:real_func SPIR-V 响亮拒绝(降级设计);A4:tuple 注解已修;A6:func 内 for 内联=并行 → serialize 逐循环;A7:early_return 复合返回手工;A9/A14:fuse_args 工厂崩 → 内联;A13:链式写=误报(已实证);A15:alias assert=上下文特异(smooth wrap 场景)。
 - **C2 emitter 三缺陷已修**(env_lookup/dtype-pointee/scope),既有 know-how 在 dev_notes §7.7-7.9。
 
@@ -41,6 +41,6 @@ description: quadrants(Taichi fork)编译器/运行时源码开发的能力速�
 ## 流程
 
 - 构建/wheel:`MAKEFLAGS=-j8 NO_PROXY="*" .venv-build/bin/python build.py wheel`(sccache;python-only 分钟级)→ 装**自建验证 venv**(venv 归属见 mujoqo memory;基线 venv3=dev36 冻结,用于 dual-wheel 归因)。
-- 门禁:`zsh tests/robostudio/run_robostudio_gates.sh <venv>`(当前 11 门)+ `pytest tests/python/test_return.py`(46/46)。gate-4 perf 钉值 WARN-only(机器方差 ±4×,perf 结论交错中位,`_gpu_busy.sh` 查空闲)。
+- 门禁:`zsh tests/robostudio/run_robostudio_gates.sh <venv>`(门数以 runner 头注为准)+ `pytest tests/python/test_return.py`(46/46)。gate-4 perf 钉值 WARN-only(机器方差 ±4×,perf 结论交错中位,`_gpu_busy.sh` 查空闲)。
 - 新 native 旗标/大改:ledger 条目(设计/数字/footprint)+ `--no-ff` 合并由协调人执行;上游 test_return 无回归是底线。
 - Metal 无 f64/i64/u64/print/assert;3-arg range 不支持;静态展开平方爆炸(有界);池指针 4B 对齐;S-guard 一进程一 init。

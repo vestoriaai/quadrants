@@ -3,10 +3,10 @@
 #
 # Reproduces the consolidation checks plus gate 9 (reassociate flag),
 # gate 10 (simt.subgroup/block on Metal + CPU - mujocoqd/subgroup-cpu-support),
-# gate 11 (C2 emitter fixes - mujocoqd/c2-emitter-fixes) and gate 12
+# gate 11 (C2 emitter fixes - mujocoqd/c2-emitter-fixes), gate 12
 # (to_numpy_type compound dtypes - mujocoqd/n2-to-numpy-type; CPU only, the
-# API is arch-independent. ID 13 is reserved by the A10 nested-loop line on
-# its own branch -- the gate COUNT below reflects gates actually present).
+# API is arch-independent) and gate 13 (A10 nested-loop order semantics -
+# mujocoqd/a10-nested-loop-raw; cpu+metal dual arm).
 #   7  C2        probe_spirv_vectorize.py metal    -> ALL PASS (bitwise scalar==vec)
 #   8  R5        gate_r5_host_visible.py metal     -> RESULT: PASS (byte parity +
 #                  relative perf pins; small readback <=x0.5 default, 64MB <=x1.2)
@@ -215,6 +215,21 @@ fi
   && gate_pass 12 "n2 to_numpy_type compound" \
   || { gate_fail 12 "n2 to_numpy_type compound" "output below"; tail -16 "$TMP/g12.log"; }
 
-echo "UNION GATE: $PASS/12 PASS"
+# 13 A10 nested-loop order semantics (mujocoqd/a10-nested-loop-raw) ------------
+# Corrected-order column/row Cholesky forms must match their numpy twins on
+# BOTH backends, and the degenerate invalid-order form must equal its twin
+# exactly (faithful-compilation pin; the original A10 "miscompile" was an
+# algorithm-order bug in the evidence, see the probe header + ledger).
+"$PY" -u "$ROOT/tests/robostudio/probe_a10_nested_loop_order.py" cpu >"$TMP/g13_cpu.log" 2>&1 \
+  && grep -q "RESULT: PASS" "$TMP/g13_cpu.log" && G13=1 || { G13=0; echo "  a10 cpu arm: expected RESULT: PASS:"; tail -8 "$TMP/g13_cpu.log"; }
+if wait_gpu_idle; then
+  "$PY" -u "$ROOT/tests/robostudio/probe_a10_nested_loop_order.py" metal >"$TMP/g13_metal.log" 2>&1 \
+    && grep -q "RESULT: PASS" "$TMP/g13_metal.log" && G13=$((G13 + 1)) || { echo "  a10 metal arm: expected RESULT: PASS:"; tail -8 "$TMP/g13_metal.log"; }
+else
+  echo "  a10 metal arm: skipped (gpu-busy)"
+fi
+(( G13 == 2 )) && gate_pass 13 "a10 nested-loop order (cpu+metal)" || gate_fail 13 "a10 nested-loop order (cpu+metal)" "see arms above"
+
+echo "UNION GATE: $PASS/13 PASS"
 if (( NFAIL > 0 )); then echo "(logs kept in $TMP)"; trap - EXIT; exit 1; fi
 exit 0
