@@ -789,3 +789,26 @@ union runner gate 11(+19/−5);probe_reassociate_flag.py 注释修正(+11/−11)
 - **wheel**:`dist/quadrants-1.3.4.dev78+g4f09cab72.d20261011-cp312-cp312-macosx_13_0_arm64.whl`
   → `/Users/mini0/Code/mujoqo/_probe.venv8`(python3.12,tuna 依赖镜像)。
 - **状态**:landed + verified(分支 `mujocoqd/c2-emitter-fixes`,未 merge)。
+
+## A10 复核 — 列序"miscompile"系证据算法次序错误,编译器无罪(mujocoqd/a10-nested-loop-raw)
+- **描述**:需求清单 A10(嵌套 runtime 循环 RAW:列序 Cholesky 双后端 nan,定案"自家
+  codegen bug、下一 native 线首项")复核**推翻**。原证据(mujoqo `_probe/cs_evidence/
+  cs_dbg_chol2.py` 族)的列序形态在 `i<j` 分支除以 `U[j,j]`,而 `U[j,j]` 由同一中层循环
+  **更晚**的 `i==j` 分支写入——顺序语义读初值 0 → ±inf → nan;该程序的 **numpy 孪生同样
+  nan**,qd 输出与孪生逐元素一致(nan 模式含内;cpu+metal;dev36 与当前 wheel 双验)
+  = 双后端忠实编译,无 codegen 缺陷。次序正确的列序 Cholesky(对角先算,仅依赖更早列;
+  func+3-D+serialize 移植形态,n=8/24)双后端全过:cpu 0.00e+00 / metal ≤4.77e-07。
+  **零 native 改动,无修复需求**;原 A10 修复 plan(dump/diff IR)不再需要。
+- **背景需求**:A10 原条目把本项列为"下一 native 线首项";本轮在最小化复现阶段
+  (带精确语义孪生对照)即证伪。row-order 律**保留**,理由更正:行序形态的除数
+  (对角/更早行值)在其写入后可见,列序原形态除数在写入前——是算法数据依赖结构问题,
+  非编译器缺陷;A5/A8/A11/A12(Apple MSL loop-carried 族)不受影响,仍按原账。
+- **语义钉(gate 13)**:`tests/robostudio/probe_a10_nested_loop_order.py` —
+  A 正确列序 inline 2-D(n=8/24)/ B func+3-D(n=8/24)/ C 行序控制(2.38e-07)/
+  **D 无效形态 ≡ numpy 孪生精确断言**(nan 模式 + 有限值;faithful-compilation pin,
+  防未来 codegen 变更悄悄改变退化程序输出)。cpu+metal 双臂进 union runner
+  (**gate 13**;编号 12 留给 n2-to-numpy-type 线,本分支 runner 计 /12)。
+- **footprint**:tests +237(新探针)、runner +21/−3;docs 本条目。零 native、零旗标、
+  cache key 无涉。
+- **状态**:landed + verified(分支 `mujocoqd/a10-nested-loop-raw`,未 merge;gate 13
+  cpu+metal 双臂 RESULT: PASS,venv4 = 0de907cd ≡ HEAD native,2026-10-12)。

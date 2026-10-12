@@ -41,6 +41,6 @@ description: quadrants(Taichi fork)编译器/运行时源码开发的能力速�
 ## 流程
 
 - 构建/wheel:`MAKEFLAGS=-j8 NO_PROXY="*" .venv-build/bin/python build.py wheel`(sccache;python-only 分钟级)→ 装**自建验证 venv**(venv 归属见 mujoqo memory;基线 venv3=dev36 冻结,用于 dual-wheel 归因)。
-- 门禁:`zsh tests/robostudio/run_robostudio_gates.sh <venv>`(当前 11 门)+ `pytest tests/python/test_return.py`(46/46)。gate-4 perf 钉值 WARN-only(机器方差 ±4×,perf 结论交错中位,`_gpu_busy.sh` 查空闲)。
+- 门禁:`zsh tests/robostudio/run_robostudio_gates.sh <venv>`(门数以 runner 头注为准)+ `pytest tests/python/test_return.py`(46/46)。gate-4 perf 钉值 WARN-only(机器方差 ±4×,perf 结论交错中位,`_gpu_busy.sh` 查空闲)。
 - 新 native 旗标/大改:ledger 条目(设计/数字/footprint)+ `--no-ff` 合并由协调人执行;上游 test_return 无回归是底线。
 - Metal 无 f64/i64/u64/print/assert;3-arg range 不支持;静态展开平方爆炸(有界);池指针 4B 对齐;S-guard 一进程一 init。
