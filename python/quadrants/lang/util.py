@@ -95,6 +95,9 @@ def is_quadrants_class(rhs):
 def to_numpy_type(dt):
     """Convert quadrants data type to its counterpart in numpy.
 
+    Compound types (VectorType/MatrixType) are accepted and yield the numpy
+    dtype of their *element*: shape/extent semantics stay with the caller.
+
     Args:
         dt (DataType): The desired data type to convert.
 
@@ -102,6 +105,11 @@ def to_numpy_type(dt):
         DataType: The counterpart data type in numpy.
 
     """
+    # Late import: lang/matrix.py imports this module (N2).
+    from quadrants.lang.matrix import MatrixType  # pylint: disable=C0415
+
+    if isinstance(dt, MatrixType):  # VectorType subclasses MatrixType
+        return to_numpy_type(dt.dtype)
     if dt == f32:
         return np.float32
     if dt == f64:
