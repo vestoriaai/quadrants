@@ -2,8 +2,11 @@
 # robostudio-main union gate runner — one command, all robostudio gate families.
 #
 # Reproduces the consolidation checks plus gate 9 (reassociate flag),
-# gate 10 (simt.subgroup/block on Metal + CPU - mujocoqd/subgroup-cpu-support)
-# and gate 11 (C2 emitter fixes - mujocoqd/c2-emitter-fixes).
+# gate 10 (simt.subgroup/block on Metal + CPU - mujocoqd/subgroup-cpu-support),
+# gate 11 (C2 emitter fixes - mujocoqd/c2-emitter-fixes) and gate 12
+# (to_numpy_type compound dtypes - mujocoqd/n2-to-numpy-type; CPU only, the
+# API is arch-independent. ID 13 is reserved by the A10 nested-loop line on
+# its own branch -- the gate COUNT below reflects gates actually present).
 #   7  C2        probe_spirv_vectorize.py metal    -> ALL PASS (bitwise scalar==vec)
 #   8  R5        gate_r5_host_visible.py metal     -> RESULT: PASS (byte parity +
 #                  relative perf pins; small readback <=x0.5 default, 64MB <=x1.2)
@@ -38,8 +41,8 @@ trap 'rm -rf "$TMP"' EXIT
 [[ -x "$PY" ]] || { echo "FATAL: no venv python at $PY (create .venv-consolidated, see docs/build_robostudio.md)" >&2; exit 1; }
 
 PASS=0; NFAIL=0
-gate_pass() { echo "gate $1/11 [$2]: PASS"; (( PASS = PASS + 1 )); }
-gate_fail() { echo "gate $1/11 [$2]: FAIL -- $3"; (( NFAIL = NFAIL + 1 )); }
+gate_pass() { echo "gate $1/12 [$2]: PASS"; (( PASS = PASS + 1 )); }
+gate_fail() { echo "gate $1/12 [$2]: FAIL -- $3"; (( NFAIL = NFAIL + 1 )); }
 
 # wait_gpu_idle: 0 if idle (possibly after waiting), 1 if still busy after 5 min
 wait_gpu_idle() {
@@ -203,6 +206,15 @@ else
   gate_fail 11 "c2-emitter-fixes" "gpu-busy"
 fi
 
-echo "UNION GATE: $PASS/11 PASS"
+# 12 to_numpy_type compound dtypes (mujocoqd/n2-to-numpy-type) ------------------
+# to_numpy_type accepts VectorType/MatrixType and yields the element np dtype
+# (scalar table pinned object-exact; compound direct calls; loud unknown dtype;
+# compound-dtype ndarray round trip). CPU-only: the API is arch-independent.
+"$PY" -u "$ROOT/tests/robostudio/probe_n2_to_numpy_type.py" cpu >"$TMP/g12.log" 2>&1 \
+  && grep -q "RESULT: PASS" "$TMP/g12.log" \
+  && gate_pass 12 "n2 to_numpy_type compound" \
+  || { gate_fail 12 "n2 to_numpy_type compound" "output below"; tail -16 "$TMP/g12.log"; }
+
+echo "UNION GATE: $PASS/12 PASS"
 if (( NFAIL > 0 )); then echo "(logs kept in $TMP)"; trap - EXIT; exit 1; fi
 exit 0
