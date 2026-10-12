@@ -61,6 +61,7 @@ from quadrants.lang.util import (
     is_quadrants_class,
     python_scope,
     quadrants_scope,
+    to_numpy_type,
     warning,
 )
 from quadrants.types.enums import SNodeGradType
@@ -1482,9 +1483,55 @@ def mesh_relation_access(mesh, from_index, to_element_type):
     raise RuntimeError("Relation access should be with a mesh instance!")
 
 
+def copy(dst, src, count=None):
+  """Copies `src` into the ndarray `dst`.
+
+  Python-scope convenience that mirrors warp's ``wp.copy``: fills an
+  existing ndarray from another ndarray or from host data.
+
+  Args:
+    dst (Ndarray): Destination ndarray.
+    src (Ndarray | numpy.ndarray | list | tuple): Source data. Ndarray
+      sources are copied elementwise via ``copy_from`` (shapes must
+      match); host data is cast to `dst`'s dtype and reshaped to `dst`'s
+      numpy shape (element dims appended for vector/matrix dtypes).
+    count (int, optional): Number of leading elements of `dst` to fill
+      (host-data sources only). ``None`` copies everything.
+
+  Returns:
+    Ndarray: The destination ndarray, for chaining.
+  """
+  import numpy as np
+
+  if hasattr(src, "copy_from"):
+    if count is not None:
+      raise ValueError("count is only supported for host-data sources")
+    dst.copy_from(src)
+    return dst
+  arr = np.asarray(src)
+  shape = tuple(dst.shape)
+  n_total = int(np.prod(shape, dtype=np.int64)) if shape else 1
+  if arr.size % n_total != 0:
+    raise ValueError(f"src size {arr.size} is not divisible by dst size {n_total}")
+  elem = arr.size // n_total
+  elem_shape = shape + ((elem,) if elem > 1 else ())
+  arr = arr.reshape(elem_shape)
+  elem_dt = getattr(dst.dtype, "dtype", dst.dtype)
+  arr = arr.astype(to_numpy_type(elem_dt), copy=False)
+  if count is not None:
+    # from_numpy is whole-array only; fill the leading `count` elements over a
+    # host readback of the current contents (documented convenience cost).
+    whole = dst.to_numpy().reshape(elem_shape).copy()
+    whole.reshape(-1)[: count * elem] = arr.reshape(-1)[: count * elem]
+    dst.from_numpy(whole)
+    return dst
+  dst.from_numpy(arr)
+  return dst
+
+
 __all__ = [
     "axes",
-    "deactivate_all_snodes",
+    "copy",    "deactivate_all_snodes",
     "field",
     "grouped",
     "ndarray",
