@@ -688,6 +688,17 @@ codegen 改动**(arch 全部门控),无新 compile_config 旗标,offline-cache k
 
 ---
 
+# mujocoqd/qd-copy-api 条目(2026-10-12;**已合入 robostudio-main**,merge 2ce5a850;union 11/11 @ venv4/dev82)
+
+**qd.copy(dst, src, count=None) 原生 API**(impl.py,`from quadrants.lang import *` 导出):
+warp `wp.copy` 的 python-scope 对应物。ndarray 源走 `copy_from`;host 数据(numpy/list)按
+dst 元素 dtype cast(to_numpy_type 走 VectorType.dtype 解包)+ reshape 到 dst 的 numpy 形状
+(向量/矩阵 dtype 自动附加元素维);`count` 填充前导元素(from_numpy 整数组语义 → host
+readback 合并实现,代价已文档化)。返回 dst 可链式。动机:mujoqo 移植在 wp.copy 调用点上的
+wp_copy 别名 shim 层得以删除,调用点 `qd.copy(dst, src)` 与上游形状一致。
+**Gate**:qdcopy smoke(numpy/list/ndarray/vec3 元素维/count;cpu+metal)ALL PASS + union
+11/11。footprint:impl.py +55/−2,纯 python 增量。
+
 # mujocoqd/c2-emitter-fixes 条目(2026-10-12;分支 `mujocoqd/c2-emitter-fixes`,基于 8ebf8620)
 
 > 修复 REA 条目"附带发现"里的三个 HEAD 既有 C2 emitter/analyze 缺陷(dev59/dev71 wheel
