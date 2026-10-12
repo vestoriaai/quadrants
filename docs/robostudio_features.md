@@ -1,3 +1,6 @@
+<!-- INDEX — merged lines (newest last; each entry's full section via its header below) -->
+<!-- qd-copy-api 2ce5a850 · c2-emitter-fixes 83b2d1a2 · subgroup-cpu-support 8ebf8620 · reassociate-flag 19ff0276 · reassoc-subgroup-probe 9372c300 · r5-host-visible 67e27bc4 · spirv-vectorize 68bd7965 · algorithms-2 b12c125c · compiler-line 33e7dabf -->
+
 # robostudio_features.md — features ledger for robostudio-main
 
 > **维护约定（本文件头即规则）**：每一个合并进 robostudio-main 的
