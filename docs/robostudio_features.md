@@ -789,3 +789,31 @@ union runner gate 11(+19/−5);probe_reassociate_flag.py 注释修正(+11/−11)
 - **wheel**:`dist/quadrants-1.3.4.dev78+g4f09cab72.d20261011-cp312-cp312-macosx_13_0_arm64.whl`
   → `/Users/mini0/Code/mujoqo/_probe.venv8`(python3.12,tuna 依赖镜像)。
 - **状态**:landed + verified(分支 `mujocoqd/c2-emitter-fixes`,未 merge)。
+
+# mujocoqd/n2-to-numpy-type 条目(2026-10-12;分支 `mujocoqd/n2-to-numpy-type`,基于 f906f29b)
+
+**to_numpy_type 收 VectorType/MatrixType**(`python/quadrants/lang/util.py`,+8,
+python-only):此前只收标量 DataType,复合类型落到函数尾 `assert False`;消费方
+(mujoqo `io.py` D19 解包绕 + 3 处同类)被迫逐层 `.dtype` 解包。现函数头加一分支:
+`isinstance(dt, MatrixType)`(VectorType 是其子类,单判定覆盖两型)→ 递归
+`to_numpy_type(dt.dtype)`;口径 = **元素 np dtype**,形状/extent 语义归调用方
+(不附形状,满足 io/sensor 场景)。late import `MatrixType` 断 import 环
+(util ↔ matrix)。零 native、零旗标、offline-cache key 无涉。
+**背景需求**:mujoqo 需求清单 N2(warp 能力缺口 #3,"小改 util,顺手项")。
+**语义钉(gate 12)**:`tests/robostudio/probe_n2_to_numpy_type.py`(新,155 行):
+S1 标量 12 分支逐对象钉(`is np.float32` 级,标量回归底线);S2 复合直接调用
+(vec3/vec6 f32/i32/f64 + mat2x3 f32/mat3x3 f64)→ 元素 dtype;S3 嵌套复合公开
+构造不可达(cook_dtype 拒)→ SKIP + 明标合成 2 层解包钉(递归深度无关);S4 复合
+dtype ndarray from_numpy/to_numpy 往返(vec3/vec6 i32/mat2x3 + 标量对照;值 + dtype);
+S5 未知 dtype 保持响亮(raise,不静默)。CPU-only 进 union runner gate 12(API
+架构无关;编号 13 留给 A10 线,本分支 runner 计 /12,+17/−5)。
+**验证**:venv9(`/Users/mini0/Code/mujoqo/_probe.venv9`,python3.12,tuna):
+probe RESULT: PASS(cpu);**union runner 12/12 PASS**(既有 11 门全数保留通过 =
+标量调用点零变化复验;2026-10-12);`test_return.py` 46 passed。**验证以
+site-packages 叠改态执行(盘约束):venv9 底座 = dist wheel `dev82+g0de907cd2`
+(≡ robostudio-main native),其上仅叠改 `lang/util.py` 单文件(`_lib` 未触);
+wheel 留待合并态统一烤制(纯 python 改动,分钟级)。**
+**footprint**:python +8/−0(`lang/util.py`)、tests +155(probe,新)、runner
++17/−5。mujoqo 侧 io.py:146 解包绕退役(改回直接调用)与全库回归属 mujoqo
+闭包,不属本线。
+**状态**:landed + verified(分支 `mujocoqd/n2-to-numpy-type`,未 merge)。
