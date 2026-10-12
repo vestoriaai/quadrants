@@ -1514,11 +1514,17 @@ def copy(dst, src, count=None):
   if arr.size % n_total != 0:
     raise ValueError(f"src size {arr.size} is not divisible by dst size {n_total}")
   elem = arr.size // n_total
-  arr = arr.reshape(shape + ((elem,) if elem > 1 else ()))
-  if count is not None:
-    arr = arr[:count]
+  elem_shape = shape + ((elem,) if elem > 1 else ())
+  arr = arr.reshape(elem_shape)
   elem_dt = getattr(dst.dtype, "dtype", dst.dtype)
   arr = arr.astype(to_numpy_type(elem_dt), copy=False)
+  if count is not None:
+    # from_numpy is whole-array only; fill the leading `count` elements over a
+    # host readback of the current contents (documented convenience cost).
+    whole = dst.to_numpy().reshape(elem_shape).copy()
+    whole.reshape(-1)[: count * elem] = arr.reshape(-1)[: count * elem]
+    dst.from_numpy(whole)
+    return dst
   dst.from_numpy(arr)
   return dst
 
