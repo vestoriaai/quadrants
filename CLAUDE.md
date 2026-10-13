@@ -1,6 +1,6 @@
 # quadrants 开发工作准则(robostudio 线)
 
-Genesis AI Taichi fork 的 robostudio 部署分支。**`robostudio-main` 为 single source of truth**:branch-per-line 开发 → gate 全绿 → `--no-ff` 合并;协调人合并,线上 agent 不 merge/push。
+Genesis AI Taichi fork 的 robostudio 部署分支。**`robostudio-main` 为 single source of truth**:branch-per-line 开发 → gate 全绿 → **squash 合并**(`git checkout robostudio-main && git merge --squash <branch>` 后以单 commit 落库,message 概括该线全部内容;`docs/robostudio_features.md` INDEX 行指向该 squash commit);协调人合并,线上 agent 不 merge/push。
 
 写/改 compiler 前先加载项目 skill `qd-compiler`(`.claude/skills/qd-compiler/SKILL.md`:源码地图、A 系列地雷、修复模式、构建/gate 流程)。
 
