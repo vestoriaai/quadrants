@@ -422,12 +422,24 @@ bool CFGNode::store_to_load_forwarding(bool after_lower_access, bool autodiff_en
         replace_with(i, std::move(zero), true);
       } else {
         if (result->ret_type.ptr_removed()->is<TensorType>() && !stmt->ret_type->is<TensorType>()) {
-          QD_ASSERT(load_src->is<MatrixPtrStmt>() && load_src->as<MatrixPtrStmt>()->offset->is<ConstStmt>());
-          QD_ASSERT(result->is<MatrixInitStmt>());
+          // A whole-tensor stored value can only be forwarded element-wise
+          // when the load is a Const-offset MatrixPtrStmt into a
+          // MatrixInitStmt. Any other consumer form (e.g. a runtime-indexed
+          // element load) must keep the load: forwarding is an optimization,
+          // so giving it up is safe, whereas asserting here kills the
+          // compiler on legitimate kernels. (A19)
+          if (!(load_src && load_src->is<MatrixPtrStmt>() &&
+                load_src->as<MatrixPtrStmt>()->offset->is<ConstStmt>() && result->is<MatrixInitStmt>())) {
+            continue;
+          }
 
           int offset = load_src->as<MatrixPtrStmt>()->offset->as<ConstStmt>()->val.val_int32();
+          auto *matrix_init = result->as<MatrixInitStmt>();
+          if (offset < 0 || offset >= (int)matrix_init->values.size()) {
+            continue;
+          }
 
-          result = result->as<MatrixInitStmt>()->values[offset];
+          result = matrix_init->values[offset];
         }
 
         stmt->replace_usages_with(result);
