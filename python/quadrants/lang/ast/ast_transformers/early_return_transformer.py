@@ -16,18 +16,35 @@ semantics and inlining:
                                                return __er_ret0
 
 Rules (see docs/robostudio ledger, mujocoqd/compiler-line M2):
-- Slot types come from the return annotation via `qd.cast(0, <dtype>)` init. Unannotated
-  value-returning functions are rejected with a clear error (bare-`return` void functions
-  are supported without slots).
+- Slot types come from the return annotation. Primitive slots init via `qd.cast(0, <dtype>)`;
+  compound slots (VectorType/MatrixType annotations, e.g. tuple[vec3, qd.f32]) init via
+  `qd.cast(<T>(0), <T>.dtype)` — the `T(0)` broadcast constructor produces a correctly-shaped
+  tensor (make_matrix_expr carries T's element dtype) and the cast keeps the init call-shaped
+  and the element dtype explicit. Unannotated value-returning functions are rejected with a
+  clear error (bare-`return` void functions are supported without slots).
+- Statements after the first return-bearing statement of a block are grouped into runs:
+  plain statements merge into ONE `if __er_done == 0:` guard (per-statement guards would
+  strand first-bindings in sibling runtime-if blocks: names born in one block are retired
+  at block exit and the sibling read fails with an actionable branch-scope NameError);
+  a sibling return-site (a compound containing a return) keeps its own guard and starts a
+  fresh run, because taking it sets `__er_done` and later statements in the same body
+  must not run. Source-level dead code after a literal `return` at the same block level
+  is dropped (it could never run); the literal return's slot stores stay in the current
+  run so they can read names first-bound there.
 - `return` inside loops additionally emits `break` — EXCEPT in a kernel's outermost
   (parallelized) loop, where break is forbidden by the front-end; there the remaining loop
   body is simply guarded and the loop runs out (semantically equal, SIMT-free early exit).
 - Subtrees inside `qd.static(...)` control flow are left untouched: static returns are
   already legal and are compile-time.
+- Loud rejections: nested-tuple returns (tuple annotations containing a tuple) and
+  struct/custom-class returns — for those shapes use a manual single-exit (flag-guard)
+  function; mixed bare/value returns; return sites with inconsistent arity (a short return
+  would silently leave the remaining slots at their init values).
 - Name space `__er_ret{i}` / `__er_done` is verified collision-free against the function.
 """
 
 import ast
+import typing
 
 from quadrants.lang.exception import QuadrantsSyntaxError
 
@@ -66,6 +83,48 @@ def _is_static_call(node):
             if isinstance(f, ast.Name) and f.id == "static":
                 return True
     return False
+
+
+def _resolve_slot_type(elt, node, global_vars):
+    """Classify one return-annotation element: `("primitive", src)` or `("compound", src)`.
+
+    compound = a VectorType/MatrixType instance (vec3, mat83, qd.types.vector(3, qd.f32), ...).
+    Raises QuadrantsSyntaxError for shapes the single-exit rewrite cannot slot: nested-tuple
+    annotations and struct/custom-class returns (both: "use a manual single-exit (flag-guard)
+    function"), and elements not resolvable from the function's globals.
+    """
+    src = ast.unparse(elt)
+    try:
+        obj = eval(src, dict(global_vars or {}))  # pylint: disable=eval-used
+    except Exception as e:  # noqa: BLE001
+        raise QuadrantsSyntaxError(
+            f"early_return=True: function {node.name!r}: cannot resolve return annotation element "
+            f"{src!r} at rewrite time ({type(e).__name__}: {e}). Use a type expression resolvable "
+            "from the function's globals (e.g. qd.f32 or a module-level vec/mat type)."
+        ) from None
+    origin = typing.get_origin(obj)
+    if origin is tuple or (isinstance(obj, type) and issubclass(obj, tuple)):
+        raise QuadrantsSyntaxError(
+            f"early_return=True: function {node.name!r} returns {src!r}: nested-tuple returns are "
+            "not supported by the single-exit rewrite. Flatten the tuple, or use a manual "
+            "single-exit (flag-guard) function for this shape."
+        )
+    # late imports: lang/matrix.py sits above this module in the package graph
+    from quadrants.lang.matrix import MatrixType
+
+    if isinstance(obj, MatrixType):  # VectorType subclasses MatrixType
+        return "compound", src
+    from quadrants.lang.util import cook_dtype
+
+    try:
+        cook_dtype(obj)
+    except Exception:  # noqa: BLE001
+        raise QuadrantsSyntaxError(
+            f"early_return=True: function {node.name!r} returns {src!r}: struct/custom-class "
+            "returns are not supported by the single-exit rewrite. Use a manual single-exit "
+            "(flag-guard) function for this shape."
+        ) from None
+    return "primitive", src
 
 
 class _Ctx:
@@ -116,21 +175,38 @@ class _Rewriter:
     def transform_block(self, stmts, loop_depth):
         out = []
         seen_return = False
+        run = []  # plain post-return statements, merged into ONE guard
         for st in stmts:
-            if seen_return:
-                new_st = self.transform_stmt(st, loop_depth)
-                body = new_st if isinstance(new_st, list) else [new_st]
-                out.append(self._guard(body))
-                continue
             new_st = self.transform_stmt(st, loop_depth)
             if isinstance(new_st, list):
-                out.extend(new_st)
-                has = _contains_done_store(new_st)
+                # literal return at this level: everything after it is source-level dead.
+                # First (unconditional) return stays at block level; a fall-through return
+                # keeps its slot stores in the current run so they see names first-bound
+                # there (the defect-2 fix).
+                if seen_return:
+                    run.extend(new_st)
+                else:
+                    out.extend(new_st)
+                    seen_return = True
+                break
+            if seen_return:
+                if _contains_done_store([new_st]):
+                    # a sibling return-site (return nested in an if/for/while): it needs
+                    # its OWN guard, and whatever follows needs a FRESH guard, because
+                    # this statement may set __er_done when taken (a single merged body
+                    # would keep executing past the taken return and clobber the slots)
+                    if run:
+                        out.append(self._guard(run))
+                        run = []
+                    out.append(self._guard([new_st]))
+                else:
+                    run.append(new_st)
             else:
                 out.append(new_st)
-                has = _contains_done_store([new_st])
-            if has:
-                seen_return = True
+                if _contains_done_store([new_st]):  # the first return-site of the block
+                    seen_return = True
+        if run:
+            out.append(self._guard(run))
         return out, seen_return
 
     def transform_stmt(self, st, loop_depth):
@@ -166,26 +242,38 @@ def rewrite(node: ast.FunctionDef, is_kernel: bool, global_vars: dict) -> ast.Fu
             f"early_return=True: function {node.name!r} already uses the reserved name {_DONE!r}"
         )
 
-    # slot count from the widest tuple return
-    nret = 1
-    has_value_return = False
-    has_bare_return = False
+    # inventory of return sites (drives every validation below)
+    value_sites = []  # (lineno, arity): arity = tuple width, or 1 for a scalar expression
+    n_bare = 0
     for n in ast.walk(node):
         if isinstance(n, ast.Return):
             if n.value is None:
-                has_bare_return = True
+                n_bare += 1
             else:
-                has_value_return = True
-                if isinstance(n.value, ast.Tuple):
-                    nret = max(nret, len(n.value.elts))
+                arity = len(n.value.elts) if isinstance(n.value, ast.Tuple) else 1
+                value_sites.append((getattr(n, "lineno", 0), arity))
 
+    has_value_return = bool(value_sites)
+    has_bare_return = n_bare > 0
+
+    if has_value_return and has_bare_return:
+        raise QuadrantsSyntaxError(
+            f"early_return=True: function {node.name!r} mixes bare `return` with `return <value>`; "
+            "a bare return would silently leave the value slots at their initial values. Return "
+            "the full slot set at every site, or make the function void (bare returns only)."
+        )
+
+    nret = 1
     if has_value_return:
-        for i in range(nret):
-            if _RET.format(i) in used:
-                raise QuadrantsSyntaxError(
-                    f"early_return=True: function {node.name!r} already uses the reserved name "
-                    f"{_RET.format(i)!r}"
-                )
+        arities = {a for _, a in value_sites}
+        if len(arities) > 1:
+            sites = ", ".join(f"line {ln}: {a} value(s)" for ln, a in sorted(value_sites))
+            raise QuadrantsSyntaxError(
+                f"early_return=True: function {node.name!r} has inconsistent return arities "
+                f"({sites}); every return site must return the same number of values, because a "
+                "short return would silently leave the remaining slots at their init values"
+            )
+        nret = arities.pop()
 
     if has_value_return:
         if node.returns is None:
@@ -195,8 +283,13 @@ def rewrite(node: ast.FunctionDef, is_kernel: bool, global_vars: dict) -> ast.Fu
                 "can type the return slots"
             )
         if nret == 1:
-            # scalar annotation: keep as the single slot dtype source
-            ann_elts = [node.returns]
+            if isinstance(node.returns, ast.Subscript) and isinstance(node.returns.slice, ast.Tuple):
+                # `-> tuple[T]` spells a single slot as a 1-element tuple type
+                ann_elts = list(node.returns.slice.elts)
+            elif isinstance(node.returns, ast.Tuple):
+                ann_elts = list(node.returns.elts)
+            else:
+                ann_elts = [node.returns]
         elif isinstance(node.returns, ast.Subscript) and isinstance(node.returns.slice, ast.Tuple):
             ann_elts = list(node.returns.slice.elts)
         elif isinstance(node.returns, ast.Tuple):
@@ -206,13 +299,22 @@ def rewrite(node: ast.FunctionDef, is_kernel: bool, global_vars: dict) -> ast.Fu
                 f"early_return=True: function {node.name!r} returns {nret}-tuples but the return "
                 f"annotation is not a tuple type"
             )
-        if len(ann_elts) < nret:
+        if len(ann_elts) != nret:
             raise QuadrantsSyntaxError(
-                f"early_return=True: function {node.name!r} returns {nret}-tuples but its "
-                f"annotation only describes {len(ann_elts)} slot(s)"
+                f"early_return=True: function {node.name!r} returns {nret} value(s) but its "
+                f"annotation describes {len(ann_elts)} slot(s); a mismatch would silently "
+                "leave the extra slots at their init values"
             )
     else:
         ann_elts = []
+
+    if has_value_return:
+        for i in range(nret):
+            if _RET.format(i) in used:
+                raise QuadrantsSyntaxError(
+                    f"early_return=True: function {node.name!r} already uses the reserved name "
+                    f"{_RET.format(i)!r}"
+                )
 
     ctx = _Ctx(nret, is_kernel)
     rewriter = _Rewriter(ctx)
@@ -224,6 +326,10 @@ def rewrite(node: ast.FunctionDef, is_kernel: bool, global_vars: dict) -> ast.Fu
     # hoisted out of the caller's loop, leaking `__er_done` across calls (observed: serial
     # loop, second call skipped its body). The call-shaped init stays put. Same reason the
     # slots use `qd.cast`. Upstream issue: inlined-func prologue store over-hoisting.
+    # Compound slots go through `qd.cast(T(0), T.dtype)`: T(0) is the broadcast constructor
+    # (make_matrix_expr carries T's element dtype, so the slot is a correctly-shaped tensor)
+    # and the cast keeps the init call-shaped with an explicit element dtype. (A plain
+    # `qd.cast(0, T)` dies in cook_dtype: VectorType/MatrixType are not dtypes.)
     prologue = [_stamp_deep(
         ast.Assign(
             targets=[ast.Name(id=_DONE, ctx=ast.Store())],
@@ -232,16 +338,18 @@ def rewrite(node: ast.FunctionDef, is_kernel: bool, global_vars: dict) -> ast.Fu
         1,
     )]
     for i in range(nret if has_value_return else 0):
-        elt = ann_elts[i]
-        src = ast.unparse(elt)
+        kind, src = _resolve_slot_type(ann_elts[i], node, global_vars)
+        if kind == "compound":
+            init_src = f"qd.cast({src}(0), {src}.dtype)"
+        else:
+            init_src = f"qd.cast(0, {src})"
         try:
-            dtype_expr = ast.parse(src, mode="eval").body
+            call = ast.parse(init_src, mode="eval").body
         except SyntaxError as e:
             raise QuadrantsSyntaxError(
-                f"early_return=True: cannot resolve return annotation element {src!r} of "
+                f"early_return=True: cannot synthesize slot initializer {init_src!r} for "
                 f"{node.name!r}: {e}"
             )
-        call = ast.parse(f"qd.cast(0, {src})", mode="eval").body
         prologue.append(
             _stamp_deep(ast.Assign(targets=[ast.Name(id=_RET.format(i), ctx=ast.Store())], value=call), 1)
         )

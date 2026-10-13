@@ -1,5 +1,5 @@
 <!-- INDEX — merged lines (newest last; each entry's full section via its header below) -->
-<!-- qd-copy-api 2ce5a850 · c2-emitter-fixes 83b2d1a2 · subgroup-cpu-support 8ebf8620 · reassociate-flag 19ff0276 · reassoc-subgroup-probe 9372c300 · r5-host-visible 67e27bc4 · spirv-vectorize 68bd7965 · algorithms-2 b12c125c · compiler-line 33e7dabf · n2-to-numpy-type 4a76ce7c · a10-nested-loop-raw c52711b5 · a19-stlf-fallback 3793c86d · a20-loopvar-scope 01d2037e · metal-i64 01d2037e -->
+<!-- qd-copy-api 2ce5a850 · c2-emitter-fixes 83b2d1a2 · subgroup-cpu-support 8ebf8620 · reassociate-flag 19ff0276 · reassoc-subgroup-probe 9372c300 · r5-host-visible 67e27bc4 · spirv-vectorize 68bd7965 · algorithms-2 b12c125c · compiler-line 33e7dabf · n2-to-numpy-type 4a76ce7c · a10-nested-loop-raw c52711b5 · a19-stlf-fallback 3793c86d · a20-loopvar-scope 01d2037e · metal-i64 01d2037e · a7-m2-compound 869a00a0 -->
 
 # robostudio_features.md — features ledger for robostudio-main
 
@@ -956,3 +956,63 @@ test_state_history_get_set`:旧 wheel = A19 assert 拒编译(FAIL);新 wheel =
   合并本分支会连带带入 a20)。mujoqo 侧遗留(非本线):collision_flex.py:1202 worldid/group
   先用后定义(arch 无关,归移植线);a20 ledger 条目自身 foot/状态块重复、INDEX 行悬垂,
   归 a20 所有者修。
+
+## A7/M2 根修 — early_return 复合返回 + 守卫合并(mujocoqd/a7-m2-compound)
+- **描述**:`@qd.kernel`/`@qd.func(early_return=True)` 两缺陷根修(方案 B,评估报告
+  a7-m2-eval 实施),单文件为主:`python/quadrants/lang/ast/ast_transformers/
+  early_return_transformer.py`。**缺陷①(复合槽)**:prologue 槽初始化 `qd.cast(0, T)`
+  对 VectorType/MatrixType 直接死于 `cook_dtype`(前端 `ValueError: Invalid data type`,
+  **不是**评估报告静态预测的 LLVM/SPIR-V 断言点——探针实证修正);现 primitive 槽保持
+  `qd.cast(0, T)`,compound 槽走 `qd.cast(T(0), T.dtype)`:`T(0)` 单标量广播构造
+  (make_matrix_expr 自带 T 的元素 dtype,槽为正确形状张量;mat83(0) 单标量广播亦合法),
+  外层 cast 保持 init 的 call 形态(:222-226 over-hoisting 纪律)并显式元素 dtype。
+  **缺陷②(作用域)**:return 后语句改"run 合并"——纯语句 run 合并进单个
+  `if __er_done == 0:` 守卫(兄弟块首绑退休 → A20 家族 NameError 从根消除);含
+  return 的兄弟复合语句保持独立守卫并重开 run(首个 cut 曾全局单守卫,被既有
+  func_guard/func_per_call_reset 形态当场抓出"taken return 后同体语句继续执行覆写槽"
+  回归,双 wheel 归因确认后改为 run 切分);字面 return 并入当前 run 并丢弃块级死尾
+  (旧逐语句守卫恰好跳过它,合并后必须显式 drop);首个无条件 return 不加守卫。
+  f_guard/f_void/k_nested 形态 IR 与旧 pass **unparse 逐位相同**(_structure_check +
+  新旧双模块 unparse 等价钉死),f_loop_ret 差异恰为预期的纯语句合块。**顺手校验/响亮
+  拒绝**(编译期):值 arity vs 槽数不匹配、bare+value 混用、嵌套 tuple 注解
+  (typing.get_origin 判别,别名拼写同杀)、struct/自定义类返回——后两类信息明指
+  "手工单出口(flag-guard)写法";注解元素按 rewrite 期 globals 求值分类
+  (primitive/compound/拒绝),`-> tuple[T]` 单槽拼写顺带可用。
+- **背景需求**:mujoqo D8 移植(A7 账):mujoco_qd 全库 early_return=True 零使用,
+  18 处字面 return-in-loop 炸弹 + 58 处手工单出口存量(ret0qd/doneqd 3851 行/23 文件)
+  均被①②挡死;write_contact 本体标量不受挡,挡的是 gjk/sdf/ray/box_box 复合返回族。
+- **门禁**:本线新 gate = **union gate 17**(`tests/robostudio/probe_early_return_forms.py`,
+  cpu+metal 双臂,TOTAL 16→17):既有 7 形态复跑 + **F1-F14 矩阵**(全 numpy 孪生,
+  cpu 27 门/27 PASS;metal 26 PASS + 1 有据 SKIP,见下)——F1 vec3 槽 tuple/F2 mat3 广播
+  槽/F3 tuple(vec,i32)/F4 **box_box 真实形态** Tuple[vec8f,mat83f,mat83f] 4 站点/
+  F5 **ray_mesh_with_bvh 真实形态** 6 槽/F6 while+return 复合复活/F7 kernel 侧
+  early-return(限 cpu,见发现)/F8 kernel 嵌套 break+return/F9 复合槽 per-call reset
+  (over-hoisting 纪律扩展到 T(0) 形态的验收)/F10 守卫内 for/F11 四复合站点/F12 新校验
+  负例 ×4(arity/bare+value/嵌套 tuple/struct)/F13 守卫内复合+标量首绑交错/
+  **F14 = 缺陷②验收形态**(pre-fix:`Name "t" is not defined`,post-fix 数值过)。
+  上游 `test_return.py` **46/46**;union runner 17 门全量(venva7 = dev104 自建 wheel,
+  requirements-test.txt 栈,pytest 8.4.2);基线复现探针 pre-fix wheel 双缺陷复现 →
+  dev104 双绿翻转。**试点**(不碰 mujoqo 文件,只读其源码):
+  `_probe/probe_a7m2_pilot_mujocoqd_forms.py`——ray_mesh_with_bvh(march 循环 2 处
+  6 元组复合 return + fall-through)与 box_box(4 处 Tuple[vec8f,mat83f,mat83f]
+  return,serialize 循环原地改槽)形态等价 kernel,early_return=True 写法
+  **cpu+metal ALL PASS**,锚 = numpy 孪生;真实站点 M2 化可行(正式移植归 P1 线)。
+- **附带发现(既有核心问题,双 wheel 0de907cd vs dev104 一致,非本线回归,未修——
+  非白名单,归编译器所有者线)**:kernel 循环内条件赋值的旗标作 runtime-if 条件时,
+  守卫体内**复合工作**(整值存/元素存+读)错值或跨迭代泄漏
+  (`_probe/_kcompound_diag.py` 5 形态 + `_probe/_k7metal_manual.py` 手工单出口等价
+  kernel 在 pre-fix wheel metal 同样失败;`_kcompound_narrow2/3.py` 控制:纯数据条件
+  下同形态 PASS)。影响:kernel 侧 early_return 的 __er_done 在函数级(循环外),故
+  守卫区含复合工作被此 bug 挡(与 pass 输出无关);F7 因此限 cpu,F7/F8 逐元素 launch
+  (kernel done 为 launch 级 SIMT-free 语义,k_guard 同口径)。func 侧不受影响
+  (内联后旗标落调用方循环内)。精确最小触发器(条目常量性/内联敏感)留待独立归因线。
+- **footprint**:early_return_transformer.py +150/−45 左右(单文件,含校验与拒绝);
+  probe_early_return_forms.py +648(F 矩阵);runner +22(门 17 段+头注),TOTAL 16→17;
+  ledger 本条目 + INDEX 行;_probe 新件 7(证据/诊断/试点,含死尾 drop 与 run 切分
+  的归因记录)。零 native、零旗标、cache key 无涉(offline_cache_util 无此字段,
+  IR body hash 兜底);休眠机制无。
+- **状态**:landed + verified(squash merged to robostudio-main as e79ae899,基点 1fd930dc;
+  待协调人 squash)。已知账(P1 线/他线):sleep.py `_sleep_cycle` return-in-loop 假绿
+  (惰性编译未触发);18 处炸弹与 58 处手工存量迁移策略;kernel+复合+旗标既有 bug
+  的独立归因与修复;单索引行赋值 `mat[i] = vec` 在部分站点被拒(试点用元素级赋值绕开,
+  真实 box_box 同拼写可编译,差异待查——归编译器线顺带核对)。

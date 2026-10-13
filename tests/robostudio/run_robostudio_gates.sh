@@ -10,8 +10,11 @@
 # store-to-load-forwarding fallback - mujocoqd/a19-stlf-fallback; CPU only,
 # vendored mujoco_qd _sensor_touch repro), gate 15 (A20 actionable
 # branch-scope NameError + predecl recipe - mujocoqd/a20-loopvar-scope; CPU
-# only, text-level pin) and gate 16 (metal i64 matrix incl segmented sort -
-# mujocoqd/metal-i64; cpu+metal dual arm, perf informational).
+# only, text-level pin), gate 16 (metal i64 matrix incl segmented sort -
+# mujocoqd/metal-i64; cpu+metal dual arm, perf informational) and gate 17
+# (early-return compound forms - mujocoqd/a7-m2-compound; cpu+metal dual arm:
+# compound slot init + merged-guard rewrite + new loud rejections, F1-F14
+# matrix with numpy twins).
 #   7  C2        probe_spirv_vectorize.py metal    -> ALL PASS (bitwise scalar==vec)
 #   8  R5        gate_r5_host_visible.py metal     -> RESULT: PASS (byte parity +
 #                  relative perf pins; small readback <=x0.5 default, 64MB <=x1.2)
@@ -45,7 +48,7 @@ trap 'rm -rf "$TMP"' EXIT
 
 [[ -x "$PY" ]] || { echo "FATAL: no venv python at $PY (create .venv-consolidated, see docs/build_robostudio.md)" >&2; exit 1; }
 
-PASS=0; NFAIL=0; TOTAL=16
+PASS=0; NFAIL=0; TOTAL=17
 gate_pass() { echo "gate $1/$TOTAL [$2]: PASS"; (( PASS = PASS + 1 )); }
 gate_fail() { echo "gate $1/$TOTAL [$2]: FAIL -- $3"; (( NFAIL = NFAIL + 1 )); }
 
@@ -276,6 +279,28 @@ else
   echo "  i64 metal arm: skipped (gpu-busy)"
 fi
 (( G16 == 2 )) && gate_pass 16 "i64 segmented sort (cpu+metal)" || gate_fail 16 "i64 segmented sort (cpu+metal)" "see arms above"
+
+# 17 early-return compound forms (mujocoqd/a7-m2-compound) ---------------------
+# @qd.kernel/@qd.func(early_return=True) root fix: compound slots (vec/mat
+# annotations init via qd.cast(T(0), T.dtype), the broadcast constructor keeps
+# the slot a correctly-shaped tensor) + post-return statements merged into ONE
+# __er_done guard (per-statement guards stranded first-bindings in sibling
+# runtime-if blocks -> actionable branch-scope NameError) + loud rejections
+# (arity mismatch / bare+value mix / nested tuple / struct return). The probe
+# pins the pre-existing 7 forms AND the F1-F14 matrix (numpy twins), incl. the
+# box_box / ray_mesh_with_bvh return shapes. cpu+metal dual arm.
+G17=0
+"$PY" -u "$ROOT/tests/robostudio/probe_early_return_forms.py" cpu >"$TMP/g17_cpu.log" 2>&1 \
+  && grep -q "EARLY_RETURN GATE \[cpu\]: ALL PASS" "$TMP/g17_cpu.log" && G17=1 \
+  || { echo "  early-return cpu arm: expected EARLY_RETURN GATE ALL PASS:"; tail -12 "$TMP/g17_cpu.log"; }
+if wait_gpu_idle; then
+  "$PY" -u "$ROOT/tests/robostudio/probe_early_return_forms.py" metal >"$TMP/g17_metal.log" 2>&1 \
+    && grep -q "EARLY_RETURN GATE \[metal\]: ALL PASS" "$TMP/g17_metal.log" && G17=$((G17 + 1)) \
+    || { echo "  early-return metal arm: expected EARLY_RETURN GATE ALL PASS:"; tail -12 "$TMP/g17_metal.log"; }
+else
+  echo "  early-return metal arm: skipped (gpu-busy)"
+fi
+(( G17 == 2 )) && gate_pass 17 "early-return compound forms (cpu+metal)" || gate_fail 17 "early-return compound forms (cpu+metal)" "see arms above"
 
 echo "UNION GATE: $PASS/$TOTAL PASS"
 if (( NFAIL > 0 )); then echo "(logs kept in $TMP)"; trap - EXIT; exit 1; fi
