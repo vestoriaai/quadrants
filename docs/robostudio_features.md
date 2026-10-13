@@ -839,3 +839,47 @@ wheel 留待合并态统一烤制(纯 python 改动,分钟级)。**
   cache key 无涉。
 - **状态**:landed + verified(分支 `mujocoqd/a10-nested-loop-raw`,未 merge;gate 13
   cpu+metal 双臂 RESULT: PASS,venv4 = 0de907cd ≡ HEAD native,2026-10-12)。
+
+# mujocoqd/a19-stlf-fallback 条目(2026-10-13;分支 `mujocoqd/a19-stlf-fallback`,基于 ec916733)
+
+**A19:store_to_load_forwarding 硬 assert → 保守回退**(`quadrants/ir/
+control_flow_graph.cpp`,+15/−3,commit 79e660fe):`CFGNode::
+store_to_load_forwarding` 在"被 forward 的 result 是 TensorType 而消费 load 非
+TensorType"时硬 assert"load_src 必须是 Const-offset MatrixPtrStmt 且 result 是
+MatrixInitStmt"——mujoqo `_sensor_touch` 编译即炸
+(`control_flow_graph.cpp:store_to_load_forwarding@425`)。IR 实证(mujoqo
+`_probe/a19_ircatch.log`,崩前最后 dump = `ray_geom` func 编译单元标量化后):
+病态形态 = **tensor 值整体存入标量类型 alloca**(scalarize store 侧未拆分的
+病根)+ 随后同 slot 的纯标量 load——此时"Const-offset MatrixPtr 元素提取"
+precondition 恒不成立,且若强行 forward 会把 tensor 塞进标量 mul(旧 assert
+挡的本就是坏 forward,但方式是炸死编译)。修复 = 形态不满足(含 offset 越界
+防御)即 `continue` 保持 load:forwarding 是优化,放弃只少优化、正确性无损。
+**同函数同族审计**:Alloca+TensorType 两分支本就是保守 `continue`;
+Identical store elimination 段无同族 assert(same_value 空安全、get_store_data
+noexcept)——单点修复。
+**语义钉(gate 14)**:`tests/robostudio/probe_a19_stlf_fallback.py`(新,611 行):
+vendor mujoqo `_sensor_touch` kernel + ray 闭包(ray_{geom,plane,sphere,capsule,
+ellipsoid,cylinder,box}/_ray_{map,quad,eliminate} + normalize_with_norm/transposed,
+Apache-2.0;ConeType/MJ_MINVAL 内联,math/ray namespace shim)——**触发单元是
+完整 kernel 编译**(纯 ray 闭包或纯前端合成形态 c1-c8 均不触发)。双 wheel 行为:
+旧 wheel(0de907cd)死于 @425 assert(gate FAIL);修复 wheel 编译通过 + 钉值
+sensordata 全零 + ray_sphere 直调命中臂(dist=1.5/normal(0,0,-1))。
+CPU-only(缺陷为 IR 形态缺陷,架构无关)。**注意**:纯 `ray_geom` 闭包单编译
+不触发,@425 需要完整 kernel 上下文,蒸馏记录见 mujoqo `_probe/probe_a19_distill.py`。
+**验证**:探针 a(mujoqo `probe_a19_jump.py touch`)旧 wheel `*** MatrixPtrStmt
+ASSERT ***` → 新 wheel `LAUNCH OK (no assert)`;simple victim 数值不变;mujoqo
+三门禁(venvA19 = dev95+g79e660fea):history 50/59(+24 解锁)、constraint
+71F/77P(dev78 基线 73F,净解锁 2)、io 80F(= dev78→dev95 基线回归 geom1
+NameError,非本修复,另行登记)。
+**已知边界 / A20 家族证据(本线不动手,移交)**:(a) `StateParityTest::
+test_state_history_get_set`:旧 wheel = A19 assert 拒编译(FAIL);新 wheel =
+编译过但 LLVM `ICmp` AssertOK abort(Instructions.h:1187)——kernel launch 即
+崩进程(证据 mujoqo `_probe/a19_history_v2.log`);(b) ray_geom real_func 分发
+返回 dist=-1 而 normal 有效(双 wheel 一致,`_probe/probe_a19_sphere_iso.py`);
+(c) 病根疑似 scalarize 的 tensor-into-scalar-alloca store(见上)。三者同邻域,
+候补 A20,由协调人派线。
+**footprint**:C++ +15/−3(`control_flow_graph.cpp` 单点)、tests +611(gate 探针,
+新)、runner +17/−4(gate 14 + 标签 /12→/14 对齐,门数 13→14)、docs 本条目。
+零旗标、offline-cache key 无涉(无新配置)。
+**状态**:landed + verified(分支 `mujocoqd/a19-stlf-fallback`,未 merge;gate 14
+双 wheel 定向验证,union 全门与 test_return 见本线最终报告)。

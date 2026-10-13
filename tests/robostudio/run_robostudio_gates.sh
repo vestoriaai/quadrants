@@ -6,7 +6,9 @@
 # gate 11 (C2 emitter fixes - mujocoqd/c2-emitter-fixes), gate 12
 # (to_numpy_type compound dtypes - mujocoqd/n2-to-numpy-type; CPU only, the
 # API is arch-independent) and gate 13 (A10 nested-loop order semantics -
-# mujocoqd/a10-nested-loop-raw; cpu+metal dual arm).
+# mujocoqd/a10-nested-loop-raw; cpu+metal dual arm) and gate 14 (A19
+# store-to-load-forwarding fallback - mujocoqd/a19-stlf-fallback; CPU only,
+# vendored mujoco_qd _sensor_touch repro).
 #   7  C2        probe_spirv_vectorize.py metal    -> ALL PASS (bitwise scalar==vec)
 #   8  R5        gate_r5_host_visible.py metal     -> RESULT: PASS (byte parity +
 #                  relative perf pins; small readback <=x0.5 default, 64MB <=x1.2)
@@ -41,8 +43,8 @@ trap 'rm -rf "$TMP"' EXIT
 [[ -x "$PY" ]] || { echo "FATAL: no venv python at $PY (create .venv-consolidated, see docs/build_robostudio.md)" >&2; exit 1; }
 
 PASS=0; NFAIL=0
-gate_pass() { echo "gate $1/12 [$2]: PASS"; (( PASS = PASS + 1 )); }
-gate_fail() { echo "gate $1/12 [$2]: FAIL -- $3"; (( NFAIL = NFAIL + 1 )); }
+gate_pass() { echo "gate $1/14 [$2]: PASS"; (( PASS = PASS + 1 )); }
+gate_fail() { echo "gate $1/14 [$2]: FAIL -- $3"; (( NFAIL = NFAIL + 1 )); }
 
 # wait_gpu_idle: 0 if idle (possibly after waiting), 1 if still busy after 5 min
 wait_gpu_idle() {
@@ -230,6 +232,17 @@ else
 fi
 (( G13 == 2 )) && gate_pass 13 "a10 nested-loop order (cpu+metal)" || gate_fail 13 "a10 nested-loop order (cpu+metal)" "see arms above"
 
-echo "UNION GATE: $PASS/13 PASS"
+# 14 A19 store-to-load-forwarding fallback (mujocoqd/a19-stlf-fallback) --------
+# The vendored mujoco_qd _sensor_touch kernel + ray closure, cpu only (the
+# defect is an IR-form defect, arch-independent). On a wheel without the fix
+# this dies at control_flow_graph.cpp store_to_load_forwarding@425; with the
+# fix it must compile through and match the pinned outputs (see the probe
+# header for the pre-existing ray_geom dist-field note).
+"$PY" -u "$ROOT/tests/robostudio/probe_a19_stlf_fallback.py" >"$TMP/g14.log" 2>&1 \
+  && grep -q "RESULT: PASS" "$TMP/g14.log" \
+  && gate_pass 14 "a19 stlf fallback" \
+  || { gate_fail 14 "a19 stlf fallback" "output below"; tail -16 "$TMP/g14.log"; }
+
+echo "UNION GATE: $PASS/14 PASS"
 if (( NFAIL > 0 )); then echo "(logs kept in $TMP)"; trap - EXIT; exit 1; fi
 exit 0
