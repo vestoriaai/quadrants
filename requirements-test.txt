@@ -1,0 +1,12 @@
+# Test-stack pins for any quadrants verification venv (union gates + upstream
+# test_return). Install after creating/activating a venv:
+#   python -m pip install -r requirements-test.txt
+#
+# pytest pinned to 8.4.2 on purpose: tests/python/conftest.py implements the
+# pytest_handlecrashitem hook, which pytest 9 removed -> PluginValidationError
+# ("unknown hook 'pytest_handlecrashitem'"). Do not bump past 8.x without
+# fixing that conftest first.
+pytest==8.4.2
+pytest-xdist
+cffi
+setuptools
