@@ -154,11 +154,22 @@ def _seg_scatter(keys_in: template(), keys_out: template(), values_in: template(
         excl_prefix = _block.SharedArray((RADIX_DIGITS,), i32)
         block_offsets = _block.SharedArray((RADIX_DIGITS,), i32)
         if static(sel == 1):
-            key = u32(0xFFFFFFFF)
-            if i < n:
-                key = bit_cast(keys_in[i], u32)
-            rank = _block.radix_rank_match_atomic_or(key, BLOCK_DIM, RADIX_BITS, bit_start, RADIX_BITS, bins, excl_prefix)
-            digit = i32((key >> u32(bit_start)) & u32(RADIX_DIGITS - 1))
+            if static(key_width == 32):
+                key = u32(0xFFFFFFFF)
+                if i < n:
+                    key = bit_cast(keys_in[i], u32)
+                rank = _block.radix_rank_match_atomic_or(key, BLOCK_DIM, RADIX_BITS, bit_start, RADIX_BITS, bins, excl_prefix)
+                digit = i32((key >> u32(bit_start)) & u32(RADIX_DIGITS - 1))
+            else:
+                # 64-bit keys: extract the digit from the full-width key, then hand the
+                # pre-shifted 8-bit digit to the u32 rank helper with bit_start=0
+                # (mirrors the key_width branch in _seg_hist; the helper's key contract
+                # is u32, see block.radix_rank_match_atomic_or).
+                k64 = u64(0xFFFFFFFF)
+                if i < n:
+                    k64 = bit_cast(keys_in[i], u64)
+                digit = i32((k64 >> u64(bit_start)) & u64(RADIX_DIGITS - 1))
+                rank = _block.radix_rank_match_atomic_or(u32(digit), BLOCK_DIM, RADIX_BITS, i32(0), RADIX_BITS, bins, excl_prefix)
         else:
             rpat = u32(0xFFFFFFFF)
             if i < n:

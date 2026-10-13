@@ -5,10 +5,13 @@
 # gate 10 (simt.subgroup/block on Metal + CPU - mujocoqd/subgroup-cpu-support),
 # gate 11 (C2 emitter fixes - mujocoqd/c2-emitter-fixes), gate 12
 # (to_numpy_type compound dtypes - mujocoqd/n2-to-numpy-type; CPU only, the
-# API is arch-independent) and gate 13 (A10 nested-loop order semantics -
-# mujocoqd/a10-nested-loop-raw; cpu+metal dual arm) and gate 14 (A19
+# API is arch-independent), gate 13 (A10 nested-loop order semantics -
+# mujocoqd/a10-nested-loop-raw; cpu+metal dual arm), gate 14 (A19
 # store-to-load-forwarding fallback - mujocoqd/a19-stlf-fallback; CPU only,
-# vendored mujoco_qd _sensor_touch repro).
+# vendored mujoco_qd _sensor_touch repro), gate 15 (A20 actionable
+# branch-scope NameError + predecl recipe - mujocoqd/a20-loopvar-scope; CPU
+# only, text-level pin) and gate 16 (metal i64 matrix incl segmented sort -
+# mujocoqd/metal-i64; cpu+metal dual arm, perf informational).
 #   7  C2        probe_spirv_vectorize.py metal    -> ALL PASS (bitwise scalar==vec)
 #   8  R5        gate_r5_host_visible.py metal     -> RESULT: PASS (byte parity +
 #                  relative perf pins; small readback <=x0.5 default, 64MB <=x1.2)
@@ -42,9 +45,9 @@ trap 'rm -rf "$TMP"' EXIT
 
 [[ -x "$PY" ]] || { echo "FATAL: no venv python at $PY (create .venv-consolidated, see docs/build_robostudio.md)" >&2; exit 1; }
 
-PASS=0; NFAIL=0
-gate_pass() { echo "gate $1/14 [$2]: PASS"; (( PASS = PASS + 1 )); }
-gate_fail() { echo "gate $1/14 [$2]: FAIL -- $3"; (( NFAIL = NFAIL + 1 )); }
+PASS=0; NFAIL=0; TOTAL=16
+gate_pass() { echo "gate $1/$TOTAL [$2]: PASS"; (( PASS = PASS + 1 )); }
+gate_fail() { echo "gate $1/$TOTAL [$2]: FAIL -- $3"; (( NFAIL = NFAIL + 1 )); }
 
 # wait_gpu_idle: 0 if idle (possibly after waiting), 1 if still busy after 5 min
 wait_gpu_idle() {
@@ -243,6 +246,37 @@ fi
   && gate_pass 14 "a19 stlf fallback" \
   || { gate_fail 14 "a19 stlf fallback" "output below"; tail -16 "$TMP/g14.log"; }
 
-echo "UNION GATE: $PASS/14 PASS"
+# 15 A20 branch-scope NameError (mujocoqd/a20-loopvar-scope) --------------------
+# A name first bound inside a runtime if branch / loop body is invisible after
+# the block closes; the failed lookup must raise the actionable predeclaration
+# diagnostic WITHOUT the chained builtins AttributeError, true typos must keep
+# the generic message, and the predecl recipe kernel must compile + compute
+# (the fix handed to the mujoco_qd collision_primitive owner). CPU-only:
+# the pin is frontend/text-level.
+"$PY" -u "$ROOT/tests/robostudio/probe_a20_branch_scope_diag.py" cpu >"$TMP/g15.log" 2>&1 \
+  && grep -q "RESULT: PASS" "$TMP/g15.log" \
+  && gate_pass 15 "a20 branch-scope NameError" \
+  || { gate_fail 15 "a20 branch-scope NameError" "output below"; tail -16 "$TMP/g15.log"; }
+
+# 16 metal i64 matrix (mujocoqd/metal-i64) ------------------------------------
+# Full i64 form matrix (load/store, arith, shifts/bitwise, compares, casts,
+# clamp, bit_cast, INT64_MAX sentinel) + plain sort i64 keys + segmented sort
+# i64 keys (fixed here: _seg_scatter key_width branch) + segmented i32
+# control. Correctness gates the exit code; the 8M i64/i32 perf section is
+# informational (interleaved paired medians, >4x slowdown prints an alert).
+G16=0
+"$PY" -u "$ROOT/tests/robostudio/probe_metal_i64.py" cpu >"$TMP/g16_cpu.log" 2>&1 \
+  && grep -q "I64 PROBE \[cpu\]: ALL PASS" "$TMP/g16_cpu.log" && G16=1 \
+  || { echo "  i64 cpu arm: expected I64 PROBE ALL PASS:"; tail -12 "$TMP/g16_cpu.log"; }
+if wait_gpu_idle; then
+  "$PY" -u "$ROOT/tests/robostudio/probe_metal_i64.py" metal >"$TMP/g16_metal.log" 2>&1 \
+    && grep -q "I64 PROBE \[metal\]: ALL PASS" "$TMP/g16_metal.log" && G16=$((G16 + 1)) \
+    || { echo "  i64 metal arm: expected I64 PROBE ALL PASS:"; tail -12 "$TMP/g16_metal.log"; }
+else
+  echo "  i64 metal arm: skipped (gpu-busy)"
+fi
+(( G16 == 2 )) && gate_pass 16 "i64 segmented sort (cpu+metal)" || gate_fail 16 "i64 segmented sort (cpu+metal)" "see arms above"
+
+echo "UNION GATE: $PASS/$TOTAL PASS"
 if (( NFAIL > 0 )); then echo "(logs kept in $TMP)"; trap - EXIT; exit 1; fi
 exit 0

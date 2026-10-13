@@ -1,5 +1,5 @@
 <!-- INDEX — merged lines (newest last; each entry's full section via its header below) -->
-<!-- qd-copy-api 2ce5a850 · c2-emitter-fixes 83b2d1a2 · subgroup-cpu-support 8ebf8620 · reassociate-flag 19ff0276 · reassoc-subgroup-probe 9372c300 · r5-host-visible 67e27bc4 · spirv-vectorize 68bd7965 · algorithms-2 b12c125c · compiler-line 33e7dabf · n2-to-numpy-type 4a76ce7c · a10-nested-loop-raw c52711b5 · a19-stlf-fallback 3793c86d -->
+<!-- qd-copy-api 2ce5a850 · c2-emitter-fixes 83b2d1a2 · subgroup-cpu-support 8ebf8620 · reassociate-flag 19ff0276 · reassoc-subgroup-probe 9372c300 · r5-host-visible 67e27bc4 · spirv-vectorize 68bd7965 · algorithms-2 b12c125c · compiler-line 33e7dabf · n2-to-numpy-type 4a76ce7c · a10-nested-loop-raw c52711b5 · a19-stlf-fallback 3793c86d · a20-loopvar-scope 01d2037e · metal-i64 01d2037e -->
 
 # robostudio_features.md — features ledger for robostudio-main
 
@@ -883,3 +883,76 @@ test_state_history_get_set`:旧 wheel = A19 assert 拒编译(FAIL);新 wheel =
 零旗标、offline-cache key 无涉(无新配置)。
 **状态**:landed + verified(分支 `mujocoqd/a19-stlf-fallback`,未 merge;gate 14
 双 wheel 定向验证,union 全门与 test_return 见本线最终报告)。
+
+## A20 — branch-scope NameError 可操作诊断 + "dev78→dev95 回归"定性推翻(mujocoqd/a20-loopvar-scope)
+- **描述**:`get_var_by_name` 的 builtins 回退失败时,若该名字曾绑定于**已闭合的 block
+  scope**(runtime if 分支/循环体/内联 func 局部——`VariableScopeGuard` 弹栈时记入
+  retired 集合),改抛可操作诊断:点名变量、说明"分支内首次绑定、闭块后不可见"、指向
+  预声明约定(`geom1 = 0`);两处 raise 改 `from None`,掐掉误导性的 chained
+  `AttributeError: module 'builtins' has no attribute ...`(正是它把 A20 排查引向
+  builtins 回退路径)。typo(从未绑定)保持原 generic 报错。零语义/解析行为变更。
+  文件:`python/quadrants/lang/ast/ast_transformer_utils.py`(+14/−2)。
+- **背景需求**:mujoqo io_test geom1 NameError 家族(需求清单 A20,登记为"dev78→dev95
+  基线回归,34 条,三 ast/ 嫌疑 commit")。本线最小复现+多 wheel 归因**推翻回归定性**:
+  触发形态 = 名字在 runtime if 分支内**首次绑定**(tuple-unpack 自 func 返回,
+  `collision_primitive.py _primitive_narrowphase` 的 `geom1, geom2 = geom_collision_pair(...)`
+  等;非 loop 变量),后续兄弟块读取。该形态在 v1.3.3 / dev25 / dev36 / dev78 前端
+  (overlay)/ **dev82 整 wheel** / dev94 / dev95 全部同样失败——从未在任何 wheel 上编译过;
+  三嫌疑 commit 实为 dev8(S2)/dev10(S3)/dev27(M2+A4),全在 dev78 之前,且
+  dev78..dev95 窗口零 ast/ 改动;dev82 整 wheel io_test = 80F/87P 与 dev95 完全一致
+  (dev78=11F 应系当时 mujoco_qd 侧尚未走到该 kernel,reach 差异,非编译器回归)。
+  **解堵配方在 mujoqo 侧**:`_primitive_narrowphase` 体内补预声明
+  (`geom1 = GeomV()` 先例即 collision_core.py:113;`margin=0.0` 等标量/vec 默认)——
+  `_probe/a20_predecl_fix.py` 钉编译+数值(23.5 正确);补丁副本(仅 _probe/_dbg 抛置
+  验证,未动 mujoqo 文件)实测 geom1 签名 36→0,下一层阻塞 = A7 家族
+  (`write_contact` 等早退,18 处 "Return inside non-static")。S3 的"runtime if 不做
+  alloca 提升"设计决策维持(提升+零初始化=语义变更,未立项,如需另走裁决)。
+- **门禁**:本线新 gate = **union gate 14**(`tests/robostudio/probe_a20_branch_scope_diag.py`,
+  cpu 文本级:D1 可操作诊断/D2 typo 报错不变(test_name_error 契约)/R1 配方编译+数值);
+  上游 `test_return.py` 46/46;union runner **14/14 PASS**(venvA20 =
+  dev96+g8b80ce9e,本分支自建 wheel;gate 14 在未修复 dev95 wheel 上如实 FAIL 于 D1)。
+  归因/配方探针:`_probe/a20_min_repro.py`(预声明形态全 wheel 通过,对照)、
+  `a20_actual_shape.py`(蒸馏中间件)、`a20_branch_bind.py`(忠实形态复现+诊断断言)、
+  `a20_predecl_fix.py`(配方钉)。
+- **footprint**:前端 +14/−2;tests:新探针 +155、runner +16/−4(含 /12 硬编码总数
+  去 陈旧化);ledger 本条目。零 native、零旗标、cache key 无涉;休眠机制无。
+- **状态**:landed + verified(分支 `mujocoqd/a20-loopvar-scope`,未 merge;待协调人
+  裁决:①mujoqo `_primitive_narrowphase` 预声明补丁派单;②A20 需求清单条目更正
+  ("回归"→"既有前端缺口+warp 风格代码缺预声明");③runtime-if 提升语义是否立项)。
+
+## Metal-i64 — i64 类型通路定性(记载推翻)+ segmented sort 64 位键补齐(mujocoqd/metal-i64)
+- **定性(本线主产出,dev95 基线 cpu+metal 双探针实证)**:"Metal 无 i64" 记载过时——
+  `metal_device.mm:1107-1110` Apple3+ 已置 `spirv_has_int64` + `physical_storage_buffer`
+  (`feature_64_bit_integer_math = family_apple3`),SPIR-V→MSL 经 spirv_cross 原生 `long`。
+  probe_metal_i64.py 12 组形态全实证 metal PASS:i64 load/store(含 INT64_MAX/MIN)、+ - *、
+  `// %`(floor 语义)、`(g<<32)|s` 打包、位与或异、比较控制流、i32/f32/bool→i64 cast、
+  clamp、bit_cast i64↔u64(radix twiddle 同款)、u64 load/store+sort、
+  **plain `sort()` i64 键(= mujoco_qd filter_key 主路径 collision_flex.py:2073 所用)本就 PASS**。
+  键宽收窄方案(需求清单原登记)被用户否决后定性——结论:filter_key 主路径零收窄、零绕行,
+  键宽保持 i64,无需任何编译器(native)修复。
+- **唯一实证缺口 + 修复**:sort_segmented i64 键 GPU 通路(含 metal;CPU 走
+  `_cpu_paths._cpu_seg_radix_sort` 主机路径不受影响)。断点 = `_segmented.py` `_seg_scatter`
+  sel==1 分支 `bit_cast(keys_in[i], u32)` 宽度硬编码 → 64 位键 64→32 异宽 →
+  spirv_codegen.cpp:visit@1033 响亮拒绝(codegen 行为正确)。修复 `1f8600f9`(+16/−5,
+  python-only):照 `_seg_hist` 既有 key_width 32/64 静态分支模式,digit 从 u64 键全宽提取后
+  预提 8-bit 进 u32 喂 `radix_rank_match_atomic_or`(其 u32 key 契约不变,bit_start=0);
+  out-of-range lane 保持 0xFFFFFFFF→dump-digit 约定;**32 位路径逐位不变**(同语句集外加
+  一层 static 包裹)。
+- **性能**(8M 元素,交错 i64/i32 配对中位,GPU 空闲,dev109 两轮一致):copy x1.03-1.12、
+  打包 x0.74-0.91、plain sort x2.15-2.44(= 8 遍 vs 4 遍通过数翻倍,预期内);
+  全部低于 4× 热路径阈值,无 hot-path。绝对 GB/s 受标量 codegen kernel 形状限制(~15-30 GB/s),
+  比值才有效。
+- **门禁**:本线新 gate = **union gate 16**(`tests/robostudio/probe_metal_i64.py`,
+  cpu+metal 双臂;cpu 臂含 segmented-i64 主机路径,metal 臂 t11 翻硬门——修复前该探针在
+  未修复 wheel 上如实 xfail 于 bit_cast 拒绝;8M perf 段 informational,>4× 打 ALERT;
+  runner 顺带删一处 a20 遗留的硬编码 `/14` 陈旧总数回显)。union **16/16 PASS** +
+  上游 `test_return.py` **46/46**(venv `_probe.venvi64` = dev109+gba344e6ef,本分支自建
+  wheel,requirements-test.txt 测试栈 pytest 8.4.2)。
+- **footprint**:python-only `_segmented.py` +16/−5;tests:探针 +621(含修复前定性记录与
+  xfail 机制)、runner +27/−3;ledger 本条目 + INDEX 行。零 native、零旗标、cache key 无涉、
+  休眠机制无。
+- **状态**:landed + verified(分支 `mujocoqd/metal-i64`,未 merge,待协调人;注意:本分支
+  基点已含 a20 合并 233f99c2——a20 线的 merge 当时落在工作树 HEAD 即本分支 reflog 可证,
+  合并本分支会连带带入 a20)。mujoqo 侧遗留(非本线):collision_flex.py:1202 worldid/group
+  先用后定义(arch 无关,归移植线);a20 ledger 条目自身 foot/状态块重复、INDEX 行悬垂,
+  归 a20 所有者修。

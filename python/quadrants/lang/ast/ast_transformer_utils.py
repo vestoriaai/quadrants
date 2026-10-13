@@ -66,14 +66,22 @@ Your code:
 
 
 class VariableScopeGuard:
-    def __init__(self, scopes: list[dict[str, Any]]):
+    def __init__(self, scopes: list[dict[str, Any]], retired_names: set[str] | None = None):
         self.scopes = scopes
+        self.retired_names = retired_names
 
     def __enter__(self):
         self.scopes.append({})
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        self.scopes.pop()
+        # A20: remember names whose only binding lived in this block. When such a
+        # name is later looked up from outside the closed block, the plain
+        # 'Name "x" is not defined' error reads like a typo; the actionable
+        # variant in get_var_by_name points at the predeclaration convention.
+        if self.retired_names is not None:
+            self.retired_names.update(self.scopes.pop().keys())
+        else:
+            self.scopes.pop()
 
 
 class StaticScopeStatus:
@@ -249,6 +257,10 @@ class ASTTransformerFuncContext:
         self.func: "FuncBase" = func
         self.local_scopes: list[dict[str, Any]] = []
         self.loop_scopes: List[LoopScopeAttribute] = []
+        # A20: names whose only binding lived in an already-closed block scope
+        # (runtime if branch, loop body, inlined func locals). Consulted by
+        # get_var_by_name to turn the generic NameError into an actionable one.
+        self.retired_block_scope_names: set[str] = set()
         self.template_slot_locations = template_slot_locations
         self.is_kernel: bool = is_kernel
         self.arg_features: list[tuple[Any, ...]] = arg_features
@@ -302,7 +314,7 @@ class ASTTransformerFuncContext:
 
     # e.g.: FunctionDef, Module, Global
     def variable_scope_guard(self):
-        return VariableScopeGuard(self.local_scopes)
+        return VariableScopeGuard(self.local_scopes, self.retired_block_scope_names)
 
     # e.g.: For, While
     def loop_scope_guard(self, is_static=False):
@@ -436,7 +448,13 @@ class ASTTransformerFuncContext:
         try:
             return False, getattr(builtins, name), None
         except AttributeError:
-            raise QuadrantsNameError(f'Name "{name}" is not defined')
+            if name in self.retired_block_scope_names:
+                raise QuadrantsNameError(
+                    f'Name "{name}" is not defined: it was first assigned inside a runtime '
+                    f"if branch / loop body, and those bindings are not visible after the "
+                    f"block closes. Predeclare it before the block (e.g. `{name} = 0`) instead."
+                ) from None
+            raise QuadrantsNameError(f'Name "{name}" is not defined') from None
 
     def memoized_get_pos_info(self, node: ast.AST) -> str:
         key = (node.lineno, node.col_offset, node.end_lineno, node.end_col_offset, node.__class__.__name__)
