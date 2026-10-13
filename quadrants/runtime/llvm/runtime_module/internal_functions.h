@@ -5,6 +5,7 @@
     QD_ASSERT(cond);                                            \
     if ((r)->error_code) {                                      \
       quadrants_printf((r), "%s", (r)->error_message_template); \
+      fflush(NULL); \
       abort();                                                  \
     }                                                           \
   } while (0)
