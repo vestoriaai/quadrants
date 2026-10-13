@@ -1,5 +1,6 @@
 #pragma once
 
+#include <exception>
 #include <atomic>
 #include <condition_variable>
 #include <deque>
@@ -21,6 +22,10 @@ class ParallelExecutor {
   void enqueue(const TaskType &func);
 
   void flush();
+
+  // A21: rethrow (in the caller's thread) the first exception that escaped a
+  // worker task, then clear it. No-op if no task has thrown.
+  void rethrow_pending_exception();
 
   int get_num_threads() {
     return num_threads_;
@@ -47,6 +52,11 @@ class ParallelExecutor {
   ExecutorStatus status_;
   std::vector<std::thread> threads_;
   std::deque<TaskType> task_queue_;
+  // A21: first exception thrown by a task inside a worker thread. Tasks must
+  // not let exceptions escape (worker threads have no unwinding contract);
+  // this keeps the message so the submitting thread can raise it.
+  std::exception_ptr pending_exception_;
+
   int running_threads_;
 
   // Used to signal the workers that they can start polling from |task_queue|.

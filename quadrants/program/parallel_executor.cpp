@@ -1,3 +1,4 @@
+#include <exception>
 #include <quadrants/system/timeline.h>
 #include "quadrants/program/parallel_executor.h"
 
@@ -58,6 +59,17 @@ void ParallelExecutor::flush() {
   while (!flush_cv_cond()) {
     flush_cv_.wait(lock);
   }
+  rethrow_pending_exception();
+}
+
+void ParallelExecutor::rethrow_pending_exception() {
+  std::unique_lock<std::mutex> lock(mut_);
+  if (pending_exception_) {
+    auto e = pending_exception_;
+    pending_exception_ = nullptr;
+    lock.unlock();
+    std::rethrow_exception(e);
+  }
 }
 
 bool ParallelExecutor::flush_cv_cond() {
@@ -96,8 +108,18 @@ void ParallelExecutor::worker_loop() {
         task_queue_.pop_front();
         lock.unlock();
 
-        // Run the task
-        task();
+        // Run the task. A21: never let an exception escape a worker thread
+        // (uncaught -> std::terminate -> SIGABRT with the message lost);
+        // stash it and let the submitting thread rethrow via
+        // rethrow_pending_exception().
+        try {
+          task();
+        } catch (...) {
+          std::unique_lock<std::mutex> elock(mut_);
+          if (!pending_exception_) {
+            pending_exception_ = std::current_exception();
+          }
+        }
 
         lock.lock();
         running_threads_--;
