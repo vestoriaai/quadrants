@@ -1,5 +1,6 @@
 #pragma once
 
+#include <exception>
 #include <atomic>
 #include <condition_variable>
 #include <deque>
@@ -21,6 +22,7 @@ class ParallelExecutor {
   void enqueue(const TaskType &func);
 
   void flush();
+
 
   int get_num_threads() {
     return num_threads_;
@@ -47,6 +49,13 @@ class ParallelExecutor {
   ExecutorStatus status_;
   std::vector<std::thread> threads_;
   std::deque<TaskType> task_queue_;
+  // A21: message of the first error thrown by a task inside a worker thread.
+  // Tasks must not let exceptions escape (worker threads have no unwinding
+  // contract; an escaping throw hits std::terminate -> SIGABRT). The message
+  // is stashed here and re-raised as std::runtime_error by flush() in the
+  // submitting thread, where it crosses the python boundary normally.
+  std::string pending_error_;
+
   int running_threads_;
 
   // Used to signal the workers that they can start polling from |task_queue|.

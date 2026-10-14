@@ -1,3 +1,4 @@
+#include <cstdarg>
 #include "quadrants/runtime/llvm/llvm_runtime_executor.h"
 #include "quadrants/program/adstack_size_expr_eval.h"
 
@@ -21,6 +22,17 @@
 #include "quadrants/program/program_impl.h"
 #include "quadrants/program/program.h"
 
+
+// A21 diagnostics: kernel-side runtime errors print then abort(); a buffered
+// stdout loses the message. Route kernel printf to the unbuffered stderr.
+static void kernel_printf_to_stderr(const char *fmt, ...) {
+  va_list ap;
+  va_start(ap, fmt);
+  vfprintf(stderr, fmt, ap);
+  va_end(ap);
+  fflush(stderr);
+}
+
 #if defined(QD_WITH_CUDA)
 #include "quadrants/rhi/cuda/cuda_context.h"
 #endif
@@ -30,6 +42,16 @@
 #include "quadrants/rhi/amdgpu/amdgpu_device.h"
 #if defined(QD_WITH_AMDGPU)
 #include "quadrants/rhi/amdgpu/amdgpu_context.h"
+
+// A21 diagnostics: kernel-side runtime errors print then abort(); a buffered
+// stdout loses the message. Route kernel printf to the unbuffered stderr.
+static void kernel_printf_to_stderr(const char *fmt, ...) {
+  va_list ap;
+  va_start(ap, fmt);
+  vfprintf(stderr, fmt, ap);
+  va_end(ap);
+  fflush(stderr);
+}
 #endif
 
 namespace quadrants::lang {
@@ -774,7 +796,7 @@ void LlvmRuntimeExecutor::materialize_runtime(KernelProfilerBase *profiler, uint
   auto *host_memory_pool = &HostMemoryPool::get_instance();
   runtime_jit->call<void *, void *, std::size_t, void *, int, void *, void *, void *, void *>(
       "runtime_initialize", *result_buffer_ptr, host_memory_pool, runtime_objects_prealloc_size,
-      runtime_objects_prealloc_buffer, num_rand_states, (void *)&host_allocate_aligned, (void *)std::printf,
+      runtime_objects_prealloc_buffer, num_rand_states, (void *)&host_allocate_aligned, (void *)&kernel_printf_to_stderr,
       (void *)std::vsnprintf, external_rand_states_buffer);
 
   QD_TRACE("LLVMRuntime initialized (excluding `root`)");

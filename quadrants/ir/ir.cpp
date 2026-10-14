@@ -487,13 +487,18 @@ std::unique_ptr<Block> Block::clone() const {
 }
 
 DelayedIRModifier::~DelayedIRModifier() {
-  // TODO: destructors should not be interrupted
-  QD_ASSERT(to_insert_before_.empty());
-  QD_ASSERT(to_insert_after_.empty());
-  QD_ASSERT(to_erase_.empty());
-  QD_ASSERT(to_replace_with_.empty());
-  QD_ASSERT(to_extract_to_block_front_.empty());
-  QD_ASSERT(to_type_check_.empty());
+  // A21: this destructor runs during stack unwinding whenever a pass throws
+  // after queueing modifications. QD_ASSERT'ing on non-empty queues there
+  // aborts the process *before* the original error reaches python, hiding it
+  // behind a bare SIGABRT. Unwinding cannot safely apply the queued edits, so
+  // discard them (the IR tree itself is untouched - edits were deferred) and
+  // let the original exception propagate with its message.
+  to_insert_before_.clear();
+  to_insert_after_.clear();
+  to_erase_.clear();
+  to_replace_with_.clear();
+  to_extract_to_block_front_.clear();
+  to_type_check_.clear();
 }
 
 void DelayedIRModifier::erase(Stmt *stmt) {

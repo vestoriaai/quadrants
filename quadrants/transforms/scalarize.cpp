@@ -1034,6 +1034,20 @@ class ScalarizePointers : public BasicStmtVisitor {
       QD_ASSERT(stmt->offset->is<ConstStmt>());
       int offset = stmt->offset->cast<ConstStmt>()->val.val_int32();
 
+      if (offset >= (int)scalarized_alloca_stmts.size()) {
+        // A21: QD_ERROR here hits __builtin_unreachable (UB -> SIGABRT with
+        // the message eaten). Raise a catchable exception instead so the
+        // message surfaces through the python boundary.
+        // A21: print the offending MatrixPtr and its origin alloca (with
+        // source debug info) so the failing kernel variable is identifiable.
+        std::string ptr_txt, alloca_txt;
+        irpass::print(stmt, &ptr_txt, true, false);
+        irpass::print(stmt->origin, &alloca_txt, true, false);
+        throw std::runtime_error(fmt::format(
+            "scalarize: MatrixPtr offset {} out of range for local tensor of {} elements\n"
+            "MatrixPtr stmt:\n{}origin alloca:\n{}",
+            offset, (int)scalarized_alloca_stmts.size(), ptr_txt, alloca_txt));
+      }
       QD_ASSERT(offset < scalarized_alloca_stmts.size());
       auto new_stmt = scalarized_alloca_stmts[offset];
 

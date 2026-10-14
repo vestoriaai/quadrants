@@ -1,3 +1,4 @@
+#include <exception>
 #include <quadrants/system/timeline.h>
 #include "quadrants/program/parallel_executor.h"
 
@@ -58,6 +59,16 @@ void ParallelExecutor::flush() {
   while (!flush_cv_cond()) {
     flush_cv_.wait(lock);
   }
+  // A21: surface the first stashed task error here, in the submitting
+  // thread, as std::runtime_error (crosses the python boundary as
+  // RuntimeError; the raw std::string throw that started this must never
+  // escape a worker thread - see the catch above).
+  if (!pending_error_.empty()) {
+    std::string msg = pending_error_;
+    pending_error_.clear();
+    lock.unlock();
+    throw std::runtime_error("parallel compile task failed: " + msg);
+  }
 }
 
 bool ParallelExecutor::flush_cv_cond() {
@@ -96,8 +107,25 @@ void ParallelExecutor::worker_loop() {
         task_queue_.pop_front();
         lock.unlock();
 
-        // Run the task
-        task();
+        // Run the task. A21: never let an exception escape a worker thread
+        // (uncaught -> std::terminate -> SIGABRT with the message lost);
+        // stash the message and let flush() raise it in the submitting
+        // thread.
+        try {
+          task();
+        } catch (const std::string &e) {
+          std::lock_guard<std::mutex> elock(mut_);
+          if (pending_error_.empty())
+            pending_error_ = e;
+        } catch (const std::exception &e) {
+          std::lock_guard<std::mutex> elock(mut_);
+          if (pending_error_.empty())
+            pending_error_ = e.what();
+        } catch (...) {
+          std::lock_guard<std::mutex> elock(mut_);
+          if (pending_error_.empty())
+            pending_error_ = "unknown parallel task exception";
+        }
 
         lock.lock();
         running_threads_--;
