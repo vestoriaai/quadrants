@@ -14,7 +14,10 @@
 # mujocoqd/metal-i64; cpu+metal dual arm, perf informational) and gate 17
 # (early-return compound forms - mujocoqd/a7-m2-compound; cpu+metal dual arm:
 # compound slot init + merged-guard rewrite + new loud rejections, F1-F14
-# matrix with numpy twins).
+# matrix with numpy twins) and gate 18 (qd-native BVH - mujocoqd/bvh;
+# quadrants/bvh.py build/traversal/refit vs numpy-twin predicates + warp
+# wp.Bvh A/A; warp borrowed via QD_GATE_WARP_SP, its quadrants shadowed by
+# $QSP - path order matters; cpu+metal dual arm, 27 assertions each).
 #   7  C2        probe_spirv_vectorize.py metal    -> ALL PASS (bitwise scalar==vec)
 #   8  R5        gate_r5_host_visible.py metal     -> RESULT: PASS (byte parity +
 #                  relative perf pins; small readback <=x0.5 default, 64MB <=x1.2)
@@ -48,7 +51,7 @@ trap 'rm -rf "$TMP"' EXIT
 
 [[ -x "$PY" ]] || { echo "FATAL: no venv python at $PY (create .venv-consolidated, see docs/build_robostudio.md)" >&2; exit 1; }
 
-PASS=0; NFAIL=0; TOTAL=17
+PASS=0; NFAIL=0; TOTAL=18
 gate_pass() { echo "gate $1/$TOTAL [$2]: PASS"; (( PASS = PASS + 1 )); }
 gate_fail() { echo "gate $1/$TOTAL [$2]: FAIL -- $3"; (( NFAIL = NFAIL + 1 )); }
 
@@ -301,6 +304,36 @@ else
   echo "  early-return metal arm: skipped (gpu-busy)"
 fi
 (( G17 == 2 )) && gate_pass 17 "early-return compound forms (cpu+metal)" || gate_fail 17 "early-return compound forms (cpu+metal)" "see arms above"
+
+# 18 qd-native BVH (mujocoqd/bvh) ------------------------------------------------
+# quadrants/bvh.py (file-loaded from the worktree; the venv runtime provides
+# the compiled quadrants). Build invariants + numpy-twin traversal semantics +
+# warp wp.Bvh A/A + ray hand cases (any-hit cutoff, nearest via iterator
+# narrowing) + refit + empty/n=1/leaf_size/determinism. cpu arm must pass;
+# metal arm runs the same 27 assertions.
+G18=0
+BVH_BORROW=(env PYTHONPATH="$QSP:${QD_GATE_WARP_SP:-/Users/mini0/Code/mujoqo/_port.venv/lib/python3.12/site-packages}")
+if ! "${BVH_BORROW[@]}" "$PY" -c "import quadrants, warp; assert '$V' in quadrants.__file__, quadrants.__file__" 2>"$TMP/g18_borrow.log"; then
+  gate_fail 18 "qd-native BVH" "warp-borrow preflight failed (QD_GATE_WARP_SP=$QD_GATE_WARP_SP)"
+else
+  "${BVH_BORROW[@]}" "$PY" -u "$ROOT/tests/robostudio/gate_bvh.py" cpu >"$TMP/g18_cpu.log" 2>&1
+  if (( $? == 0 )) && grep -q "RESULT: BVH GATE \[cpu\]: ALL PASS" "$TMP/g18_cpu.log"; then
+    G18=1; echo "  bvh cpu: ALL PASS"
+  else
+    G18=0; echo "  bvh cpu: expected ALL PASS:"; grep "^\[FAIL\]\|^RESULT" "$TMP/g18_cpu.log" || tail -8 "$TMP/g18_cpu.log"
+  fi
+  if wait_gpu_idle; then
+    "${BVH_BORROW[@]}" "$PY" -u "$ROOT/tests/robostudio/gate_bvh.py" metal >"$TMP/g18_metal.log" 2>&1
+    if (( $? == 0 )) && grep -q "RESULT: BVH GATE \[metal\]: ALL PASS" "$TMP/g18_metal.log"; then
+      echo "  bvh metal: ALL PASS"
+    else
+      G18=0; echo "  bvh metal: expected ALL PASS:"; grep "^\[FAIL\]\|^RESULT" "$TMP/g18_metal.log" || tail -8 "$TMP/g18_metal.log"
+    fi
+  else
+    G18=0; echo "  bvh metal: gpu-busy"
+  fi
+  (( G18 )) && gate_pass 18 "qd-native BVH (cpu+metal)" || gate_fail 18 "qd-native BVH (cpu+metal)" "see arms above"
+fi
 
 echo "UNION GATE: $PASS/$TOTAL PASS"
 if (( NFAIL > 0 )); then echo "(logs kept in $TMP)"; trap - EXIT; exit 1; fi

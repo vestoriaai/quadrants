@@ -1,5 +1,5 @@
 <!-- INDEX — merged lines (newest last; each entry's full section via its header below) -->
-<!-- qd-copy-api 2ce5a850 · c2-emitter-fixes 83b2d1a2 · subgroup-cpu-support 8ebf8620 · reassociate-flag 19ff0276 · reassoc-subgroup-probe 9372c300 · r5-host-visible 67e27bc4 · spirv-vectorize 68bd7965 · algorithms-2 b12c125c · compiler-line 33e7dabf · n2-to-numpy-type 4a76ce7c · a10-nested-loop-raw c52711b5 · a19-stlf-fallback 3793c86d · a20-loopvar-scope 01d2037e · metal-i64 01d2037e · a7-m2-compound 869a00a0 -->
+<!-- qd-copy-api 2ce5a850 · c2-emitter-fixes 83b2d1a2 · subgroup-cpu-support 8ebf8620 · reassociate-flag 19ff0276 · reassoc-subgroup-probe 9372c300 · r5-host-visible 67e27bc4 · spirv-vectorize 68bd7965 · algorithms-2 b12c125c · compiler-line 33e7dabf · n2-to-numpy-type 4a76ce7c · a10-nested-loop-raw c52711b5 · a19-stlf-fallback 3793c86d · a20-loopvar-scope 01d2037e · metal-i64 01d2037e · a7-m2-compound 869a00a0 · qd-native-bvh 1afd8ab9 -->
 
 # robostudio_features.md — features ledger for robostudio-main
 
@@ -1016,3 +1016,50 @@ test_state_history_get_set`:旧 wheel = A19 assert 拒编译(FAIL);新 wheel =
   (惰性编译未触发);18 处炸弹与 58 处手工存量迁移策略;kernel+复合+旗标既有 bug
   的独立归因与修复;单索引行赋值 `mat[i] = vec` 在部分站点被拒(试点用元素级赋值绕开,
   真实 box_box 同拼写可编译,差异待查——归编译器线顺带核对)。
+
+## qd 原生 BVH — 泛型 AABB 空间查询原语(mujocoqd/bvh)
+- **设计**:`quadrants/bvh.py`(新,893 行)——warp native LBVH(bvh.cu/bvh.h)算法级
+  直译,零 native/零 codegen/零既有文件改动。构建:morton3<1024> 键 → (i32 morton,
+  index) Batcher 奇偶排序(host 驱动 parallel_sort schedule)→ key deltas →
+  build_leaves → build_hierarchy(delta 分裂+parity tie-break+原子完成计数;完成链
+  **串行**保确定)→ mark_packed_leaf_nodes(leaf_size 静音)。遍历:bvh_query_init +
+  bvh_query_{aabb,ray,sphere}_next——warp bvh_query_next_impl 骨架,三谓词展开,
+  手工单出口,**标量 i32 返回**(兼容无 M2 复合槽的运行时);迭代器状态在调用方 2-D
+  ndarray 行(stack[slot,depth]/state[slot,4];qd 无 kernel 内定长数组,探针 P1 实锤)。
+  BVHPackedNodeHalf 位域(i:31|b:1)经 bit_cast 打进 vec4 w 通道(与 warp 字节同构,
+  NaN payload 往返 cpu+metal 钉死)。refit = bvh_refit_kernel(结构不动 bounds 上提)。
+  host Bvh 句柄(num_items 显式口应对 qd 零宽 1-填充)+ 三个 batch 查询 kernel。
+- **数字**:gate 18(tests/robostudio/gate_bvh.py,27 断言/臂):**cpu 27/27、metal
+  27/27 PASS**(venv-consolidated dev25+g3297e86fe);新运行时(0de907cd wheel)cpu 亦
+  27/27。oracle 三层:结构不变量(排列/自查询必中/packed-leaf range 位级划分 [0,n))+
+  **numpy 孪生谓词**(48 aabb/48 ray/48 sphere 候选集合逐一相等)+ **warp wp.Bvh A/A**
+  (同界 48+48 集合相等,warp 借用为 cpu oracle,对 metal 臂亦有效)。ray 手工:any-hit
+  截断、迭代器收窄求最近、球查询;refit 随动;空树/n=1/leaf_size=64/3 次构建逐位确定。
+  上游 test_return.py **46/46**。union TOTAL 17→18,gate 18 双臂 PASS;既有 gate
+  1-6/13 全过,gate 7-12/14-17 import 期失败 = 母盘 venv 陈旧(dev25 缺
+  spirv_vectorize/host_visible/reassociate init 旗标、_cpu_paths、sort_segmented、
+  early_return kwarg,各有专名证据;M2 条目记载 17 门全量当时跑在 venva7=dev104
+  自建 wheel 上,本机现已无),非本线回归(bvh 分支零既有文件改动)。
+- **footprint**:bvh.py +893;gate_bvh.py +437;runner 注册块 +33、头注 +2(TOTAL
+  17→18);ledger 本条目 + INDEX 行;_probe/bvh_local_array_probe.py +330(勘察,
+  任务书 step-1 另令,不计入本预算)。合计 1369 行 ≤1400。**sort 直调不可行记录**:
+  此 wheel 可组合基数排序无 cpu 通路(GPU 楼梯 arm64 死于 block.sync)、
+  sort_stage 仅收 field(template() 拒 ndarray + snode 访问)——以 ndarray 形态重述
+  同一奇偶网络 + parallel_sort schedule,sort 本体未动。
+- **perf 追加验收**(用户追加;一次性/稳态分离口径,_probe/bvh_perf_probe.py:
+  1k/10k/50k × uniform/cluster,查询 512/5000 双档批量,5 次中位,wp-cpu 与 qd-cpu
+  同进程交错 reps,qd-metal 独进程先过 _gpu_busy.sh)。**构建 = 一次性成本**(中位
+  ms,1k/10k/50k):wp-cpu 0.2/2.6/15.1,qd-cpu 3.8/6.6/11.7(小 n 吃 ~55–136 次
+  per-stage launch+sync 固定税,50k 反超 wp 的 SAH),qd-metal 19.7/44.1/97.9
+  (per-stage launch 延迟主导,非 GPU 计算)。**查询 = 稳态计算**(5000 条批量档
+  per-query 中位 ns,uniform/cluster 全场景范围):qd-cpu 22–1843,wp-cpu 75–10582
+  (同数量级,qd-cpu 一致 4–6× 快;512 小批量档两者 0.5–1.0× 基本打平——固定路径
+  未摊薄,大批量档 qd 吞吐规模化更好),qd-metal 含实测后端地板(389.7 µs/launch,
+  任何 kernel 都有,非 BVH 特有)117–23376 / 扣地板 12–22615(≈qd-cpu 的 1.5–8×,
+  小场景整批时间≈地板本身)。命中总数三方断言相等(f32 孪生精确;numpy f64 参考
+  50k ray 1 例刃边差 51964 vs 51965,容差内;同协议双跑漂移 ~20%,±4× 方差纪律内)。
+- **限制**:单 group(groups 不实现,键上 32 位预留);奇偶排序不稳定(平键顺序网络
+  相关;LBVH 对任意平键排列有效,候选集与树形无关,gate 确认);构建/refit 完成链串行
+  (确定性优先);ray 谓词保持 warp 原版 slab(0×inf=NaN 边界语义一致,robust 变体未引);
+  capsule 谓词未实现;单 kernel 可组合形态待基数排序 cpu 通路进 wheel。状态:landed
+  on mujocoqd/bvh(bfd5b39c/1afd8ab9),待协调人 squash。
