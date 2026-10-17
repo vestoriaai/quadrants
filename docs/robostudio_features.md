@@ -1,5 +1,5 @@
 <!-- INDEX — merged lines (newest last; each entry's full section via its header below) -->
-<!-- qd-copy-api 2ce5a850 · c2-emitter-fixes 83b2d1a2 · subgroup-cpu-support 8ebf8620 · reassociate-flag 19ff0276 · reassoc-subgroup-probe 9372c300 · r5-host-visible 67e27bc4 · spirv-vectorize 68bd7965 · algorithms-2 b12c125c · compiler-line 33e7dabf · n2-to-numpy-type 4a76ce7c · a10-nested-loop-raw c52711b5 · a19-stlf-fallback 3793c86d · a20-loop-var-scope 01d2037e · metal-i64 01d2037e · a7-m2-compound 869a00a0 · qd-native-bvh 76541b81 · cpu-head-state-per-iteration PENDING-SQUASH -->
+<!-- qd-copy-api 2ce5a850 · c2-emitter-fixes 83b2d1a2 · subgroup-cpu-support 8ebf8620 · reassociate-flag 19ff0276 · reassoc-subgroup-probe 9372c300 · r5-host-visible 67e27bc4 · spirv-vectorize 68bd7965 · algorithms-2 b12c125c · compiler-line 33e7dabf · n2-to-numpy-type 4a76ce7c · a10-nested-loop-raw c52711b5 · a19-stlf-fallback 3793c86d · a20-loop-var-scope 01d2037e · metal-i64 01d2037e · a7-m2-compound 869a00a0 · qd-native-bvh 76541b81 · cpu-head-state-per-iteration 4a400a11 -->
 
 # robostudio_features.md — features ledger for robostudio-main
 
@@ -1061,8 +1061,7 @@ test_state_history_get_set`:旧 wheel = A19 assert 拒编译(FAIL);新 wheel =
 - **限制**:单 group(groups 不实现,键上 32 位预留);奇偶排序不稳定(平键顺序网络
   相关;LBVH 对任意平键排列有效,候选集与树形无关,gate 确认);构建/refit 完成链串行
   (确定性优先);ray 谓词保持 warp 原版 slab(0×inf=NaN 边界语义一致,robust 变体未引);
-  capsule 谓词未实现;单 kernel 可组合形态待基数排序 cpu 通路进 wheel。状态:landed
-  on mujocoqd/bvh(bfd5b39c/1afd8ab9),待协调人 squash。
+  capsule 谓词未实现;单 kernel 可组合形态待基数排序 cpu 通路进 wheel。状态:landed on robostudio-main(squash 76541b81)。
 ## CPU 头声明状态 per-iteration 重建(mujocoqd/cpu-head-state-per-iteration)
 - **设计**:qd CPU 并行 kernel 的头声明标量(pre-loop 声明)被 offload 跨任务提升为
   launch-shared global temp,非 serialize 顶层循环的写∧读构成无同步 RMW = 静默数值
