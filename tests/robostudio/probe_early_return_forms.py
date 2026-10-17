@@ -498,14 +498,17 @@ def f14_ref(x):
 
 
 # ---- kernel-side forms -------------------------------------------------------
-# NOTE (existing core bug, NOT introduced by this line — pinned in
-# _probe/_kcompound_diag.py, reproduces identically on pre-fix 0de907cd and
-# dev104 wheels): compound work inside a runtime-if whose condition flag is
-# conditionally assigned in the same kernel-loop iteration miscompiles
-# (cross-iteration branch leakage), hand-written and pass-emitted alike.
-# Kernel-side early_return puts __er_done at function level, so F7/F8 keep the
-# compound funcs in the UNGUARDED prefix and pin the guard merge with
-# scalar-only guard regions (the portable kernel-side shape).
+# NOTE (ERRATUM 2026-10-13, supersedes the "cross-iteration branch leakage /
+# compound miscompile" reading; mechanism pinned in _probe/eval_kflag/):
+# a flag declared OUTSIDE the element loop survives across offload tasks and is
+# demoted to a GlobalTemporary — a launch-shared scratch cell — so under a
+# PARALLEL element loop the cell races across elements (metal wave scheduling
+# makes head elements observe the tail's set before their own guards run).
+# It was never a compound-work defect: identical behavior on the pre-fix
+# 0de907cd and dev104 wheels (upstream-inherited), cpu included at the pool's
+# block boundaries. Kernel-side early_return puts __er_done at function level,
+# so F7/F8 keep the compound funcs in the UNGUARDED prefix and pin the guard
+# merge with scalar-only guard regions (the portable kernel-side shape).
 @qd.kernel(early_return=True)
 def k7_compound_local(xs: qd.types.ndarray(ndim=1), y3: qd.types.ndarray(ndim=1), y1: qd.types.ndarray(ndim=1), yg: qd.types.ndarray(ndim=1)):
     for i in range(xs.shape[0]):
@@ -742,9 +745,11 @@ gate(
 # launch), so multi-element launches cannot model per-element returns; k_guard uses
 # the same 1-element pattern.
 # CPU-claim only: on metal the kernel+compound-func+flag combination loses the guarded
-# scalar stores — an EXISTING core bug, identical on the pre-fix wheel with a
-# hand-written single-exit kernel (_probe/_k7metal_manual.py; family pinned in
-# _probe/_kcompound_diag.py). Not a pass-output defect.
+# scalar stores — the loop-external flag GlobalTemporary cross-element race (ERRATUM
+# 2026-10-13: launch-shared scratch cell, parallel-element scheduling; not a compound
+# defect), identical on the pre-fix wheel with a hand-written single-exit kernel
+# (_probe/_k7metal_manual.py; family pinned in _probe/_kcompound_diag.py and
+# _probe/eval_kflag/). Not a pass-output defect.
 if ARCH == "cpu":
     fx1 = qd.ndarray(dtype=qd.f32, shape=(1,))
     o3x = qd.ndarray(dtype=qd.f32, shape=(3,))
@@ -768,9 +773,10 @@ if ARCH == "cpu":
     gate("F7_kernel_compound_local", ok7, f"{ogx.to_numpy()}")
 else:
     print(
-        "[SKIP] F7_kernel_compound_local (metal): kernel+compound-func+flag blocked by pinned "
-        "EXISTING core bug (identical on pre-fix wheel, _probe/_k7metal_manual.py + "
-        "_probe/_kcompound_diag.py); not a pass-output defect"
+        "[SKIP] F7_kernel_compound_local (metal): kernel+compound-func+flag blocked by the "
+        "loop-external flag GlobalTemporary cross-element race (identical on pre-fix wheel, "
+        "_probe/_k7metal_manual.py + _probe/_kcompound_diag.py + _probe/eval_kflag/); "
+        "not a pass-output defect"
     )
 
 # F8: kernel nested break + return; compound func in the inner-loop prefix.

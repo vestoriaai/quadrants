@@ -1,34 +1,33 @@
-"""A7/M2 side-finding evidence: KERNEL loop-invariant flag + compound work in runtime-if.
+"""A7/M2 side-finding evidence: KERNEL loop-external flag semantics (ERRATUM 2026-10-13).
 
-EXISTING CORE BUG (not introduced by the early_return line): identical failure on the
-pre-fix baseline wheel (0de907cd) and the dev104 fix wheel — dual-wheel attribution.
-Same LICM/over-hoisting family as the documented inlined-func prologue-store hazard
-(early_return_transformer NOTE), CPU included, so not the Metal MSL family.
+ERRATUM (supersedes the original "compound work in runtime-if miscompiles"
+reading): the wants below originally assumed the flag resets every iteration.
+The kernels DECLARE the flag OUTSIDE the loop; after offload such an alloca is
+demoted to a GlobalTemporary (launch-shared scratch), so its true sequential
+semantics are once-set-always, and under a PARALLEL element loop the shared
+slot races across elements (metal wave scheduling widens the window; cpu pool
+is near-sequential). The real boundary between the passing and failing forms
+was never compound-vs-scalar work — it is the flag declaration position
+(loop-external GlobalTemporary race vs in-loop per-element local). Controls
+(narrow2 A/B/C, narrow3 kE/kF) PASS for the same reason; their original
+"compound vs element store" explanation is retracted. Mechanism + production
+impact: _probe/eval_kflag/ (eval1-eval6, census, offload IR).
 
-Trigger (pinned repros below; exact minimal trigger needs its own attribution pass):
-a scalar flag conditionally assigned inside a kernel-loop iteration and used as a
-runtime-if condition over a block containing compound work. Observed matrix:
+Original observed matrix, re-read under the erratum (wants fixed below to the
+code's sequential semantics):
 
   k_plain    no guard, element store                                      -> PASS
-  k_manual7  flag OUTSIDE loop; element store + read inside guard         -> FAIL
-  k_manual7b flag OUTSIDE loop; predeclared v, store + read inside guard  -> FAIL
-  k_manual8  flag OUTSIDE loop; compound in post-loop region              -> FAIL
-  kD         flag INSIDE loop; whole-value store of CONSTANT entries      -> FAIL
-             (2-iteration delay pattern in got[])
+  k_manual7  flag OUTSIDE loop; element store + read inside guard         -> want was wrong
+             (once-set-always: first negative element sets the flag and its
+             own guard read already sees 1 -> nothing is ever written)
+  k_manual7b flag OUTSIDE loop; predeclared v, store + read inside guard  -> want was wrong (same)
+  k_manual8  flag OUTSIDE loop; compound in post-loop region              -> want was wrong
+             (z guard can never pass once iteration 0 set the flag)
+  kD         flag INSIDE loop; whole-value store of CONSTANT entries      -> want was INVERTED
+             (done=1 for xs<0 keeps v at zero; done=0 for xs>=0 stores the
+             negative vec; got=[0,0,-4,-4,...] matches the code bit-exactly;
+             the "2-iteration delay" reading was a misparse)
 
-Controls that PASS: element store under a plain data condition (narrow2 A/C),
-whole-value store under a plain data condition (narrow2 B), flag-INSIDE-loop +
-element store with/without in-guard read (_kcompound_narrow3.py kE/kF). Note the
-func-side forms of the early_return F-matrix (F10/F13: whole-value stores of
-VARIABLE entries inside the func's merged guard) pass — the boundary is
-entry-constant-ness / inlining sensitive; treat as open for the compiler owner.
-
-Impact on the A7/M2 line: kernel-side early_return generates the flag at function
-level (outside the outermost loop), so guard regions containing compound work hit
-THIS bug — the pass output is correct there (hand-written identical shape fails
-the same way). Func-side compound forms are unaffected (F1-F6, F9-F14 pass
-cpu+metal). Kernel-side F7/F8 therefore pin the guard-merge with compound funcs
-in the UNGUARDED prefix and scalar-only guard regions.
 Run: <venv>/bin/python _kcompound_diag.py [cpu|metal]
 """
 import sys
@@ -85,7 +84,10 @@ def k_manual7(xs: qd.types.ndarray(ndim=1), y: qd.types.ndarray(ndim=1)):
 y.from_numpy(np.zeros(len(FX), dtype=np.float32))
 k_manual7(fx, y)
 qd.sync()
-check("k_manual7_guard_local", y.to_numpy(), [max(x, 0.0) for x in FX])
+# ERRATUM: flag is loop-external (once-set-always). FX[0] < 0 sets __er_done in
+# iteration 0, and that same iteration's guard already reads 1, so no element
+# ever writes y: sequential semantics = all zeros (not per-element max(x, 0)).
+check("k_manual7_guard_local", y.to_numpy(), [0.0 for _ in FX])
 
 # guarded, function-level predeclared compound
 @qd.kernel
@@ -103,7 +105,8 @@ def k_manual7b(xs: qd.types.ndarray(ndim=1), y: qd.types.ndarray(ndim=1)):
 y.from_numpy(np.zeros(len(FX), dtype=np.float32))
 k_manual7b(fx, y)
 qd.sync()
-check("k_manual7b_guard_predecl", y.to_numpy(), [max(x, 0.0) for x in FX])
+# ERRATUM: same loop-external flag as k_manual7 -> sequential semantics = zeros.
+check("k_manual7b_guard_predecl", y.to_numpy(), [0.0 for _ in FX])
 
 # compound in the post-loop fall-through region
 @qd.kernel
@@ -128,7 +131,12 @@ y2.from_numpy(np.zeros(len(FX), dtype=np.float32))
 z.from_numpy(np.zeros(len(FX), dtype=np.float32))
 k_manual8(fx, y2, z)
 qd.sync()
-want_z = []
+# ERRATUM: the flag is loop-external, so iteration 0 (x=-7.5) sets __er_done and
+# from then on the z guard never passes: sequential semantics for z = all zeros
+# (the original want modeled a per-iteration flag reset the code does not have).
+# y still receives the inner-loop hits themselves:
+# [0.5, 0.5, 0.5, 1.0, 3.5, 0.0, 0.0] (x=20/100 outrun the 8 x 0.5 budget).
+want_y8 = []
 for x in FX:
     s = 0.0
     hit = False
@@ -137,8 +145,9 @@ for x in FX:
         if s > x:
             hit = True
             break
-    want_z.append(0.0 if hit else s)
-check("k_manual8_postloop", z.to_numpy(), want_z)
+    want_y8.append(s if hit else 0.0)
+check("k_manual8_postloop_y", y2.to_numpy(), want_y8)
+check("k_manual8_postloop_z", z.to_numpy(), [0.0 for _ in FX])
 
 # kD: flag INSIDE the loop, whole-value compound store under the flag condition
 @qd.kernel
@@ -156,10 +165,20 @@ def k_d(xs: qd.types.ndarray(ndim=1), y: qd.types.ndarray(ndim=1)):
 y.from_numpy(np.zeros(len(FX), dtype=np.float32))
 k_d(fx, y)
 qd.sync()
-check("kD_flag_inside_whole_store", y.to_numpy(), [-4.0 if x < 0 else 0.0 for x in FX])
+# ERRATUM: the original want was inverted (copied from kB, ignoring that the
+# flag polarity here is done=1 for xs<0). done=1 keeps v at the zero vec, and
+# done=0 (xs>=0) stores the negative vec: y = 0 for xs<0, -4 for xs>=0.
+# got=[0, 0, -4, -4, ...] matches the code bit-exactly; the earlier
+# "2-iteration delay" reading was a misparse.
+check("kD_flag_inside_whole_store", y.to_numpy(),
+      [0.0 if x < 0 else -4.0 for x in FX])
 
 bad = [n for n, ok in results if not ok]
-print(f"\nKCOMPOUND DIAG arch={ARCH}: {'bug PRESENT' if bad else 'bug ABSENT (' + str(len(results)) + ' sanity forms pass)'} — failing: {bad}")
-# This evidence probe exits 0 when the BUG IS PRESENT (it documents the defect);
-# flip the expectation when the compiler is fixed.
-sys.exit(0 if bad else 1)
+print(f"\nKCOMPOUND DIAG arch={ARCH}: "
+      f"{'SEMANTICS DEVIATION (loop-external flag race visible)' if bad else 'all ' + str(len(results)) + ' forms match sequential semantics'}"
+      f" — failing: {bad}")
+# Post-erratum convention: exit 0 when every form matches the sequential
+# semantics of its code (near-sequential pools: loop-external flags behave
+# once-set-always deterministically); nonzero lists the deviating forms,
+# which under parallel scheduling is the GlobalTemporary cross-element race.
+sys.exit(0 if not bad else 1)
