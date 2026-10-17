@@ -1,5 +1,5 @@
 <!-- INDEX — merged lines (newest last; each entry's full section via its header below) -->
-<!-- qd-copy-api 2ce5a850 · c2-emitter-fixes 83b2d1a2 · subgroup-cpu-support 8ebf8620 · reassociate-flag 19ff0276 · reassoc-subgroup-probe 9372c300 · r5-host-visible 67e27bc4 · spirv-vectorize 68bd7965 · algorithms-2 b12c125c · compiler-line 33e7dabf · n2-to-numpy-type 4a76ce7c · a10-nested-loop-raw c52711b5 · a19-stlf-fallback 3793c86d · a20-loopvar-scope 01d2037e · metal-i64 01d2037e · a7-m2-compound 869a00a0 · qd-native-bvh 1afd8ab9 -->
+<!-- qd-copy-api 2ce5a850 · c2-emitter-fixes 83b2d1a2 · subgroup-cpu-support 8ebf8620 · reassociate-flag 19ff0276 · reassoc-subgroup-probe 9372c300 · r5-host-visible 67e27bc4 · spirv-vectorize 68bd7965 · algorithms-2 b12c125c · compiler-line 33e7dabf · n2-to-numpy-type 4a76ce7c · a10-nested-loop-raw c52711b5 · a19-stlf-fallback 3793c86d · a20-loop-var-scope 01d2037e · metal-i64 01d2037e · a7-m2-compound 869a00a0 · qd-native-bvh 76541b81 · cpu-head-state-per-iteration PENDING-SQUASH -->
 
 # robostudio_features.md — features ledger for robostudio-main
 
@@ -1063,3 +1063,41 @@ test_state_history_get_set`:旧 wheel = A19 assert 拒编译(FAIL);新 wheel =
   (确定性优先);ray 谓词保持 warp 原版 slab(0×inf=NaN 边界语义一致,robust 变体未引);
   capsule 谓词未实现;单 kernel 可组合形态待基数排序 cpu 通路进 wheel。状态:landed
   on mujocoqd/bvh(bfd5b39c/1afd8ab9),待协调人 squash。
+## CPU 头声明状态 per-iteration 重建(mujocoqd/cpu-head-state-per-iteration)
+- **设计**:qd CPU 并行 kernel 的头声明标量(pre-loop 声明)被 offload 跨任务提升为
+  launch-shared global temp,非 serialize 顶层循环的写∧读构成无同步 RMW = 静默数值
+  竞态(mujoqo _flex_edges 字段实锤,27042 槽位 ~7700 随机错;探针
+  `_probe/head_state_probe.py` head 形态单调 1..16)。修复 = offload.cpp pre-Offloader
+  变换 `rebuild_head_state_per_iteration`(arch 无关 IR,全后端共用,顺带拆 GPU 侧
+  同型雷):判据 = **写∧读 ∧ 非序列化 kernel 顶层循环**(range_for/struct_for/
+  mesh_for)——克隆 alloca + 循环前无环前缀 store 进循环体入口,循环子树引用全重接;
+  alias(pointer alloca)簇 union 后整簇重建;`is_shared`(SharedArray block 级共享窗,
+  block collectives 在 func 顶层声明、inline 后落 kernel root)显式排除;写-only 形态
+  (test_ret_4k 类)不重建。**语义二元性(ADJUDICATED R3,2026-10-18)**:非 serialize
+  顶层循环 = per-program 语义(头状态写∧读 → 每迭代重建);serialize=True = 显式顺序
+  任务语义(头状态跨迭代携带,pre-fix 行为不变)——后者是语言级声明契约,消费方 =
+  _cpu_paths.py 全家族("one thread, program order, so the loop-carried accumulator
+  is exact";计数排序直方图/256-digit 前缀和逐循环显式 serialize)。IR 层"每迭代重置"
+  与"顺序携带"两形态同形不可静态区分,唯一判据 = serialize 标志;集成线摘 mujoco
+  serialize workaround 后对应 kernel 自动落 per-program 修复面。权威文本 =
+  docs/cpu_head_state_development_spec.md 状态段(含 dev_notes 搬运指示)。
+- **数字**:探针三形态 ×8 launches:head 全 1 / body 全 1 / serialize 确定性 1..16;
+  gate 19 六形态 ×20 launches 全过;test_return.py **46/46**(test_ret_4k 由写-only
+  排除救回:首版判据 44/46);AD 电池双轮对照 436 个 test_adstack 失败为分支既有
+  (pre/post 失败清单逐条相同,零新增),其余 AD 文件 214/214 双轮全绿;union runner
+  19 门全量绿(18 留 BVH 线)。双轮归因:分支基线轮(rebuild 前的 offload.cpp 重编
+  wheel)probe_subgroup/probe_algorithms/probe_metal_i64 全 PASS;含缺陷判据轮
+  gates 10/16 CPU 臂红(select/sort_radix 全挂、t10 sort INT64_MIN)→ 两条排除
+  (is_shared / serialize)逐一救回。
+- **footprint**:offload.cpp +260/−12 左右(单文件;pass + 排除 + 注释);新件
+  `_probe/head_state_probe.py`(复现/语义钉)、`tests/robostudio/
+  gate_cpu_head_state.py`(gate 19,六形态);runner 追加门 19 段+头注,TOTAL 17→19
+  (18 槽留 BVH 线);规格状态段+ledger 本条目。零旗标、cache key 无涉(注:离线缓存
+  对同版本戳不同二进制会吐陈旧 kernel——本轮实证,缓存键线在案)。
+- **限制**:①写-only + 循环内读的未来形态判据会漏,须响亮拒绝或 lint 补位,不许静默;
+  ②未标 serialize 的顺序携带写法(头 RMW 跨迭代)在 ≤512×threads 迭代时 pre-fix 靠
+  512-chunk 偶然串行,修复后转确定性 per-iteration——顺序算法必须显式 serialize
+  (algorithms 已是此口径);③同版本戳不同二进制的 offline cache 陈旧命中(实证,
+  gate/电池前清 ~/.cache/quadrants/qdcache;归缓存键线);④metal 端到端冻结中
+  (arch 无关变换,metal 臂经其余 gate 间接覆盖);⑤mujoqo 侧 10+ 序列化 workaround
+  的移除回归归集成线。

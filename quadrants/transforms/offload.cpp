@@ -5,6 +5,7 @@
 #include "quadrants/ir/visitors.h"
 #include "quadrants/program/program.h"
 
+#include <algorithm>
 #include <set>
 #include <unordered_map>
 #include <utility>
@@ -706,6 +707,311 @@ class FixCrossOffloadReferences : public BasicStmtVisitor {
   std::unordered_map<Stmt *, DataType> local_to_global_vector_type_;
 };
 
+// ---------------------------------------------------------------------------
+// Head-state per-iteration rebuild (mujocoqd/cpu-head-state-per-iteration).
+//
+// A scalar declared before a top-level loop (a "head declaration" in kernel
+// source) lowers to a kernel-root alloca. When the loop task stores to it,
+// the cross-task promotion below (IdentifyValuesUsedInOtherOffloads /
+// PromoteIntermediateToGlobalTmp) turns the alloca into ONE launch-shared
+// global-temp slot: every iteration's read-modify-write then hits that shared
+// slot -- in a parallel task with no synchronisation (silent cross-thread
+// race on CPU, cross-program race on GPU), and in a serialized task only with
+// deterministic timing (still launch-shared, not warp semantics). Warp
+// per-program semantics require the head declaration to re-execute per loop
+// iteration, exactly like an in-body declaration (which already lowers to a
+// per-iteration alloca inside the task).
+//
+// This pre-offload transform moves storing head state into the loop task.
+// For every kernel-root-level for loop (range_for / struct_for / mesh_for,
+// strictly serialized range-fors excluded, see below) whose subtree BOTH
+// writes to / atomically updates a kernel-root alloca AND reads it (a
+// LocalLoad of it, or an atomic -- an atomic is itself a read-modify-write),
+// clone the alloca together with its loop-free root-level prefix stores into
+// the loop body entry and rewire all uses inside the loop subtree to the
+// clones. The write-and-read signature is exactly the defect class
+// (accumulate-into, rebind-then-use, element RMW); the legal write-only shape
+// -- disjoint slice stores consumed only AFTER the loop, e.g.
+// `ret = vec(0); for i: ret[i] = i; return ret` -- keeps the promotion path
+// bit-identical. The promotion pass then no longer sees a storing-and-reading
+// cross-task consumer:
+//   - unserialized loop tasks get per-iteration state (the defect fix: those
+//     are the loops the CPU thread pool actually runs concurrently);
+//   - strictly serialized range-fors keep the pre-fix semantics (deterministic
+//     launch-shared accumulation): serialize=True is the language construct
+//     for iteration-carried sequential algorithms, and their carries are
+//     load-bearing (see the in-driver comment at the exclusion site);
+//   - read-only and write-only cross-task references (later serial tasks,
+//     other loops, post-loop consumers) never enter this path: their
+//     promotion behaviour stays bit-identical.
+// Root allocas whose stored value aliases another root alloca (pointer
+// allocas) form one rebuild cluster, so a write through a pointer alloca
+// inside the loop cannot keep reaching the shared slot. Ambiguity is resolved
+// conservatively: any statement whose write-destination chain reaches the
+// alloca counts as a store (correctness over promotion quality).
+
+// True if the (pointer) expression `expr` transitively reaches `target`.
+bool chain_reaches(const Stmt *expr, const Stmt *target, int depth) {
+  if (expr == nullptr || depth > 8)
+    return false;
+  if (expr == target)
+    return true;
+  const int n_op = expr->num_operands();
+  for (int i = 0; i < n_op; i++) {
+    if (chain_reaches(expr->operand(i), target, depth + 1))
+      return true;
+  }
+  return false;
+}
+
+// Destination expression of a statement that writes *local* memory (nullptr
+// for non-writes). Global stores are kernel-scope data, not head state.
+const Stmt *local_write_dest(const Stmt *stmt) {
+  if (auto st = stmt->cast<LocalStoreStmt>())
+    return st->dest;
+  if (auto at = stmt->cast<AtomicOpStmt>())
+    return at->dest;
+  return nullptr;
+}
+
+// Collect the representatives of head-state clusters written and/or read
+// inside a statement subtree.
+class ScanHeadStateUses : public BasicStmtVisitor {
+ public:
+  using BasicStmtVisitor::visit;
+
+  explicit ScanHeadStateUses(const std::unordered_map<Stmt *, Stmt *> &cluster_rep)
+      : cluster_rep_(cluster_rep) {
+    allow_undefined_visitor = true;
+    invoke_default_visitor = true;
+  }
+
+  // A load of the head alloca (or of anything derived from it) inside the
+  // loop is the read half of the write-and-read defect signature.
+  void visit(LocalLoadStmt *stmt) override {
+    for (const auto &entry : cluster_rep_) {
+      if (chain_reaches(stmt->src, entry.first, 0))
+        read_reps_.insert(entry.second);
+    }
+  }
+
+  void visit(Stmt *stmt) override {
+    const Stmt *dest = local_write_dest(stmt);
+    if (dest == nullptr)
+      return;
+    for (const auto &entry : cluster_rep_) {
+      if (chain_reaches(dest, entry.first, 0)) {
+        written_reps_.insert(entry.second);
+        if (stmt->is<AtomicOpStmt>())
+          // An atomic update is itself a read-modify-write on the (slice of
+          // the) head alloca: counts as the read half as well.
+          read_reps_.insert(entry.second);
+      }
+    }
+  }
+
+  const std::set<Stmt *> &written_reps() const {
+    return written_reps_;
+  }
+
+  const std::set<Stmt *> &read_reps() const {
+    return read_reps_;
+  }
+
+ private:
+  const std::unordered_map<Stmt *, Stmt *> &cluster_rep_;  // member -> rep
+  std::set<Stmt *> written_reps_;
+  std::set<Stmt *> read_reps_;
+};
+
+// Rewire operands inside a loop subtree from original head allocas to their
+// per-iteration clones. The cloned prefix stores inserted at the loop entry
+// are part of the subtree and get rewired as well.
+class RewireHeadStateUses : public BasicStmtVisitor {
+ public:
+  using BasicStmtVisitor::visit;
+
+  explicit RewireHeadStateUses(const std::unordered_map<Stmt *, Stmt *> &clone_of)
+      : clone_of_(clone_of) {
+    allow_undefined_visitor = true;
+    invoke_default_visitor = true;
+  }
+
+  void preprocess_container_stmt(Stmt *stmt) override {
+    rewire(stmt);
+  }
+
+  void visit(Stmt *stmt) override {
+    rewire(stmt);
+  }
+
+ private:
+  void rewire(Stmt *stmt) {
+    const int n_op = stmt->num_operands();
+    for (int i = 0; i < n_op; i++) {
+      Stmt *op = stmt->operand(i);
+      if (op == nullptr)
+        continue;
+      auto it = clone_of_.find(op);
+      if (it != clone_of_.end())
+        stmt->set_operand(i, it->second);
+    }
+  }
+
+  const std::unordered_map<Stmt *, Stmt *> &clone_of_;
+};
+
+void rebuild_head_state_per_iteration(Block *root_block) {
+  // Snapshot the root statement order; positions stay valid because this pass
+  // only inserts statements into loop bodies.
+  std::vector<Stmt *> order;
+  std::unordered_map<Stmt *, int> root_pos;
+  const int n_root = (int)root_block->statements.size();
+  order.reserve(n_root);
+  for (int i = 0; i < n_root; i++) {
+    order.push_back(root_block->statements[i].get());
+    root_pos[order.back()] = i;
+  }
+
+  std::vector<Stmt *> allocas;
+  for (auto *stmt : order) {
+    if (auto *a = stmt->cast<AllocaStmt>()) {
+      // Block-tier shared-memory windows (qd.simt.block.SharedArray, lowered
+      // to is_shared allocas) are block-scoped by contract, not per-iteration
+      // head state: the block collectives declare them at func top level, so
+      // they land at kernel root after inlining and are written AND read by
+      // the block-tier loop. Rebuilding them per-iteration would give every
+      // virtual thread a private window and break the collectives.
+      if (a->is_shared)
+        continue;
+      allocas.push_back(stmt);
+    }
+  }
+  if (allocas.empty())
+    return;
+
+  // Union root allocas that alias each other (a root store to one alloca
+  // whose value chain reaches another root alloca, i.e. pointer allocas).
+  std::unordered_map<Stmt *, Stmt *> parent;
+  for (auto *a : allocas)
+    parent[a] = a;
+  auto find = [&parent](Stmt *x) {
+    while (parent[x] != x) {
+      parent[x] = parent[parent[x]];
+      x = parent[x];
+    }
+    return x;
+  };
+  for (auto *stmt : order) {
+    auto st = stmt->cast<LocalStoreStmt>();
+    if (st == nullptr || parent.find(st->dest) == parent.end())
+      continue;
+    for (auto *a : allocas) {
+      if (a != st->dest && chain_reaches(st->val, a, 0))
+        parent[find(st->dest)] = find(a);
+    }
+  }
+  std::unordered_map<Stmt *, Stmt *> cluster_rep;  // member -> representative
+  for (auto *a : allocas)
+    cluster_rep[a] = find(a);
+
+  for (auto *loop : order) {
+    const bool is_top_level_for =
+        loop->is<RangeForStmt>() || loop->is<StructForStmt>() || loop->is<MeshForStmt>();
+    if (!is_top_level_for)
+      continue;
+    // Strictly serialized range-fors keep the pre-fix semantics: a serialized
+    // loop is the language's way of expressing a *sequential* algorithm over
+    // iteration-carried head state (the algorithms' counting-sort histogram /
+    // digit scan annotate every loop with qd.loop_config(serialize=True) for
+    // exactly this reason, and their carries are load-bearing). Rebuilding
+    // those per-iteration would reset the carry each iteration and corrupt
+    // them. The unserialized loops are the ones the thread pool actually runs
+    // concurrently - the racy defect class this rebuild targets.
+    if (auto *rf = loop->cast<RangeForStmt>()) {
+      if (rf->strictly_serialized)
+        continue;
+    }
+
+    ScanHeadStateUses scan(cluster_rep);
+    loop->accept(&scan);
+    // Rebuild only the write-and-read clusters (the defect signature). A
+    // write-only cluster -- disjoint slice stores with the consumer after the
+    // loop -- is legal and race-free today; leave its promotion untouched.
+    std::set<Stmt *> rebuild_reps;
+    for (auto *rep : scan.written_reps()) {
+      if (scan.read_reps().count(rep) > 0)
+        rebuild_reps.insert(rep);
+    }
+    if (rebuild_reps.empty())
+      continue;
+
+    // Every member of every written-and-read cluster gets a per-iteration
+    // clone.
+    std::set<Stmt *> members;
+    for (const auto &entry : cluster_rep) {
+      if (rebuild_reps.count(entry.second) > 0)
+        members.insert(entry.first);
+    }
+
+    // Clone set in root order, strictly before the loop: member allocas plus
+    // their loop-free root-level prefix stores (the initialization the kernel
+    // source performs before the loop). Values produced by other root
+    // statements (consts, argloads, root arithmetic) stay put and reach the
+    // clones through the normal cross-task machinery, deterministically.
+    const int loop_pos = root_pos.at(loop);
+    std::unordered_map<Stmt *, Stmt *> clone_of;  // member alloca -> clone
+    std::set<Stmt *> has_prefix;
+    VecStatement cloned;
+    for (int i = 0; i < loop_pos; i++) {
+      Stmt *stmt = order[i];
+      const bool is_member_alloca = members.count(stmt) > 0;
+      const Stmt *dest = local_write_dest(stmt);
+      Stmt *hit_member = nullptr;
+      if (stmt->is<LocalStoreStmt>() && dest != nullptr) {
+        for (auto *m : members) {
+          if (chain_reaches(dest, m, 0)) {
+            hit_member = m;
+            break;
+          }
+        }
+      }
+      if (!is_member_alloca && hit_member == nullptr)
+        continue;
+      if (hit_member != nullptr)
+        has_prefix.insert(hit_member);
+      cloned.push_back(stmt->clone());
+      if (is_member_alloca)
+        clone_of[stmt] = cloned.back().get();
+    }
+    // Head allocas with no loop-free store before the loop get a zero init so
+    // per-iteration reads stay deterministic (this mirrors the zero init the
+    // promotion path used to give the shared slot).
+    for (auto *m : members) {
+      if (has_prefix.count(m) > 0 || clone_of.count(m) == 0)
+        continue;
+      auto alloca_type = clone_of.at(m)->ret_type.ptr_removed();
+      auto const_stmts = get_const_stmt_with_value(alloca_type, 0);
+      for (auto &s : const_stmts)
+        cloned.push_back(std::move(s));
+      Stmt *const_stmt = cloned.back().get();
+      cloned.push_back(Stmt::make<LocalStoreStmt>(clone_of.at(m), const_stmt));
+    }
+
+    Block *loop_body = nullptr;
+    if (auto *rf = loop->cast<RangeForStmt>())
+      loop_body = rf->body.get();
+    else if (auto *sf = loop->cast<StructForStmt>())
+      loop_body = sf->body.get();
+    else if (auto *mf = loop->cast<MeshForStmt>())
+      loop_body = mf->body.get();
+    QD_ASSERT(loop_body);
+    loop_body->insert(std::move(cloned), 0);
+    RewireHeadStateUses rewire(clone_of);
+    loop->accept(&rewire);
+  }
+}
+
 void insert_gc(IRNode *root, const CompileConfig &config) {
   auto *b = dynamic_cast<Block *>(root);
   QD_ASSERT(b);
@@ -800,6 +1106,12 @@ void associate_continue_scope(IRNode *root, const CompileConfig &config) {
 
 void offload(IRNode *root, const CompileConfig &config) {
   QD_AUTO_PROF;
+  // Per-iteration head state must be in place before task splitting, so the
+  // promotion below never sees a storing consumer in a loop task (see the
+  // rebuild_head_state_per_iteration comment block).
+  if (auto *root_block = dynamic_cast<Block *>(root)) {
+    rebuild_head_state_per_iteration(root_block);
+  }
   auto offloaded_ranges = Offloader::run(root, config);
   type_check(root, config);
   {

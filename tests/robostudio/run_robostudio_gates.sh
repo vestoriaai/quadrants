@@ -18,6 +18,11 @@
 # quadrants/bvh.py build/traversal/refit vs numpy-twin predicates + warp
 # wp.Bvh A/A; warp borrowed via QD_GATE_WARP_SP, its quadrants shadowed by
 # $QSP - path order matters; cpu+metal dual arm, 27 assertions each).
+# matrix with numpy twins), and gate 19 (CPU parallel-kernel head-declaration
+# state per-iteration - mujocoqd/cpu-head-state-per-iteration; CPU only:
+# head/serialize/body/read-only/computed-offset forms; unserialized loops
+# rebuild per-iteration, serialized loops keep pre-fix deterministic
+# semantics - ADJUDICATED R3 (2026-10-18), see the gate header).
 #   7  C2        probe_spirv_vectorize.py metal    -> ALL PASS (bitwise scalar==vec)
 #   8  R5        gate_r5_host_visible.py metal     -> RESULT: PASS (byte parity +
 #                  relative perf pins; small readback <=x0.5 default, 64MB <=x1.2)
@@ -51,7 +56,7 @@ trap 'rm -rf "$TMP"' EXIT
 
 [[ -x "$PY" ]] || { echo "FATAL: no venv python at $PY (create .venv-consolidated, see docs/build_robostudio.md)" >&2; exit 1; }
 
-PASS=0; NFAIL=0; TOTAL=18
+PASS=0; NFAIL=0; TOTAL=19
 gate_pass() { echo "gate $1/$TOTAL [$2]: PASS"; (( PASS = PASS + 1 )); }
 gate_fail() { echo "gate $1/$TOTAL [$2]: FAIL -- $3"; (( NFAIL = NFAIL + 1 )); }
 
@@ -334,6 +339,23 @@ else
   fi
   (( G18 )) && gate_pass 18 "qd-native BVH (cpu+metal)" || gate_fail 18 "qd-native BVH (cpu+metal)" "see arms above"
 fi
+# 19 CPU head-declaration state per-iteration (mujocoqd/cpu-head-state-per-iteration) ---
+# Head-declared scalars written AND read inside an UNSERIALIZED top-level loop
+# must rebuild per iteration inside the loop task (offload.cpp
+# rebuild_head_state_per_iteration), not live in a launch-shared global temp
+# (pre-fix: parallel race). Serialized range-fors keep their pre-fix
+# deterministic launch-shared accumulation - ADJUDICATED R3 (2026-10-18):
+# serialize=sequential-task semantics, loop-carried carry is the declared
+# contract (_cpu_paths.py docstring); the spec's serialize-form expectation
+# was wrong, corrected in the spec status section. Five forms x 20 launches:
+# head all-1, serialize deterministic 1..N, body all-1, read-only head
+# unchanged (promotion path bit-identical), computed-offset store
+# deterministic. Plus the write-only disjoint-slice head tensor consumed
+# post-loop (test_ret_4k class) which must stay on the promotion path. CPU only.
+"$PY" -u "$ROOT/tests/robostudio/gate_cpu_head_state.py" >"$TMP/g19.log" 2>&1 \
+  && grep -q "^RESULT: PASS" "$TMP/g19.log" \
+  && gate_pass 19 "cpu head state per-iteration" \
+  || { gate_fail 19 "cpu head state per-iteration" "output below"; tail -16 "$TMP/g19.log"; }
 
 echo "UNION GATE: $PASS/$TOTAL PASS"
 if (( NFAIL > 0 )); then echo "(logs kept in $TMP)"; trap - EXIT; exit 1; fi
