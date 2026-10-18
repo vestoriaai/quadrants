@@ -902,6 +902,9 @@ Value IRBuilder::cast(const SType &dst_type, Value value) {
       return ne(value, int_immediate_number(value.stype, 0));
     } else if (is_integral(from) && is_unsigned(from)) {  // UInt -> Bool
       return ne(value, uint_immediate_number(value.stype, 0));
+    } else if (is_real(from)) {  // Float -> Bool: C truthiness, NaN != 0 -> true
+      return make_value(spv::OpFUnordNotEqual, t_bool_, value,
+                        float_immediate_number(value.stype, 0));
     } else {
       QD_ERROR("do not support type cast from {} to {}", from.to_string(), to.to_string());
       return Value();

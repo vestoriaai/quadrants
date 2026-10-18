@@ -411,7 +411,15 @@ void TaskCodeGenLLVM::visit(UnaryOpStmt *stmt) {
     if (from == to) {
       llvm_val[stmt] = llvm_val[stmt->operand];
     } else if (to->is_primitive(PrimitiveTypeID::u1)) {
-      llvm_val[stmt] = builder->CreateIsNotNull(input);
+      if (is_real(from.get_element_type())) {
+        // C truthiness: x != 0.0 with NaN -> true (unordered compare). CreateIsNotNull
+        // is ICmpNE - illegal on float operands (LLVM AssertOK abort / illegal IR in
+        // release builds); an ordered one-compare would diverge on NaN (ledger A34).
+        llvm_val[stmt] = builder->CreateFCmpUNE(
+            input, llvm::ConstantFP::get(input->getType(), 0.0));
+      } else {
+        llvm_val[stmt] = builder->CreateIsNotNull(input);
+      }
     } else if (is_real(from.get_element_type()) != is_real(to.get_element_type())) {
       if (is_real(from.get_element_type()) && (is_integral(to.get_element_type()))) {
         cast_op = (is_signed(to.get_element_type())) ? llvm::Instruction::CastOps::FPToSI

@@ -56,7 +56,7 @@ trap 'rm -rf "$TMP"' EXIT
 
 [[ -x "$PY" ]] || { echo "FATAL: no venv python at $PY (create .venv-consolidated, see docs/build_robostudio.md)" >&2; exit 1; }
 
-PASS=0; NFAIL=0; TOTAL=19
+PASS=0; NFAIL=0; TOTAL=20
 gate_pass() { echo "gate $1/$TOTAL [$2]: PASS"; (( PASS = PASS + 1 )); }
 gate_fail() { echo "gate $1/$TOTAL [$2]: FAIL -- $3"; (( NFAIL = NFAIL + 1 )); }
 
@@ -356,6 +356,24 @@ fi
   && grep -q "^RESULT: PASS" "$TMP/g19.log" \
   && gate_pass 19 "cpu head state per-iteration" \
   || { gate_fail 19 "cpu head state per-iteration" "output below"; tail -16 "$TMP/g19.log"; }
+
+# 20 bool-cast C truthiness (mujocoqd/a34-bool-cast) ---------------------------
+# bool(<float>) must compile to C truthiness (NaN -> True, unordered compare)
+# on both backends; int/ptr path unchanged; implicit truthiness stays loudly
+# rejected. Pre-fix wheels abort (cpu) / loudly reject (metal) - the gate
+# process itself failing IS the regression signal (see ledger A34).
+G20=0
+"$PY" -u "$ROOT/tests/robostudio/probe_bool_cast.py" cpu >"$TMP/g20_cpu.log" 2>&1 \
+  && grep -q "BOOL CAST GATE \\[cpu\\]: ALL PASS" "$TMP/g20_cpu.log" && G20=1 \
+  || { echo "  bool-cast cpu arm: expected ALL PASS:"; tail -12 "$TMP/g20_cpu.log"; }
+if wait_gpu_idle; then
+  "$PY" -u "$ROOT/tests/robostudio/probe_bool_cast.py" metal >"$TMP/g20_metal.log" 2>&1 \
+    && grep -q "BOOL CAST GATE \\[metal\\]: ALL PASS" "$TMP/g20_metal.log" && G20=$((G20 + 1)) \
+    || { echo "  bool-cast metal arm: expected ALL PASS:"; tail -12 "$TMP/g20_metal.log"; }
+else
+  echo "  bool-cast metal arm: skipped (gpu-busy)"
+fi
+(( G20 == 2 )) && gate_pass 20 "bool-cast C truthiness (cpu+metal)" || gate_fail 20 "bool-cast C truthiness (cpu+metal)" "see arms above"
 
 echo "UNION GATE: $PASS/$TOTAL PASS"
 if (( NFAIL > 0 )); then echo "(logs kept in $TMP)"; trap - EXIT; exit 1; fi
