@@ -34,8 +34,18 @@ Rules (see docs/robostudio ledger, mujocoqd/compiler-line M2):
 - `return` inside loops additionally emits `break` — EXCEPT in a kernel's outermost
   (parallelized) loop, where break is forbidden by the front-end; there the remaining loop
   body is simply guarded and the loop runs out (semantically equal, SIMT-free early exit).
-- Subtrees inside `qd.static(...)` control flow are left untouched: static returns are
-  already legal and are compile-time.
+- Subtrees inside `qd.static(...)` control flow keep their static test/iter (the walk
+  still evaluates them), but any bare `return` inside is rewritten with the same
+  single-exit machinery. This is condition-value-agnostic by construction: the pass
+  runs before the walk that evaluates qd.static, so it cannot know TRUE/FALSE — and
+  doesn't need to. TRUE branch: the slot stores execute and everything after is
+  guard-dead; FALSE branch: the walk prunes the branch and the stores never run.
+  Leaving static returns untouched would embed a bare return inside runtime control
+  flow — this pass's own `if __er_done == 0:` guard runs (a static-TRUE return after
+  a runtime return; ledger A32), or an enclosing runtime if when the static site
+  sits pre-return in the block — and trip the front-end's "Return inside non-static
+  if/for" rejection either way. Rewritten pre-return sites register as return-sites
+  through their new done-stores, so followers get the guards they need.
 - Loud rejections: nested-tuple returns (tuple annotations containing a tuple) and
   struct/custom-class returns — for those shapes use a manual single-exit (flag-guard)
   function; mixed bare/value returns; return sites with inconsistent arity (a short return
@@ -70,6 +80,23 @@ def _contains_done_store(stmts):
                 for t in node.targets:
                     if isinstance(t, ast.Name) and t.id == _DONE:
                         return True
+    return False
+
+
+def _contains_return(node):
+    """True if the subtree still holds a bare `ast.Return` (untouched static sites keep them)."""
+    for n in ast.walk(node):
+        if isinstance(n, ast.Return):
+            return True
+    return False
+
+
+def _is_static_site(node):
+    """True for a compile-time control node transform_stmt leaves untouched (A32)."""
+    if isinstance(node, ast.If):
+        return _is_static_call(node.test)
+    if isinstance(node, ast.For):
+        return _is_static_call(node.iter)
     return False
 
 
@@ -172,6 +199,20 @@ class _Rewriter:
         )
         return _stamp_deep(ast.If(test=test, body=list(stmts), orelse=[]), self.ctx.loc)
 
+    def _rewrite_static_site(self, st, loop_depth):
+        """Rewrite bare returns inside a `qd.static(...)` control node with the normal
+        single-exit machinery (A32). Condition-value-agnostic by construction: this pass
+        runs before the walk that evaluates qd.static, so it cannot (and need not) know
+        TRUE/FALSE. TRUE branch: slot stores execute, everything after is guard-dead;
+        FALSE branch: the walk prunes the branch, the stores never run. The node keeps
+        its static test/iter so the walk still eliminates the dead branch. loop_depth is
+        passed through unchanged - static control adds no runtime nesting, so break
+        emission follows the enclosing runtime loop only."""
+        st.body, _ = self.transform_block(st.body, loop_depth)
+        if st.orelse:
+            st.orelse, _ = self.transform_block(st.orelse, loop_depth)
+        return _stamp_deep(st, getattr(st, "lineno", 1))
+
     def transform_block(self, stmts, loop_depth):
         out = []
         seen_return = False
@@ -189,6 +230,16 @@ class _Rewriter:
                     out.extend(new_st)
                     seen_return = True
                 break
+            if _is_static_site(new_st) and _contains_return(new_st):
+                # qd.static if/loop holding bare returns: left as-is they end up inside
+                # runtime control flow at walk time - inside this block's own guard run
+                # `if __er_done == 0:` when the site is post-return (ledger A32:
+                # static-TRUE return after a runtime return), or inside the enclosing
+                # runtime if when it sits pre-return. Rewrite unconditionally of
+                # position; rewritten pre-return sites register as return-sites via
+                # their new done-stores, which is exactly the followers-need-guards
+                # semantics.
+                new_st = self._rewrite_static_site(new_st, loop_depth)
             if seen_return:
                 if _contains_done_store([new_st]):
                     # a sibling return-site (return nested in an if/for/while): it needs
