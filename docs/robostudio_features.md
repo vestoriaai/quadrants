@@ -1,5 +1,5 @@
 <!-- INDEX — merged lines (newest last; each entry's full section via its header below) -->
-<!-- qd-copy-api 2ce5a850 · c2-emitter-fixes 83b2d1a2 · subgroup-cpu-support 8ebf8620 · reassociate-flag 19ff0276 · reassoc-subgroup-probe 9372c300 · r5-host-visible 67e27bc4 · spirv-vectorize 68bd7965 · algorithms-2 b12c125c · compiler-line 33e7dabf · n2-to-numpy-type 4a76ce7c · a10-nested-loop-raw c52711b5 · a19-stlf-fallback 3793c86d · a20-loop-var-scope 01d2037e · metal-i64 01d2037e · a7-m2-compound 869a00a0 · qd-native-bvh 76541b81 · cpu-head-state-per-iteration 4a400a11 -->
+<!-- qd-copy-api 2ce5a850 · c2-emitter-fixes 83b2d1a2 · subgroup-cpu-support 8ebf8620 · reassociate-flag 19ff0276 · reassoc-subgroup-probe 9372c300 · r5-host-visible 67e27bc4 · spirv-vectorize 68bd7965 · algorithms-2 b12c125c · compiler-line 33e7dabf · n2-to-numpy-type 4a76ce7c · a10-nested-loop-raw c52711b5 · a19-stlf-fallback 3793c86d · a20-loop-var-scope 01d2037e · metal-i64 01d2037e · a7-m2-compound 869a00a0 · qd-native-bvh 76541b81 · cpu-head-state-per-iteration 4a400a11 · a32-static-return-order e0f35bdd · a34-bool-cast 91351dbd · a37-compile-uaf 345dd750 -->
 
 # robostudio_features.md — features ledger for robostudio-main
 
@@ -1100,3 +1100,68 @@ test_state_history_get_set`:旧 wheel = A19 assert 拒编译(FAIL);新 wheel =
   gate/电池前清 ~/.cache/quadrants/qdcache;归缓存键线);④metal 端到端冻结中
   (arch 无关变换,metal 臂经其余 gate 间接覆盖);⑤mujoqo 侧 10+ 序列化 workaround
   的移除回归归集成线。
+
+## A32 — early_return:static-if-return 位于 runtime return 后的 SyntaxError 根修(mujocoqd/a32-static-return-order,e0f35bdd)
+- **设计**:early_return 单出口重写跑在 IR 构建 walk 之前的 Python AST 层,而
+  `qd.static` 条件到 walk 时才求值(call_transformer)——重写器拿不到 TRUE/FALSE。
+  原实现对 static 子树"原样保留",首个 runtime return 之后的 static-if-return 被
+  塞进 `if __er_done == 0:` runtime 守卫 run,裸 return 落进非静态 if → 前端
+  "Return inside non-static if/for" 响亮拒绝(solver linesearch max_condim=4
+  dispatch 唯一宿主,286e62f workaround 绕行)。修 = transform_block 对含裸 return
+  的 qd.static 节点就地对子树套用本 pass 自身机制,**条件值无关 + 位点无关**
+  (TRUE:槽赋值执行+后继守卫死;FALSE:walk 期剪除;前 return 位点靠新 done-store
+  注册为 return-site,顺带闭合嵌套 runtime-if 内 static return 的漏守卫缺口);
+  无 return 的静态子树字节不变。
+- **数字**:AST 级单元矩阵 14/14(mujoqo `_probe/a32_transformer_unittest.py`);
+  三态 oracle 探针(`_probe/a32_static_if_after_er.py`)dev109=REPRODUCED / 修复
+  wheel=FIXED(含嵌套/静态循环/FALSE 分支/factory 回归臂);upstream test_return
+  **46/46**;union runner 19/19(gate 17 early-return compound F1-F14 绿)。
+- **footprint**:`early_return_transformer.py` 单文件 +55/−2;`docs/
+  a32_static_return_order_development_spec.md`;探针三件在 mujoqo `_probe/`。
+- **限制**:①286e62f port 侧 workaround 的还原归 mujoqo 独立 commit(未做,可选);
+  ②gate 17 是该 pass 的常驻回归面,禁回退。
+
+## A34 — cast f32→u1 双后端 C 真值化(mujocoqd/a34-bool-cast,91351dbd)
+- **设计**:`bool(<float>)` 走 `Expr::cast(x,u1)`;LLVM cast_value u1 分支
+  CreateIsNotNull(=ICmpNE)对 float 非法(assertions-on wheel 必崩 assert
+  AssertOK,Release=非法 IR 静默 miscompile 风险),SPIR-V 响亮拒(cast@906)。
+  修 = real 操作数发**显式无序比较**:LLVM `CreateFCmpUNE(input, ConstantFP 0.0)`,
+  SPIR-V `OpFUnordNotEqual(vs float 零立即数)`;int/ptr 保持 CreateIsNotNull。
+  前端单点改写(F 案)被定性矩阵否决:qd 浮点 `!=` 的 NaN 语义双后端不一致
+  (cpu ordered / metal 经 MSL 塌缩 unordered),复用 `!=` 会复制 cpu 的错语义;
+  该分歧独立观察项另立。
+- **数字**:双后端探针矩阵全过——int2bool 零回归(cpu+metal);flt2bool cpu
+  **abort 134→PASS**、metal 响亮拒→PASS;nan2bool 双后端 **[F,T,T,T] C 语义
+  (NaN→True)**;ifflt 双后端保持响亮拒。test_return **46/46**;union runner
+  19/19(合并前口径)。
+- **footprint**:`codegen_llvm.cpp` +10/−1;`spirv_ir_builder.cpp` +3;**gate 20**
+  (`probe_bool_cast.py` cpu+metal 硬断言,含 NaN 案例与隐式真值响亮拒检查;
+  runner TOTAL 19→20,metal 臂 wait_gpu_idle);mujoqo 探针两件(三案例 +
+  定性矩阵)。
+- **限制**:①浮点 `!=` 的 NaN 双后端分歧保持原样(观察项,修则 cpu 侧对齐 C=unordered);
+  ②port 侧 support.py 的 `!= 0.0` workaround 可还原 `bool()` 原形(mujoqo 独立
+  commit,未做,可选);③隐式真值 `if <real>:` 维持响亮拒(设计如此)。
+
+## A37 — Function::store_dests 生命周期根修 + gate14 x3 共识(mujocoqd/a37-compile-uaf,345dd750)
+- **设计**:非确定性 SIGSEGV(compile_kernel → __dynamic_cast 野指针;21 份 crash
+  report 同栈异址;宿主 = 含 FuncCallStmt(real_func) 的 kernel;暴露率随进程内存
+  布局浮动,缓存/transformer 内容无关)。符号化崩链 = cfg_optimization →
+  ControlFlowGraph::store_to_load_forwarding → reaching_definition_analysis →
+  control_flow_graph.cpp:370 对野指针 dyn_cast。根因:`Function::store_dests`
+  (指向 real_func IR 的持久裸指针集合)在 gather_func_store_dests 中**只增不清**,
+  跨 IR 阶段/跨 top-level 编译累积过期指针,经 `FuncCallStmt::func->store_dests →
+  reach_gen` 进入分析被 dyn_cast。修 = SCC pop 处 `store_dests.clear()` 后再
+  insert(唯一消费者即 CFG 分析)。附带:union runner gate 14(UAF 宿主探针)改
+  **3 连跑一致性**(单跑绿=侥幸,实证一轮 19/19 同窗口 21 进程崩、复跑 18/19);
+  docs/qd_compiler_dev_notes.md §8 收三线机理。
+- **数字**:census(mujoqo `_probe/a37_uaf_census.py`,高暴露 uv-python)修复前
+  **6/6 SIGSEGV → 修复后 N=10 STABLE**;test_return **46/46**;union runner 19/19
+  (gate 14 x3 真绿)。
+- **footprint**:`gather_func_store_dests.cpp` +9/−1;runner gate 14 块 x3 化;
+  `docs/qd_compiler_dev_notes.md` +31;mujoqo 探针三件(census/asan_run/st1)。
+- **限制**:①崩溃因果诚实挂账——暴露窗随机器状态漂移(pre-fix 曾 6/6 崩 → 验证
+  时 0/16 全不崩),"旧崩新稳"对照未当场完成,A37 保持 open,census oracle 在案,
+  暴露窗复现时补判定;②ASAN 在 macOS python 扩展主机不可行(linker-signed 忽略
+  DYLD_INSERT;重签名后 runtime 自检败,harness 留档);③trash_bin 全程无 flush
+  = A24 "IR 驻留不释放"机理(本线只记账未修);④符号化 recipe = build 树 link.txt
+  去 `-Wl,-S` 手工重链(dev_notes §8.5)。
