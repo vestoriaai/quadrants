@@ -31,6 +31,15 @@ class GatherFuncStoreDests : public BasicStmtVisitor {
         auto top = tarjan_data.func_stack.top();
         tarjan_data.func_stack.pop();
         tarjan_data.func_in_stack.erase(top);
+        // A37: store_dests persists on the Function across IR-stage advances and
+        // top-level compiles, but the pointers reference this gather's tree state.
+        // Inserting without clearing keeps stale pointers from previous stages
+        // alive in the set; ControlFlowGraph::reaching_definition_analysis then
+        // dyn_casts them (control_flow_graph.cpp data_source_ptr->is<...>), which
+        // is a dangling-pointer read once the owning tree is gone (nondeterministic
+        // SIGSEGV - ledger A37) and semantically wrong even while the trash_bin
+        // keeps the corpses alive.
+        top->store_dests.clear();
         top->store_dests.insert(searcher.results_.begin(), searcher.results_.end());
         if (top == func) {
           break;

@@ -155,3 +155,34 @@
    每遍都必须包 push/pop_value_scope(prologue 与 vector walk 均已包),漏包则
    `register_value "tmpNN already exists"`。循环后按名查询的只有 alloca 与任务级值,
    注册于 push 之前,不受 pop 影响。
+
+## 8. A32/A34/A37 三线新机理(2026-10-18,mujocoqd/a32|a34|a37 worktree;合并时随各线落主)
+
+1. **early_return × qd.static 排序(A32,已修)**:early_return 重写跑在 IR 构建
+   walk 之前的 Python AST 层,而 `qd.static` 条件到 walk 时才求值——重写器拿不到
+   TRUE/FALSE,所以 transform_block 对"含裸 return 的 qd.static 节点"必须做
+   **条件值无关重写**(TRUE:槽赋值执行+后继守卫死;FALSE:walk 期剪除),位点无关
+   (前 return 位点的 static 节点靠新 done-store 注册为 return-site,后继守卫才对)。
+   原样保留 static 子树会把裸 return 塞进 runtime 守卫 run → "Return inside
+   non-static if/for"。
+2. **cast_value→u1 的浮点语义(A34,已修)**:`bool(f)` 走 `Expr::cast(x,u1)` 到各
+   后端;LLVM 用 CreateIsNotNull(=ICmpNE)对 float 非法(assert abort/Release 非法
+   IR),SPIR-V 原响亮拒。现两后端对 real 操作数发**显式无序比较**(FCmpUNE /
+   OpFUnordNotEqual,C 语义 NaN→true);int/ptr 仍 CreateIsNotNull。**注意**:qd 浮点
+   `!=` 的 NaN 语义双后端不一致(cpu ordered / metal 经 MSL 塌缩为 unordered)——
+   前端若复用 `!=` 做真值化会在 cpu 复刻错值;任何新真值化语义必须显式 unordered
+   并带 NaN 门禁(观察项另立)。
+3. **Function::store_dests 生命周期(A37,已修)**:store_dests 是 Function 上的持久
+   `unordered_set<Stmt*>`,gather_func_store_dests 每 top-level 编译跑两遍且原先只增
+   不清——旧阶段指针混进集合,经 `FuncCallStmt::func->store_dests → reach_gen` 进
+   stlf 分析被 dyn_cast(control_flow_graph.cpp:370),所在树析构即悬垂(非确定性
+   SIGSEGV,布局敏感)。修 = SCC pop 处 clear 后再 insert。**通用律**:凡是挂在
+   Callable/Function 这类长寿命对象上的 Stmt* 集合,重收集必须先清,禁止跨阶段累积。
+4. **trash_bin 无 flush = IR 驻留(A24 机理补钉)**:Block::erase / replace_with 把
+   被替语句移入 `Block::trash_bin` 后**全程无人清空**——被 erase 的语句永活。这也是
+   "编译后 IR 驻留不释放"的机理;追悬垂指针时勿把 trash_bin 尸体当 free 源。
+5. **符号化工程**:RelWithDebInfo 不粘性之外,**链接行固定带 `-Wl,-S`**——wheel 与
+   build 树 .so 均无 DWARF。需要符号化:取 build 树 link.txt 去掉 `-Wl,-S` 手工重链
+   (代码布局不变,可对 release 崩溃偏移直接 atos)。ASAN 对 python 扩展主机不可行
+   (uv python linker-signed 忽略 DYLD_INSERT;重签名后 runtime 自检仍败);退路 =
+   MallocStackLogging + lldb memory history(注意 lite/full 模式选择会扰动暴露率)。

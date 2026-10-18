@@ -252,10 +252,20 @@ fi
 # this dies at control_flow_graph.cpp store_to_load_forwarding@425; with the
 # fix it must compile through and match the pinned outputs (see the probe
 # header for the pre-existing ray_geom dist-field note).
-"$PY" -u "$ROOT/tests/robostudio/probe_a19_stlf_fallback.py" >"$TMP/g14.log" 2>&1 \
-  && grep -q "RESULT: PASS" "$TMP/g14.log" \
-  && gate_pass 14 "a19 stlf fallback" \
-  || { gate_fail 14 "a19 stlf fallback" "output below"; tail -16 "$TMP/g14.log"; }
+# A37 (2026-10-18): this probe is also the host of a nondeterministic
+# compiler-side UAF (SEGV inside compile_kernel -> __dynamic_cast on a
+# dangling pointer, exposure depends on process memory layout). A single
+# run passing is luck - the gate therefore requires N=3 consecutive clean
+# runs (any nonzero exit = FAIL) until the UAF is fixed and the census
+# (mujoqo _probe/a37_uaf_census.py) goes STABLE.
+G14_OK=1
+for g14i in 1 2 3; do
+  "$PY" -u "$ROOT/tests/robostudio/probe_a19_stlf_fallback.py" >"$TMP/g14_$g14i.log" 2>&1 \
+    && grep -q "RESULT: PASS" "$TMP/g14_$g14i.log" || { G14_OK=0; tail -16 "$TMP/g14_$g14i.log"; break; }
+done
+(( G14_OK == 1 )) \
+  && gate_pass 14 "a19 stlf fallback (x3 consensus)" \
+  || gate_fail 14 "a19 stlf fallback (x3 consensus)" "output above"
 
 # 15 A20 branch-scope NameError (mujocoqd/a20-loopvar-scope) --------------------
 # A name first bound inside a runtime if branch / loop body is invisible after
