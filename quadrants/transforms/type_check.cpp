@@ -87,6 +87,16 @@ class TypeCheck : public IRVisitor {
   }
 
   void visit(LocalStoreStmt *stmt) override {
+    // A37-line diagnostic: a store operand whose ret_type was never type-checked
+    // trips ptr_removed on a null DataType inner pointer. Name it loudly instead
+    // of faulting on recycled memory (ledger A37 statement-use-after-free).
+    if (!stmt->val->ret_type) {
+      std::string val_ir;
+      irpass::print(stmt->val, &val_ir, true, false);
+      ErrorEmitter(QuadrantsRuntimeError(), stmt->val,
+                   fmt::format("[A37DBG] LocalStore val has NULL ret_type (created at {}).\n{}",
+                               stmt->val->get_tb(), val_ir));
+    }
     if (stmt->dest->ret_type->is_primitive(PrimitiveTypeID::unknown)) {
       // Infer data type for alloca
       stmt->dest->ret_type = stmt->val->ret_type;
@@ -151,6 +161,14 @@ class TypeCheck : public IRVisitor {
   }
 
   void visit(GlobalStoreStmt *stmt) override {
+    // A37-line diagnostic (see visit(LocalStoreStmt)).
+    if (!stmt->val->ret_type) {
+      std::string val_ir;
+      irpass::print(stmt->val, &val_ir, true, false);
+      ErrorEmitter(QuadrantsRuntimeError(), stmt->val,
+                   fmt::format("[A37DBG] GlobalStore val has NULL ret_type (created at {}).\n{}",
+                               stmt->val->get_tb(), val_ir));
+    }
     type_check_store(stmt, stmt->dest, stmt->val);
   }
 

@@ -37,6 +37,11 @@ description: quadrants(Taichi fork)编译器/运行时源码开发的能力速�
 4. 递归 walk 的注册用 push/pop_value_scope 配对(prologue 既有模式)。
 5. 旗标 OFF 路径必须逐位不变(union gate 7/9 是硬门);新旗标三件套 = compile_config.h + export_lang.cpp + offline_cache_util.cpp。
 6. batch 改写:全 parse 过再统一 write(带病落盘 = 返工);探针必须断言。
+7. **DelayedIrModifier/语句所有权(A37 教训)**:被任何存活语句持裸指针的新节点,
+   `unique_ptr` 必须 insert 进 IR——循环局部 unique_ptr 离开作用域即析构,漏 insert =
+   语句级 UAF(崩/错值随堆布局浮动)。归因配方:`MallocStackLogging=full` +
+   `malloc_history -fullStacks <pid> <addr>`(lite 模式只见 VM 事件,不能归因语句)+
+   构建树重链 `-Wl,-map` 符号化 alloc/free 栈。
 
 ## 流程
 

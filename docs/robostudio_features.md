@@ -1165,6 +1165,17 @@ test_state_history_get_set`:旧 wheel = A19 assert 拒编译(FAIL);新 wheel =
   DYLD_INSERT;重签名后 runtime 自检败,harness 留档);③trash_bin 全程无 flush
   = A24 "IR 驻留不释放"机理(本线只记账未修);④符号化 recipe = build 树 link.txt
   去 `-Wl,-S` 手工重链(dev_notes §8.5)。
+- **扩展(2026-10-19,本 squash)**:①同族第二例 UAF 根因定案——scalarize 循环
+  语句所有权(familyr worktree tip 的陈旧 A42 中间版缺 v2/v3 所有权 insert;落地
+  squash 57391b9f 为正确形态,SSOT 无此洞;因果对照 familyr 布局 pre 3/3 崩 →
+  post 5/5 正确);归因配方 `MallocStackLogging=full` + `malloc_history -fullStacks`
+  (lite 只记 VM 事件,不可语句级归因)+ 重链 `-Wl,-map` 符号化 alloc/free 栈,
+  收入 qd-compiler skill 修复模式。②`TypeCheck::visit(Local/GlobalStore)` 增
+  null store-operand ret_type 守卫(ErrorEmitter 出具 IR+源行)——语句生命周期
+  回归的常设响亮化层。③验证:dev123+gc0b58c09 wheel int2bool 5/5、test_return
+  46/46、union runner **21/21**(gate 14 x3 含)。④限制:SSOT 自身未表现过此洞
+  (守卫为预防层);ownership 审计 pass(IR operand 存活性断言,估 ~50 行)评估
+  为可选拍板项,未动手——malloc_history 只解归因不解检测,错值形态曾无崩溃签名。
 
 ## Family R — real_func × 复合值/控制流全方向修复 + A42 scalarize 泛化(mujocoqd/familyr-realfunc-composite)
 - **设计**:两笔编译器修复 + 一笔分析鲁棒性修复,同一 worktree 线落地:
