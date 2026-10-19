@@ -9,7 +9,7 @@ Genesis AI Taichi fork 的 robostudio 部署分支。**`robostudio-main` 为 sin
 1. **开工**:从 robostudio-main HEAD 切 `mujocoqd/<line-name>`;任务书写明白范围/验收/footprint 预算。
 2. **最小可维护**:footprint(+LOC、触及核心文件)与收益同为一等指标,ledger 条目必写;休眠机制(默认 OFF 且无实测收益)原则上不合入;禁顺手重构。
 3. **门禁**:`tests/robostudio/run_robostudio_gates.sh <venv>` 全绿(门数以 runner 头注为准)+ 上游 `pytest tests/python/test_return.py`(46/46)+ 本线新 gate 进 runner。
-4. **ledger**:每条线在 `docs/robostudio_features.md` 加条目(设计/数字/footprint/限制);编译器 bug 进 mujoqo 的 `docs/quadrants-需求清单.md` A 系列(带最小复现,复现件进 `_probe/` 或 `cs_evidence/`,**/tmp 视为不存在**)。
+4. **ledger**:每条线在 `docs/robostudio_features.md` 加条目(设计/数字/footprint/限制);编译器 bug 进 mujoqo 的 `docs/quadrants-需求清单.md` A 系列(带最小复现,复现件进 `_probe/` 或 `cs_evidence/`,**/tmp 视为不存在**)。**每线理论上只有一个 commit(squash 本身),没有其他**——ledger 条目随 squash 同 commit 落库;INDEX 行的 sha 回填**不再单独开 docs commit**(自引用问题:commit tree 无法包含自身 sha),顺带在下一线合并时补或省略(2026-10-19 用户裁定,废除旧的"INDEX 回填 follow-up commit"惯例)。
 5. **提交**:英文 subject,结尾 `Co-Authored-By: Claude Code <noreply@anthropic.com>`;小步提交。
 
 ## 多 agent 并行(2026-10-12 事故后成文)
