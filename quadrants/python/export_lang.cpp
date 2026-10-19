@@ -192,6 +192,11 @@ void export_lang(nb::module_ &m) {
               "Run the control-flow-graph optimization pass that simplifies kernel branches and loops. Disabling it "
               "speeds up compilation at a small runtime cost. Only runs when advanced_optimization is on and "
               "opt_level > 0 (both true by default).")
+      .def_rw("cfg_auto_skip_threshold", &CompileConfig::cfg_auto_skip_threshold,
+              "Skip the cfg_optimization pass when a kernel's IR statement count exceeds this threshold: the pass's "
+              "data structures scale superlinearly, which dominates compile time and memory on huge kernels. 0 "
+              "disables the skip; default 150000 (above every legitimate kernel). The skip changes codegen, so the "
+              "value participates in the offline cache key.")
       .def_rw("check_out_of_bound", &CompileConfig::check_out_of_bound,
               "Enable the field out-of-bounds check on tensor indexing without turning on the rest of debug mode. "
               "Reset to off (with a warning) on backends without assertion support, i.e. Vulkan and Metal.")

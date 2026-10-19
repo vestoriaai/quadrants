@@ -588,11 +588,23 @@ void full_simplify(IRNode *root, const CompileConfig &config, const FullSimplify
       // franka/duck/box_pyramid) for zero extra benefit, so it is now a single call in compile_to_offloads.
       // Don't do this time-consuming optimization pass again if the IR is
       // not modified.
-      if (config.opt_level > 0 && first_iteration && config.cfg_optimization &&
-          cfg_optimization(config, root, args.after_lower_access, args.autodiff_enabled,
-                           !config.real_matrix_scalarize && !config.force_scalarize_matrix, std::nullopt,
-                           args.kernel_name, args.phase))
-        modified = true;
+      if (config.opt_level > 0 && first_iteration && config.cfg_optimization) {
+        // A24 Phase 1: the pass's data structures scale superlinearly with IR
+        // size; on huge kernels they dominate compile time and memory (swap
+        // blowout measured at suite scale). Skip above the threshold - the
+        // generated code stays semantically identical, only less optimized.
+        const bool over_threshold =
+            config.cfg_auto_skip_threshold != 0 &&
+            analysis::count_statements(root) > config.cfg_auto_skip_threshold;
+        if (over_threshold) {
+          QD_WARN("cfg_optimization skipped for kernel {}: statement count exceeds cfg_auto_skip_threshold={}",
+                  args.kernel_name, config.cfg_auto_skip_threshold);
+        } else if (cfg_optimization(config, root, args.after_lower_access, args.autodiff_enabled,
+                                    !config.real_matrix_scalarize && !config.force_scalarize_matrix,
+                                    std::nullopt, args.kernel_name, args.phase)) {
+          modified = true;
+        }
+      }
       if (should_dump)
         dump_step("12_cfg_optimization", iteration);
       first_iteration = false;

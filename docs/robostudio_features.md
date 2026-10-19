@@ -1,5 +1,5 @@
 <!-- INDEX — merged lines (newest last; each entry's full section via its header below) -->
-<!-- qd-copy-api 2ce5a850 · c2-emitter-fixes 83b2d1a2 · subgroup-cpu-support 8ebf8620 · reassociate-flag 19ff0276 · reassoc-subgroup-probe 9372c300 · r5-host-visible 67e27bc4 · spirv-vectorize 68bd7965 · algorithms-2 b12c125c · compiler-line 33e7dabf · n2-to-numpy-type 4a76ce7c · a10-nested-loop-raw c52711b5 · a19-stlf-fallback 3793c86d · a20-loop-var-scope 01d2037e · metal-i64 01d2037e · a7-m2-compound 869a00a0 · qd-native-bvh 76541b81 · cpu-head-state-per-iteration 4a400a11 · a32-static-return-order e0f35bdd · a34-bool-cast 91351dbd · a37-compile-uaf 4da921ff · familyr-realfunc-composite 57391b9f · audit-lint 2bb6b7f4 · ruff-import-sort 41175f2a · a46-recursion-guard (this) -->
+<!-- qd-copy-api 2ce5a850 · c2-emitter-fixes 83b2d1a2 · subgroup-cpu-support 8ebf8620 · reassociate-flag 19ff0276 · reassoc-subgroup-probe 9372c300 · r5-host-visible 67e27bc4 · spirv-vectorize 68bd7965 · algorithms-2 b12c125c · compiler-line 33e7dabf · n2-to-numpy-type 4a76ce7c · a10-nested-loop-raw c52711b5 · a19-stlf-fallback 3793c86d · a20-loop-var-scope 01d2037e · metal-i64 01d2037e · a7-m2-compound 869a00a0 · qd-native-bvh 76541b81 · cpu-head-state-per-iteration 4a400a11 · a32-static-return-order e0f35bdd · a34-bool-cast 91351dbd · a37-compile-uaf 4da921ff · familyr-realfunc-composite 57391b9f · audit-lint 2bb6b7f4 · ruff-import-sort 41175f2a · a46-recursion-guard 96cbd731 · a24-phase1-cfg-threshold (this) -->
 
 # robostudio_features.md — features ledger for robostudio-main
 
@@ -1176,6 +1176,23 @@ test_state_history_get_set`:旧 wheel = A19 assert 拒编译(FAIL);新 wheel =
   46/46、union runner **21/21**(gate 14 x3 含)。④限制:SSOT 自身未表现过此洞
   (守卫为预防层);ownership 审计 pass(IR operand 存活性断言,估 ~50 行)评估
   为可选拍板项,未动手——malloc_history 只解归因不解检测,错值形态曾无崩溃签名。
+
+## a24-phase1-cfg-threshold — cfg pass 大 kernel 阈值让位(ledger A24 Phase 1)
+- **设计**:`CompileConfig::cfg_auto_skip_threshold`(默认 150000,0=禁用):
+  full_simplify 的 cfg pass 调用点先数语句(`analysis::count_statements`),
+  超阈值 → QD_WARN 点名 kernel 并跳过该 pass。依据:cfg pass 数据结构随 IR
+  规模超线性(A24 归因),套件级 cfg-ON 跑实测把用户磁盘经 swap 吃掉 10+GB、
+  墙钟 29min vs OFF 12min;跳过仅降低优化强度,语义不变(kernel 级 ON==OFF
+  逐位一致,Phase 0 隔离实验)。旗标三件套:compile_config.h/cpp +
+  export_lang.cpp + offline_cache_util cache key(跳过改变 codegen)。
+- **数字**:单元三臂(threshold=50 WARN 命中+结果正确 / =0 无 WARN / 默认)
+  结果逐位一致 478.783386;union 21/21 × {默认,audit};test_return 46/46;
+  ruff 归零;clang-tidy 4 文件 0 repo warnings。
+- **footprint**:config.h +6、config.cpp +1、cache util +1、export +5、
+  simplify.cpp +13/−4、spec 文档。默认行为零变化(150k 高于一切合法 kernel)。
+- **限制**:阈值静态(非自适应);QD_WARN 为唯一信号,无 per-kernel 统计导出;
+  同族 Phase 2(trash_bin flush)实测受环境方差支配(套件级 ±50%),维持
+  暂缓不合入(机制留分支 45183711,含 revert 记录 3d486bc3);Phase 3 正式关闭。
 
 ## a46-recursion-guard — @qd.func 递归环响亮检测(ledger A46,mujocoqd/a46-recursion-guard)
 - **设计**:前端内联加 thread-local in-progress func 栈(func 对象身份),重入 =

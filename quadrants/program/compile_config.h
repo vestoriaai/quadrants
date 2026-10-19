@@ -9,6 +9,10 @@ struct CompileConfig {
   Arch arch;
   bool debug;
   bool cfg_optimization;
+  // A24 Phase 1: skip the cfg pass for kernels whose IR statement count exceeds
+  // this threshold (its data structures scale superlinearly on huge kernels).
+  // 0 disables the skip; default chosen above every legitimate kernel.
+  std::size_t cfg_auto_skip_threshold;
   bool check_out_of_bound;
   bool validate_autodiff;
   int simd_width;
