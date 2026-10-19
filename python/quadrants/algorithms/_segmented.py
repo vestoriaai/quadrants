@@ -46,7 +46,8 @@ reuse the same space sequentially). No on-device sufficiency check (graph-captur
 
 from quadrants.lang.impl import current_cfg, static
 from quadrants.lang.kernel_impl import func as _func
-from quadrants.lang.misc import cpu as _arch_cpu, loop_config
+from quadrants.lang.misc import cpu as _arch_cpu
+from quadrants.lang.misc import loop_config
 from quadrants.lang.ops import atomic_add, bit_cast
 from quadrants.lang.simt import block as _block
 from quadrants.types.annotations import template
@@ -54,11 +55,11 @@ from quadrants.types.primitive_types import i32, u32, u64
 
 from ._cpu_paths import _cpu_seg_radix_sort
 from ._radix_sort import (
+    _TWIDDLE_KEY_DTYPES,
     RADIX_BITS,
     RADIX_DIGITS,
     _key_width_bits,
     _radix_twiddle,
-    _TWIDDLE_KEY_DTYPES,
 )
 from ._reduce import BLOCK_DIM, _validate_log256_max_n
 from ._scan import _emit_exclusive_scan_add

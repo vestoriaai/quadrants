@@ -1,5 +1,5 @@
 <!-- INDEX — merged lines (newest last; each entry's full section via its header below) -->
-<!-- qd-copy-api 2ce5a850 · c2-emitter-fixes 83b2d1a2 · subgroup-cpu-support 8ebf8620 · reassociate-flag 19ff0276 · reassoc-subgroup-probe 9372c300 · r5-host-visible 67e27bc4 · spirv-vectorize 68bd7965 · algorithms-2 b12c125c · compiler-line 33e7dabf · n2-to-numpy-type 4a76ce7c · a10-nested-loop-raw c52711b5 · a19-stlf-fallback 3793c86d · a20-loop-var-scope 01d2037e · metal-i64 01d2037e · a7-m2-compound 869a00a0 · qd-native-bvh 76541b81 · cpu-head-state-per-iteration 4a400a11 · a32-static-return-order e0f35bdd · a34-bool-cast 91351dbd · a37-compile-uaf 345dd750 · familyr-realfunc-composite 57391b9f -->
+<!-- qd-copy-api 2ce5a850 · c2-emitter-fixes 83b2d1a2 · subgroup-cpu-support 8ebf8620 · reassociate-flag 19ff0276 · reassoc-subgroup-probe 9372c300 · r5-host-visible 67e27bc4 · spirv-vectorize 68bd7965 · algorithms-2 b12c125c · compiler-line 33e7dabf · n2-to-numpy-type 4a76ce7c · a10-nested-loop-raw c52711b5 · a19-stlf-fallback 3793c86d · a20-loop-var-scope 01d2037e · metal-i64 01d2037e · a7-m2-compound 869a00a0 · qd-native-bvh 76541b81 · cpu-head-state-per-iteration 4a400a11 · a32-static-return-order e0f35bdd · a34-bool-cast 91351dbd · a37-compile-uaf 4da921ff · familyr-realfunc-composite 57391b9f · audit-lint 2bb6b7f4 · ruff-import-sort (this) -->
 
 # robostudio_features.md — features ledger for robostudio-main
 
@@ -1195,7 +1195,8 @@ test_state_history_get_set`:旧 wheel = A19 assert 拒编译(FAIL);新 wheel =
   dangling operand 0x… - freed-but-referenced statement (ledger A37)`(Python
   RuntimeError);同轮 audit-off = 静默 SIGSEGV(旧行为对照)。健康面:int2bool
   双模式 PASS、test_return 46/46(audit-on)、clang-tidy 改动 3 文件 0 warnings、
-  ruff 首跑 7 findings(全 --fixable,留下一线清理)、union runner 21/21(默认)。
+  ruff 首跑 7 findings(全 --fixable,已由 ruff-import-sort 线清零)、union runner
+  21/21(默认)与 **21/21(QD_IR_AUDIT=1 全量补验,零误报)**。
 - **footprint**:verify.cpp +22/−1;ir.h +6;statements.cpp +19;
   compile_to_offloads.cpp +6;make_block_local.cpp +1;CMakeLists +1;spec 文档
   (docs/audit_lint_development_spec.md)。默认语义零变化。

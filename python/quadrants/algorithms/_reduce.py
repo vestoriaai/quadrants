@@ -15,11 +15,11 @@ The per-block partials stage through a **caller-owned** scratch buffer (``u32`` 
 
 import struct
 
+from quadrants.algorithms._cpu_paths import _cpu_reduce_add
 from quadrants.lang.expr import make_constant_expr
 from quadrants.lang.impl import current_cfg, static
 from quadrants.lang.kernel_impl import func as _func
 from quadrants.lang.kernel_impl import kernel
-from quadrants.algorithms._cpu_paths import _cpu_reduce_add
 from quadrants.lang.misc import cpu as _arch_cpu
 from quadrants.lang.misc import loop_config
 from quadrants.lang.ops import bit_cast

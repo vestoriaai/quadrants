@@ -5,10 +5,6 @@ from ._radix_sort import (
     sort,
     sort_scratch_slots,
 )
-from ._segmented import (
-    sort_segmented,
-    sort_segmented_scratch_slots,
-)
 from ._reduce import (
     reduce_add,
     reduce_max,
@@ -24,6 +20,10 @@ from ._scan import (
     exclusive_scan_max,
     exclusive_scan_min,
     exclusive_scan_scratch_slots,
+)
+from ._segmented import (
+    sort_segmented,
+    sort_segmented_scratch_slots,
 )
 from ._select import select, select_scratch_slots
 

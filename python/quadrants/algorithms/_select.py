@@ -34,14 +34,13 @@ buffer.
 
 from quadrants.lang.impl import current_cfg, static
 from quadrants.lang.kernel_impl import func as _func
-from quadrants.lang.ops import bit_cast
 from quadrants.lang.misc import cpu as _arch_cpu
+from quadrants.lang.ops import bit_cast
 from quadrants.lang.simt.reductions import _bin_add
 from quadrants.types.annotations import template
 from quadrants.types.primitive_types import i32, u32
 
 from ._cpu_paths import _cpu_select
-
 from ._reduce import (
     _OP_ADD,
     BLOCK_DIM,

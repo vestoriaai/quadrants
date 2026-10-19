@@ -19,11 +19,14 @@ reuses the private ``u32`` / add staircase (:func:`_emit_exclusive_scan_add`, at
 digit-histogram scan.
 """
 
+from quadrants.algorithms._cpu_paths import (
+    _cpu_exclusive_scan_add,
+    _cpu_exclusive_scan_minmax,
+)
+from quadrants.algorithms._reduce import _MAX_IDENTITY_BY_DTYPE, _MIN_IDENTITY_BY_DTYPE
 from quadrants.lang.impl import current_cfg, static
 from quadrants.lang.kernel_impl import func as _func
 from quadrants.lang.kernel_impl import kernel
-from quadrants.algorithms._reduce import _MAX_IDENTITY_BY_DTYPE, _MIN_IDENTITY_BY_DTYPE
-from quadrants.algorithms._cpu_paths import _cpu_exclusive_scan_add, _cpu_exclusive_scan_minmax
 from quadrants.lang.misc import cpu as _arch_cpu
 from quadrants.lang.misc import loop_config
 from quadrants.lang.ops import bit_cast

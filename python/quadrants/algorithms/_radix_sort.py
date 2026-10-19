@@ -53,11 +53,11 @@ owns the buffer (graph- / multi-stream-safe, no global state). :func:`sort` does
 (a DtoH would defeat graph capture), so size ``scratch`` correctly up front when composing the func.
 """
 
-from quadrants.lang.impl import static
 from quadrants.algorithms._cpu_paths import _cpu_radix_sort
 from quadrants.lang.impl import current_cfg, static
 from quadrants.lang.kernel_impl import func as _func
-from quadrants.lang.misc import cpu as _arch_cpu, loop_config
+from quadrants.lang.misc import cpu as _arch_cpu
+from quadrants.lang.misc import loop_config
 from quadrants.lang.ops import atomic_add, bit_cast
 from quadrants.lang.simt import block as _block
 from quadrants.types.annotations import template

@@ -20,11 +20,11 @@ mujocoqd/compiler-line C5.  Gate: ``tests/robostudio/probe_algorithms_cpu.py``.
 from quadrants.lang.any_array import AnyArray
 from quadrants.lang.impl import current_cfg, static
 from quadrants.lang.kernel_impl import func as _func
-from quadrants.lang.misc import cpu as _arch_cpu, loop_config
+from quadrants.lang.misc import cpu as _arch_cpu
+from quadrants.lang.misc import loop_config
 from quadrants.lang.ops import bit_cast
 from quadrants.types.annotations import template
 from quadrants.types.primitive_types import f32, f64, i32, i64, u32, u64
-
 
 # Count normalization (trace-time, must stay inline in the func body): the frozen contract
 # reads counts from a 0-d ndarray (``n[()]`` — traced as an AST subscript, since AnyArray is
