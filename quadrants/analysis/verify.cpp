@@ -1,6 +1,8 @@
 #include <vector>
 #include <unordered_set>
 
+#include <cstdlib>
+
 #include "quadrants/ir/ir.h"
 #include "quadrants/ir/analysis.h"
 #include "quadrants/ir/statements.h"
@@ -42,6 +44,21 @@ class IRVerifier : public BasicStmtVisitor {
         if (visible_stmts_[depth].find(op) != visible_stmts_[depth].end()) {
           found = true;
           break;
+        }
+      }
+      if (!found) {
+        // Under QD_IR_AUDIT=1 a dangling operand must stop the process
+        // deterministically: QD_UNREACHABLE compiles to a fall-through under
+        // NDEBUG (sibling compile threads would race into the quarantined
+        // block), and the non-audit diagnostic below dereferences the
+        // operand - itself the poisoned block - so the audit path reports by
+        // address only (ledger A37).
+        static const bool audit_fatal = std::getenv("QD_IR_AUDIT") != nullptr;
+        QD_ERROR("IR broken (audit): stmt {} ({}) has dangling operand {} - "
+                 "freed-but-referenced statement (ledger A37).",
+                 stmt->id, fmt::ptr(stmt), fmt::ptr(op));
+        if (audit_fatal) {
+          std::abort();
         }
       }
       QD_ASSERT_INFO(found,
@@ -142,7 +159,10 @@ void verify(IRNode *root) {
 }
 
 void verify_if_debug(IRNode *root, const CompileConfig &config) {
-  if (!config.debug) {
+  // QD_IR_AUDIT=1 forces the verifier on outside debug builds so gates and
+  // release wheels can exercise the operand-liveness audit (ledger A37).
+  static const bool force_audit = std::getenv("QD_IR_AUDIT") != nullptr;
+  if (!config.debug && !force_audit) {
     return;
   }
   verify(root);

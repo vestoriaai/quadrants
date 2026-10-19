@@ -88,6 +88,8 @@ void compile_to_offloads(IRNode *ir,
 
   if (config.force_scalarize_matrix) {
     irpass::scalarize(ir, false /*half2_optimization_enabled*/);
+    // audit right at the ownership-sensitive transform (ledger A37)
+    irpass::analysis::verify_if_debug(ir, config);
     irpass::die(ir);
   }
 
@@ -359,6 +361,8 @@ void offload_to_executable(IRNode *ir,
       (config.arch == Arch::cuda && config.half2_vectorization && !get_custom_cuda_library_path().empty());
   if (config.real_matrix_scalarize) {
     if (irpass::scalarize(ir, half2_optimization_enabled)) {
+      // audit before anything walks the scalarized operands (ledger A37)
+      irpass::analysis::verify_if_debug(ir, config);
       irpass::die(ir);
       print("DIE");
 
@@ -458,6 +462,8 @@ void compile_function(IRNode *ir,
 
     if (config.real_matrix_scalarize) {
       if (irpass::scalarize(ir)) {
+        // audit before anything walks the scalarized operands (ledger A37)
+        irpass::analysis::verify_if_debug(ir, config);
         // Remove redundant MatrixInitStmt inserted during scalarization
         irpass::die(ir);
         print("Scalarized");

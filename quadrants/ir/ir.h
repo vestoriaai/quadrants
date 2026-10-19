@@ -505,6 +505,12 @@ class Stmt : public IRNode {
   explicit Stmt(const DebugInfo &dbg_info);
 
  public:
+  // Audit mode (QD_IR_AUDIT=1): freed statements are poisoned and quarantined
+  // so their addresses are never recycled - the IR verifier's operand-liveness
+  // check then detects every dangling use deterministically (ledger A37).
+  static void operator delete(void *ptr, std::size_t size) noexcept;
+
+ public:
   StmtFieldManager field_manager;
   static std::atomic<int> instance_id_counter;
   int instance_id;

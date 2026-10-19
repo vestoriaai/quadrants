@@ -1177,6 +1177,33 @@ test_state_history_get_set`:旧 wheel = A19 assert 拒编译(FAIL);新 wheel =
   (守卫为预防层);ownership 审计 pass(IR operand 存活性断言,估 ~50 行)评估
   为可选拍板项,未动手——malloc_history 只解归因不解检测,错值形态曾无崩溃签名。
 
+## audit-lint — IR 所有权审计启用层 + lint 本地化最小支持(mujocoqd/audit-lint)
+- **设计**:①复用既有 IRVerifier(operand 地址可见集断言 + parent 回指针),不加新
+  pass:`verify_if_debug` 增 `QD_IR_AUDIT=1` env 强制门(Release 轮子/门禁可开审计;
+  env 不设 = 逐位现状);offload_to_executable 的 kernel 路径 scalarize 分支首句、
+  force_scalarize_matrix 分支、func 路径 scalarize 分支及 make_block_local 内部
+  scalarize 后各补一记 verify。②**Stmt sized operator delete 审计隔离**:
+  QD_IR_AUDIT=1 下释放的语句 0xDD 投毒不归还——地址永不复用,把 verifier 的地址集
+  成员检查从"复用假阴性"补成确定性悬垂检测(实证:无隔离时同一 bug 审计静默漏报;
+  有隔离时悬垂读撞 0xDDDD… 毒签名)。③审计发现 = 按地址命名的 QD_ERROR(刻意不
+  deref 悬垂 op——原断言的 op->type() 参数本身会踩毒)→ Python 级 RuntimeError;
+  非审计 debug 路径保留原断言。④lint:根 CMakeLists `CMAKE_EXPORT_COMPILE_COMMANDS`
+  (compile_commands.json 落 build 树);pre-commit ruff 钩子本已配置,本机 uv tool
+  装 ruff 实跑通。
+- **数字**:抓真 bug 实证——worktree 临时复刻 familyr 陈旧 scalarize(去所有权
+  insert),`QD_IR_AUDIT=1` 编 int2bool → `IR broken (audit): stmt 167 (…) has
+  dangling operand 0x… - freed-but-referenced statement (ledger A37)`(Python
+  RuntimeError);同轮 audit-off = 静默 SIGSEGV(旧行为对照)。健康面:int2bool
+  双模式 PASS、test_return 46/46(audit-on)、clang-tidy 改动 3 文件 0 warnings、
+  ruff 首跑 7 findings(全 --fixable,留下一线清理)、union runner 21/21(默认)。
+- **footprint**:verify.cpp +22/−1;ir.h +6;statements.cpp +19;
+  compile_to_offloads.cpp +6;make_block_local.cpp +1;CMakeLists +1;spec 文档
+  (docs/audit_lint_development_spec.md)。默认语义零变化。
+- **限制**:①隔离以空间换检测——audit 模式语句释放不归还,超大 kernel(A24 家族)
+  audit-on 编译内存会放大,勿开;②地址集审计不覆盖"跨 IR 阶段外部注册表陈旧指针"
+  (A37 store_dests 类,指针不在本树)——该类靠 store_dests.clear() 与探针;
+  ③QD_UNREACHABLE 在 NDEBUG 下落空(QD_ASSERT 非致命),故审计路径显式命名错误。
+
 ## Family R — real_func × 复合值/控制流全方向修复 + A42 scalarize 泛化(mujocoqd/familyr-realfunc-composite)
 - **设计**:两笔编译器修复 + 一笔分析鲁棒性修复,同一 worktree 线落地:
   ①**Family R builder 解析**(func.py):`@qd.func` 内联叶在 real_func 体编译

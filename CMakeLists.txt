@@ -15,6 +15,9 @@ endif()
 
 project(quadrants)
 
+# clang-tidy / IDE consume this; zero behavior impact (audit-lint line)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
 include("cmake/utils.cmake")
 
 set(CMAKE_CXX_STANDARD 17)

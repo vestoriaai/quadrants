@@ -1,4 +1,6 @@
 // TODO: gradually cppize statements.h
+#include <cstdlib>
+#include <cstring>
 #include <typeinfo>
 #include "quadrants/ir/statements.h"
 #include "quadrants/util/bit.h"
@@ -538,4 +540,21 @@ BitStructType *BitStructStoreStmt::get_bit_struct() const {
   return ptr->as<SNodeLookupStmt>()->snode->dt->as<BitStructType>();
 }
 
+// Sized deallocation is the only usual form declared on Stmt, so every
+// statement free funnels here. Under QD_IR_AUDIT=1 the block is poisoned and
+// deliberately leaked: the address can never be recycled, which turns the IR
+// verifier's address-set operand check into a deterministic dangling-use
+// detector (address-recycled false negatives otherwise swallow exactly the
+// statement-UAF class of ledger A37).
+void Stmt::operator delete(void *ptr, std::size_t size) noexcept {
+  static const bool quarantine = std::getenv("QD_IR_AUDIT") != nullptr;
+  if (quarantine) {
+    std::memset(ptr, 0xDD, size);
+    return;
+  }
+  ::operator delete(ptr, size);
+}
+
 }  // namespace quadrants::lang
+
+

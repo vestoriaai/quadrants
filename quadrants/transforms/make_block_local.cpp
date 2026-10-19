@@ -43,6 +43,7 @@ void make_block_local_offload(OffloadedStmt *offload,
       <*i32> $16 = global ptr [S5place<i32>], index [$15] activate=true
   */
   if (irpass::scalarize(offload)) {
+    irpass::analysis::verify_if_debug(offload, config);
     irpass::full_simplify(offload, config,
                           {false, /*autodiff_enabled*/ false, kernel_name + ".make_block_local", verbose});
   }
