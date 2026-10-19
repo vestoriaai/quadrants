@@ -52,11 +52,29 @@ class Scalarize : public BasicStmtVisitor {
 
       QD_ASSERT(dest_tensor_type->get_shape() == val_tensor_type->get_shape());
 
-      QD_ASSERT(stmt->val->template is<MatrixInitStmt>());
-      auto matrix_init_stmt = stmt->val->template as<MatrixInitStmt>();
+      auto matrix_init_stmt = stmt->val->template cast<MatrixInitStmt>();
+      // A42: a tensor-typed val need not be a MatrixInitStmt - the frontend can
+      // materialize a composite-component arithmetic tree (e.g. double-subscript
+      // component reads feeding a mul) as a plain tensor-typed value stmt.
+      // Asserting here killed the compile (ledger A42); park such vals in a temp
+      // alloca and scalarize through per-element loads instead.
+      std::unique_ptr<AllocaStmt> val_alloca;
+      std::unique_ptr<LocalStoreStmt> val_store;
+      const bool val_is_matrix_init = matrix_init_stmt != nullptr;
+      Stmt *val_alloca_stmt = nullptr;  // survives via delayed_modifier_ after the move
+      if (!val_is_matrix_init) {
+        val_alloca = std::make_unique<AllocaStmt>(val_dtype);
+        val_alloca->ret_type.set_is_pointer(true);
+        val_store = std::make_unique<LocalStoreStmt>(val_alloca.get(), stmt->val);
+        val_alloca_stmt = val_alloca.get();
+      }
 
       int num_elements = val_tensor_type->get_num_elements();
       auto primitive_type = dest_tensor_type->get_element_type();
+      if (!val_is_matrix_init) {
+        delayed_modifier_.insert_before(stmt, std::move(val_alloca));
+        delayed_modifier_.insert_before(stmt, std::move(val_store));
+      }
       for (int i = 0; i < num_elements; i++) {
         auto const_stmt = std::make_unique<ConstStmt>(TypedConstant(get_data_type<int32>(), i));
 
@@ -65,11 +83,30 @@ class Scalarize : public BasicStmtVisitor {
         matrix_ptr_stmt->ret_type = primitive_type;
         matrix_ptr_stmt->ret_type.set_is_pointer(true);
 
-        auto scalarized_stmt = std::make_unique<T>(matrix_ptr_stmt.get(), matrix_init_stmt->values[i]);
-
-        delayed_modifier_.insert_before(stmt, std::move(const_stmt));
-        delayed_modifier_.insert_before(stmt, std::move(matrix_ptr_stmt));
-        delayed_modifier_.insert_before(stmt, std::move(scalarized_stmt));
+        std::unique_ptr<T> scalarized_stmt;
+        std::unique_ptr<MatrixPtrStmt> dest_ptr_stmt = std::make_unique<MatrixPtrStmt>(stmt->dest, const_stmt.get());
+        dest_ptr_stmt->ret_type = primitive_type;
+        dest_ptr_stmt->ret_type.set_is_pointer(true);
+        if (val_is_matrix_init) {
+          scalarized_stmt = std::make_unique<T>(dest_ptr_stmt.get(), matrix_init_stmt->values[i]);
+          delayed_modifier_.insert_before(stmt, std::move(const_stmt));
+          delayed_modifier_.insert_before(stmt, std::move(dest_ptr_stmt));
+          delayed_modifier_.insert_before(stmt, std::move(scalarized_stmt));
+        } else {
+          // A42: val is a tensor-typed value stmt (not MatrixInitStmt) - park it
+          // in a temp alloca and read the elements back per scalarized store.
+          auto element_ptr_stmt = std::make_unique<MatrixPtrStmt>(val_alloca_stmt, const_stmt.get());
+          element_ptr_stmt->ret_type = primitive_type;
+          element_ptr_stmt->ret_type.set_is_pointer(true);
+          auto element_load = std::make_unique<LocalLoadStmt>(element_ptr_stmt.get());
+          element_load->ret_type = primitive_type;
+          scalarized_stmt = std::make_unique<T>(dest_ptr_stmt.get(), element_load.get());
+          delayed_modifier_.insert_before(stmt, std::move(const_stmt));
+          delayed_modifier_.insert_before(stmt, std::move(dest_ptr_stmt));
+          delayed_modifier_.insert_before(stmt, std::move(element_ptr_stmt));
+          delayed_modifier_.insert_before(stmt, std::move(element_load));
+          delayed_modifier_.insert_before(stmt, std::move(scalarized_stmt));
+        }
       }
 
       delayed_modifier_.erase(stmt);

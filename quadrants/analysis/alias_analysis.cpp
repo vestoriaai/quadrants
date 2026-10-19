@@ -124,7 +124,13 @@ AliasResult alias_analysis(Stmt *var1, Stmt *var2) {
     } else if (ptr1->is_grad != ptr2->is_grad) {
       return AliasResult::different;
     }
-    QD_ASSERT(ptr1->indices.size() == ptr2->indices.size());
+    if (ptr1->indices.size() != ptr2->indices.size()) {
+      // Mismatched arity on the same ndarray: the frontend can reach the same
+      // base through different lowering forms (whole-element vs component-
+      // chained). Conservatively uncertain - they may alias - so dependent
+      // optimizations stay correct (ledger A42 residual).
+      return AliasResult::uncertain;
+    }
     bool uncertain = false;
     for (int i = 0; i < (int)ptr1->indices.size(); i++) {
       auto diff = value_diff_ptr_index(ptr1->indices[i], ptr2->indices[i]);

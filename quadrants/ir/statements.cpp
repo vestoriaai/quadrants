@@ -1,8 +1,10 @@
 // TODO: gradually cppize statements.h
+#include <typeinfo>
 #include "quadrants/ir/statements.h"
 #include "quadrants/util/bit.h"
 #include "quadrants/program/kernel.h"
 #include "quadrants/program/function.h"
+#include "quadrants/ir/transforms.h"
 
 namespace quadrants::lang {
 
@@ -96,6 +98,27 @@ MatrixPtrStmt::MatrixPtrStmt(Stmt *origin_input, Stmt *offset_input, const Debug
   origin = origin_input;
   offset = offset_input;
   this->dbg_info = dbg_info;
+  if (const char *a42_dbg = std::getenv("QD_A42_DEBUG")) {
+    if (std::string(a42_dbg) == "1" && !origin->is<AllocaStmt>() && !origin->is<GlobalTemporaryStmt>() &&
+        !origin->is<ExternalPtrStmt>() && !origin->is<MatrixOfGlobalPtrStmt>() &&
+        !origin->is<MatrixOfMatrixPtrStmt>() && !origin->is<ThreadLocalPtrStmt>() &&
+        !origin->is<GlobalPtrStmt>() && !origin->is<GetChStmt>() && !origin->is<AdStackLoadTopStmt>() &&
+        !origin->is<MatrixPtrStmt>()) {
+      std::printf("[A42DBG] MatrixPtrStmt rejected origin=%p RA=%p class=%s\n", (void *)origin,
+                  __builtin_return_address(0),
+                  origin->is<AdStackAccAdjointStmt>() ? "AdStackAccAdjointStmt" : origin->is<AdStackAllocaStmt>() ? "AdStackAllocaStmt" : origin->is<AdStackLoadTopAdjStmt>() ? "AdStackLoadTopAdjStmt" : origin->is<AdStackPopStmt>() ? "AdStackPopStmt" : origin->is<AdStackPushStmt>() ? "AdStackPushStmt" : origin->is<ArgLoadStmt>() ? "ArgLoadStmt" : origin->is<AssertStmt>() ? "AssertStmt" : origin->is<AtomicOpStmt>() ? "AtomicOpStmt" : origin->is<BinaryOpStmt>() ? "BinaryOpStmt" : origin->is<BitStructStoreStmt>() ? "BitStructStoreStmt" : origin->is<BlockCornerIndexStmt>() ? "BlockCornerIndexStmt" : origin->is<BlockLocalPtrStmt>() ? "BlockLocalPtrStmt" : origin->is<ClearListStmt>() ? "ClearListStmt" : origin->is<ConstStmt>() ? "ConstStmt" : origin->is<ContinueStmt>() ? "ContinueStmt" : origin->is<DecorationStmt>() ? "DecorationStmt" : origin->is<ExternalFuncCallStmt>() ? "ExternalFuncCallStmt" : origin->is<ExternalTensorBasePtrStmt>() ? "ExternalTensorBasePtrStmt" : origin->is<ExternalTensorShapeAlongAxisStmt>() ? "ExternalTensorShapeAlongAxisStmt" : origin->is<FuncCallStmt>() ? "FuncCallStmt" : origin->is<GetElementStmt>() ? "GetElementStmt" : origin->is<GetRootStmt>() ? "GetRootStmt" : origin->is<GlobalLoadStmt>() ? "GlobalLoadStmt" : origin->is<GlobalStoreStmt>() ? "GlobalStoreStmt" : origin->is<GlobalThreadIndexStmt>() ? "GlobalThreadIndexStmt" : origin->is<IfStmt>() ? "IfStmt" : origin->is<IntegerOffsetStmt>() ? "IntegerOffsetStmt" : origin->is<InternalFuncStmt>() ? "InternalFuncStmt" : origin->is<LinearizeStmt>() ? "LinearizeStmt" : origin->is<LocalLoadStmt>() ? "LocalLoadStmt" : origin->is<LocalStoreStmt>() ? "LocalStoreStmt" : origin->is<LoopIndexStmt>() ? "LoopIndexStmt" : origin->is<LoopLinearIndexStmt>() ? "LoopLinearIndexStmt" : origin->is<LoopUniqueStmt>() ? "LoopUniqueStmt" : origin->is<MatrixInitStmt>() ? "MatrixInitStmt" : origin->is<MeshForStmt>() ? "MeshForStmt" : origin->is<MeshIndexConversionStmt>() ? "MeshIndexConversionStmt" : origin->is<MeshPatchIndexStmt>() ? "MeshPatchIndexStmt" : origin->is<MeshRelationAccessStmt>() ? "MeshRelationAccessStmt" : origin->is<OffloadedStmt>() ? "OffloadedStmt" : origin->is<PrintStmt>() ? "PrintStmt" : origin->is<RandStmt>() ? "RandStmt" : origin->is<RangeAssumptionStmt>() ? "RangeAssumptionStmt" : origin->is<RangeForStmt>() ? "RangeForStmt" : origin->is<ReferenceStmt>() ? "ReferenceStmt" : origin->is<ReturnStmt>() ? "ReturnStmt" : origin->is<SNodeLookupStmt>() ? "SNodeLookupStmt" : origin->is<SNodeOpStmt>() ? "SNodeOpStmt" : origin->is<StructForStmt>() ? "StructForStmt" : origin->is<TernaryOpStmt>() ? "TernaryOpStmt" : origin->is<UnaryOpStmt>() ? "UnaryOpStmt" : origin->is<WhileControlStmt>() ? "WhileControlStmt" : origin->is<WhileStmt>() ? "WhileStmt" : "TRULY-OTHER");
+    }
+  }
+  if (const char *a42_dbg = std::getenv("QD_A42_DEBUG")) {
+    if (std::string(a42_dbg) == "1" && !origin->is<AllocaStmt>() && !origin->is<GlobalTemporaryStmt>() &&
+        !origin->is<ExternalPtrStmt>() && !origin->is<MatrixOfGlobalPtrStmt>() &&
+        !origin->is<MatrixOfMatrixPtrStmt>() && !origin->is<ThreadLocalPtrStmt>() &&
+        !origin->is<GlobalPtrStmt>() && !origin->is<GetChStmt>() && !origin->is<AdStackLoadTopStmt>() &&
+        !origin->is<MatrixPtrStmt>()) {
+      std::printf("[A42DBG] MatrixPtrStmt rejected origin=%p RA=%p true_type=%s\n", (void *)origin,
+                  __builtin_return_address(0), typeid(*origin).name());
+    }
+  }
 
   if (origin->is<AllocaStmt>() || origin->is<GlobalTemporaryStmt>() || origin->is<ExternalPtrStmt>() ||
       origin->is<MatrixOfGlobalPtrStmt>() || origin->is<MatrixOfMatrixPtrStmt>() || origin->is<ThreadLocalPtrStmt>() ||
@@ -112,10 +135,13 @@ MatrixPtrStmt::MatrixPtrStmt(Stmt *origin_input, Stmt *offset_input, const Debug
     element_type() = origin->ret_type.get_element_type();
     element_type().set_is_pointer(true);
   } else {
+    std::string origin_ir;
+    irpass::print(origin, &origin_ir);
     QD_ERROR(
         "MatrixPtrStmt must be used for AllocaStmt / GlobalTemporaryStmt "
         "(locally) or GlobalPtrStmt / MatrixOfGlobalPtrStmt / ExternalPtrStmt "
-        "(globally).")
+        "(globally). origin subtree:\n{}",
+        origin_ir)
   }
   QD_STMT_REG_FIELDS;
 }

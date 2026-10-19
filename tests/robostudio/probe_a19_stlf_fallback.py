@@ -574,7 +574,18 @@ _sensor_touch(0, geom_bodyid, site_type, site_bodyid, site_size, sensor_objid,
 # touch path never writes and the sensordata pin is all zeros. The direct
 # ray_sphere arm below pins the actual hit path. Both arms are drift
 # detectors, not mujoco-semantics references.
-SD_PIN = [0.0] * 24
+# Family R (A41/A44 fix) pin update: the vendored ray_geom dispatch inside
+# _sensor_touch is a real_func x early_return-leaf shape - the builder-resolution
+# bug (statement-loss into a never-compiled tree) previously dropped the contact
+# detection branch, so the old pin recorded the miss symptom (all-zero
+# sensordata despite efc_force=10 on a geometrically visible contact). With the
+# builder-resolution fix the ray hits and the contact normalforce (10.0) flows
+# into sensordata[0] - the mj-correct touch semantics (sensordata = sum of
+# contact normalforces), validated per the inputs the probe feeds (efc_force
+# is probe-constructed, so the drift-detector pin tracks the kernel, not mujoco
+# C; mujoco-semantics validation of the unvendored kernel lives in mujoqo
+# sensor_test, green on this wheel).
+SD_PIN = [10.0] + [0.0] * 23
 
 sd = sensordata_out.to_numpy().reshape(-1)
 print("PIN-SD", [float(x) for x in sd])

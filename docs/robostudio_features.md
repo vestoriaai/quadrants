@@ -1165,3 +1165,35 @@ test_state_history_get_set`:旧 wheel = A19 assert 拒编译(FAIL);新 wheel =
   DYLD_INSERT;重签名后 runtime 自检败,harness 留档);③trash_bin 全程无 flush
   = A24 "IR 驻留不释放"机理(本线只记账未修);④符号化 recipe = build 树 link.txt
   去 `-Wl,-S` 手工重链(dev_notes §8.5)。
+
+## Family R — real_func × 复合值/控制流全方向修复 + A42 scalarize 泛化(mujocoqd/familyr-realfunc-composite)
+- **设计**:两笔编译器修复 + 一笔分析鲁棒性修复,同一 worktree 线落地:
+  ①**Family R builder 解析**(func.py):`@qd.func` 内联叶在 real_func 体编译
+  (嵌套 do_compile)时,`get_tree_and_ctx(ast_builder=current_kernel.ast_builder())`
+  解析到外层 kernel 的 builder,叶的控制流语句进入永不编译的死树,普通赋值
+  跟随 compiling_callable 进 real_func 自身树——叶被劈成两棵树,guard if 全丢、
+  体直排 last-wins(A41 分发乱值/A44 体腐坏/A33 跨界错值的统一根因)。修 =
+  plain 内联路径 builder 解析改从 compiling_callable 取(嵌套时正确指向
+  real_func 自身;非嵌套场景两 builder 同对象,零行为变化)。
+  ②**A42 scalarize 泛化**(scalarize.cpp):张量 val 非 MatrixInitStmt 的 store
+  不再 assert——临时 alloca + LocalStore 停泊 + per-element MatrixPtr/LocalLoad
+  (v1 漏插 dest ptr 的 SIGSEGV 族与 v2 move 后空 origin 两轮迭代已修)。
+  ③**alias_analysis 保守 uncertain**:同 ndarray 不同索引数(全元素 vs 链式
+  分量两种合法降级形态)不再 assert,返回 uncertain。
+- **背景需求**:A40-A44 族(bvh-interop 线 ray 链 2F 阻塞 + A33 转正 +
+  ray_boundary P4 乱值 + box4b 体腐坏);mujoqo 账本 A40-A44 全量状态。
+- **数字**:20 行最小复现(fr_min_er_leaf)dev128 5/5 MISMATCH → dev145
+  PASS;3-way 控制矩阵(直调/func 分发/real_func 分发)PASS;ray_boundary
+  P1–P4 全过(P4 从 -1.0/-0.061341 乱值翻正 0.102987/0.020101 与 P2/P3 一致);
+  box4b 从 -1.0 翻正 0.17595585≈box4a;A33 探针 FIXED;A42 V 矩阵五变体全绿
+  (V2/V2c 从 scalarize@55 断言/MatrixPtr@132 拒绝翻绿);test_return 46/46;
+  union runner **21/21**(含 gate 14 x3 新钉值、gate 20、gate 21 首跑)。
+  dev145(修复)/dev148(+typeid debug)双 wheel 复验。
+- **footprint**:func.py +15/−1;scalarize.cpp +32/−5;alias_analysis.cpp +7;
+  statements.cpp(A42DBG 追踪,历史保留);gate 21 探针 + runner 接线
+  (TOTAL 20→21);dev-notes §8;任务书/评估文档。零旗标。
+- **限制**:①真根因 taichi 局部矩阵语义(矩阵值分量读产生 tensor 形状)——
+  scalarize 泛化 = 正确修复层,前端无需改动(A42 原评估的"前端类型化修复"
+  方向撤销);②alias 索引数断言保守 uncertain 可能轻微增加保守性(正确性
+  优先);③FRDBG/A42DBG 插桩已回退留史;④A37 线 UAF(a19 宿主)x3 防闪烁
+  维持,根因 lldb 深挖另行立项。

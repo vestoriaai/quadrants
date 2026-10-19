@@ -56,7 +56,7 @@ trap 'rm -rf "$TMP"' EXIT
 
 [[ -x "$PY" ]] || { echo "FATAL: no venv python at $PY (create .venv-consolidated, see docs/build_robostudio.md)" >&2; exit 1; }
 
-PASS=0; NFAIL=0; TOTAL=20
+PASS=0; NFAIL=0; TOTAL=21
 gate_pass() { echo "gate $1/$TOTAL [$2]: PASS"; (( PASS = PASS + 1 )); }
 gate_fail() { echo "gate $1/$TOTAL [$2]: FAIL -- $3"; (( NFAIL = NFAIL + 1 )); }
 
@@ -384,6 +384,17 @@ else
   echo "  bool-cast metal arm: skipped (gpu-busy)"
 fi
 (( G20 == 2 )) && gate_pass 20 "bool-cast C truthiness (cpu+metal)" || gate_fail 20 "bool-cast C truthiness (cpu+metal)" "see arms above"
+
+# 21 real_func x composite values (mujocoqd/familyr-realfunc-composite) --------
+# CPU-only (real_func on SPIR-V stays loudly rejected per the M3 fallback).
+# Covers the Family R regression surface: early_return leaf x
+# direct/func-dispatch/real_func-dispatch callers, scalar literal dispatch,
+# and real_func composite dispatch (A33 direction).
+G21=0
+"$PY" -u "$ROOT/tests/robostudio/probe_realfunc_composite.py" cpu >"$TMP/g21_cpu.log" 2>&1 \
+  && grep -q "REALFUNC COMPOSITE GATE \\[cpu\\]: ALL PASS" "$TMP/g21_cpu.log" && G21=1 \
+  || { echo "  realfunc-composite cpu arm: expected ALL PASS:"; tail -12 "$TMP/g21_cpu.log"; }
+(( G21 == 1 )) && gate_pass 21 "realfunc composite (cpu)" || gate_fail 21 "realfunc composite (cpu)" "see output above"
 
 echo "UNION GATE: $PASS/$TOTAL PASS"
 if (( NFAIL > 0 )); then echo "(logs kept in $TMP)"; trap - EXIT; exit 1; fi

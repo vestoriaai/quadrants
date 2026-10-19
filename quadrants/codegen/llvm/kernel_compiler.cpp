@@ -3,6 +3,7 @@
 #include "quadrants/ir/transforms.h"
 
 #include "quadrants/codegen/llvm/kernel_compiler.h"
+#include <cstdio>
 #include "quadrants/codegen/llvm/compiled_kernel_data.h"
 
 namespace quadrants::lang {
@@ -13,6 +14,12 @@ KernelCompiler::KernelCompiler(Config config) : config_(std::move(config)) {
 
 KernelCompiler::IRNodePtr KernelCompiler::compile(const CompileConfig &compile_config, const Kernel &kernel_def) const {
   auto ir = irpass::analysis::clone(kernel_def.ir.get());
+  if (const char *fr_dbg = std::getenv("QD_FR_DEBUG")) {
+    if (std::string(fr_dbg) == "1") {
+      std::printf("[FRDBG] compile_to_offloads tree root=%p kernel=%s\n", (void *)ir.get(),
+                  kernel_def.get_name().c_str());
+    }
+  }
   bool verbose = compile_config.print_ir;
   if (kernel_def.is_accessor && !compile_config.print_accessor_ir) {
     verbose = false;

@@ -79,10 +79,24 @@ class Func(FuncBase):
             if key.instance_id not in self.compiled:
                 self.do_compile(key=key, args=py_args, arg_features=arg_features)
             return self.func_call_rvalue(key=key, args=py_args)
+        # A41/A44 (Family R): when this @qd.func is called from inside a real_func's
+        # own body compilation, `current_kernel` still points at the OUTER kernel,
+        # so `current_kernel.ast_builder()` resolves to the outer kernel's builder
+        # and the inlined leaf's control-flow statements (guard ifs etc.) land in a
+        # tree that is never compiled, while its plain assignments follow the
+        # compiling callable into the real_func's own tree - splitting the leaf
+        # across two trees. The actively-compiling callable's builder is the single
+        # source of truth for "where statements go"; it equals current_kernel's
+        # builder in every non-nested context, so only the nested case changes.
+        compiling_callable = impl.get_runtime().compiling_callable
+        if compiling_callable is not None:
+            ast_builder = compiling_callable.ast_builder()
+        else:
+            ast_builder = current_kernel.ast_builder()
         tree, ctx = self.get_tree_and_ctx(
             is_kernel=False,
             py_args=py_args,
-            ast_builder=current_kernel.ast_builder(),
+            ast_builder=ast_builder,
             is_real_function=self.is_real_function,
         )
 

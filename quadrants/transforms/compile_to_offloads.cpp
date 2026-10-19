@@ -399,6 +399,12 @@ void compile_function(IRNode *ir,
                       bool verbose,
                       Function::IRStage target_stage) {
   QD_AUTO_PROF;
+  if (const char *fr_dbg = std::getenv("QD_FR_DEBUG")) {
+    if (std::string(fr_dbg) == "1") {
+      std::printf("[FRDBG] compile_function tree root=%p func=%s stage=%d\n", (void *)ir,
+                  func->get_name().c_str(), (int)target_stage);
+    }
+  }
 
   auto current_stage = func->ir_stage();
   auto print = make_pass_printer(verbose, config.print_ir_dbg_info, func->get_name(), ir);
