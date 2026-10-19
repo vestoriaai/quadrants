@@ -2,11 +2,13 @@
 # Reason: torch.zeros_like is public torch API, but pyright 1.1.409+ flags
 # it as private because torch's stubs don't re-export it via __all__.
 import ast
+import contextlib
 import inspect
 import math
 import os
 import sys
 import textwrap
+import threading
 import types
 import typing
 import warnings
@@ -208,6 +210,34 @@ def _get_frozen_dc_unwrapped(v: Any, struct_cls: type, fields_dict: dict) -> dic
             all_field_cache[id(struct_cls)] = (struct_cls, _all_field)
     return unwrapped
 
+
+
+# A46 (ledger): @qd.func has no recursion support. Without a guard, a directly
+# or indirectly recursive func is re-inlined without bound and the frontend
+# materializes IR until the process is OOM-killed with zero diagnostics
+# (trivial repro: 2.76GB RSS in 25s). Thread-local so parallel kernel
+# compiles stay independent.
+_inline_tls = threading.local()
+
+
+@contextlib.contextmanager
+def inline_cycle_guard(func):
+  stack = getattr(_inline_tls, "stack", None)
+  if stack is None:
+    stack = []
+    _inline_tls.stack = stack
+  for f, name in stack:
+    if f is func:
+      chain = " <- ".join(n for _, n in stack)
+      raise QuadrantsSyntaxError(
+          f"Recursive @qd.func call detected (inline cycle): {chain} <- "
+          f"{func.__qualname__}. quadrants does not support recursive "
+          "functions; restructure with an explicit loop instead.")
+  stack.append((func, func.__qualname__))
+  try:
+    yield
+  finally:
+    stack.pop()
 
 class FuncBase:
     """

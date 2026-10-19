@@ -6,6 +6,7 @@ from quadrants._lib.core.quadrants_python import (
 )
 from quadrants._lib.core.quadrants_python import FunctionKey
 from quadrants.lang import _kernel_impl_dataclass, impl, ops
+from quadrants.lang._func_base import inline_cycle_guard
 from quadrants.lang.any_array import AnyArray
 from quadrants.lang.ast import (
     transform_tree,
@@ -93,20 +94,21 @@ class Func(FuncBase):
             ast_builder = compiling_callable.ast_builder()
         else:
             ast_builder = current_kernel.ast_builder()
-        tree, ctx = self.get_tree_and_ctx(
-            is_kernel=False,
-            py_args=py_args,
-            ast_builder=ast_builder,
-            is_real_function=self.is_real_function,
-        )
+        with inline_cycle_guard(self.func):
+            tree, ctx = self.get_tree_and_ctx(
+                is_kernel=False,
+                py_args=py_args,
+                ast_builder=ast_builder,
+                is_real_function=self.is_real_function,
+            )
 
-        struct_locals = _kernel_impl_dataclass.extract_struct_locals_from_context(ctx)
+            struct_locals = _kernel_impl_dataclass.extract_struct_locals_from_context(ctx)
 
-        tree = _kernel_impl_dataclass.unpack_ast_struct_expressions(tree, struct_locals=struct_locals)
-        ret = transform_tree(tree, ctx)
-        if not self.is_real_function:
-            if self.return_type and ctx.returned != ReturnStatus.ReturnedValue:
-                raise QuadrantsSyntaxError("Function has a return type but does not have a return statement")
+            tree = _kernel_impl_dataclass.unpack_ast_struct_expressions(tree, struct_locals=struct_locals)
+            ret = transform_tree(tree, ctx)
+            if not self.is_real_function:
+                if self.return_type and ctx.returned != ReturnStatus.ReturnedValue:
+                    raise QuadrantsSyntaxError("Function has a return type but does not have a return statement")
 
         return ret
 
@@ -168,7 +170,8 @@ class Func(FuncBase):
             old_callable = impl.get_runtime().compiling_callable
             impl.get_runtime()._compiling_callable = fn
             ctx.ast_builder = fn.ast_builder()
-            transform_tree(tree, ctx)
+            with inline_cycle_guard(self.func):
+                transform_tree(tree, ctx)
             impl.get_runtime()._compiling_callable = old_callable
 
         self.cxx_function_by_id[key.instance_id] = fn

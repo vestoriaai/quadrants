@@ -1,5 +1,5 @@
 <!-- INDEX — merged lines (newest last; each entry's full section via its header below) -->
-<!-- qd-copy-api 2ce5a850 · c2-emitter-fixes 83b2d1a2 · subgroup-cpu-support 8ebf8620 · reassociate-flag 19ff0276 · reassoc-subgroup-probe 9372c300 · r5-host-visible 67e27bc4 · spirv-vectorize 68bd7965 · algorithms-2 b12c125c · compiler-line 33e7dabf · n2-to-numpy-type 4a76ce7c · a10-nested-loop-raw c52711b5 · a19-stlf-fallback 3793c86d · a20-loop-var-scope 01d2037e · metal-i64 01d2037e · a7-m2-compound 869a00a0 · qd-native-bvh 76541b81 · cpu-head-state-per-iteration 4a400a11 · a32-static-return-order e0f35bdd · a34-bool-cast 91351dbd · a37-compile-uaf 4da921ff · familyr-realfunc-composite 57391b9f · audit-lint 2bb6b7f4 · ruff-import-sort (this) -->
+<!-- qd-copy-api 2ce5a850 · c2-emitter-fixes 83b2d1a2 · subgroup-cpu-support 8ebf8620 · reassociate-flag 19ff0276 · reassoc-subgroup-probe 9372c300 · r5-host-visible 67e27bc4 · spirv-vectorize 68bd7965 · algorithms-2 b12c125c · compiler-line 33e7dabf · n2-to-numpy-type 4a76ce7c · a10-nested-loop-raw c52711b5 · a19-stlf-fallback 3793c86d · a20-loop-var-scope 01d2037e · metal-i64 01d2037e · a7-m2-compound 869a00a0 · qd-native-bvh 76541b81 · cpu-head-state-per-iteration 4a400a11 · a32-static-return-order e0f35bdd · a34-bool-cast 91351dbd · a37-compile-uaf 4da921ff · familyr-realfunc-composite 57391b9f · audit-lint 2bb6b7f4 · ruff-import-sort 41175f2a · a46-recursion-guard (this) -->
 
 # robostudio_features.md — features ledger for robostudio-main
 
@@ -1176,6 +1176,18 @@ test_state_history_get_set`:旧 wheel = A19 assert 拒编译(FAIL);新 wheel =
   46/46、union runner **21/21**(gate 14 x3 含)。④限制:SSOT 自身未表现过此洞
   (守卫为预防层);ownership 审计 pass(IR operand 存活性断言,估 ~50 行)评估
   为可选拍板项,未动手——malloc_history 只解归因不解检测,错值形态曾无崩溃签名。
+
+## a46-recursion-guard — @qd.func 递归环响亮检测(ledger A46,mujocoqd/a46-recursion-guard)
+- **设计**:前端内联加 thread-local in-progress func 栈(func 对象身份),重入 =
+  递归环 → `QuadrantsSyntaxError: Recursive @qd.func call detected (inline
+  cycle): <全环链>`;挂点两处(func.py 普通 func 编译 with 包裹、real_func
+  do_compile 的延迟 func_body 内)。Kernel 根不加(环必经 func;多 materialize
+  key 重入为顺序非嵌套)。
+- **数字**:A46 复现从静默 SIGKILL(25s 2.76GB)变秒级命名错误(直接 `f <- f`
+  与互递归 `a <- b <- a` 双验);test_return 46/46;union 21/21 × {默认,
+  QD_IR_AUDIT=1};ruff 归零。
+- **footprint**:_func_base.py +30、func.py +3/−3、spec 文档。零默认行为变化。
+- **背景**:A24 Phase 0 附带发现;历史"runtime-loop 2.5h 不收敛"疑似同机制。
 
 ## audit-lint — IR 所有权审计启用层 + lint 本地化最小支持(mujocoqd/audit-lint)
 - **设计**:①复用既有 IRVerifier(operand 地址可见集断言 + parent 回指针),不加新
