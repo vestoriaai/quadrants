@@ -1,5 +1,5 @@
 <!-- INDEX — merged lines (newest last; each entry's full section via its header below) -->
-<!-- qd-copy-api 2ce5a850 · c2-emitter-fixes 83b2d1a2 · subgroup-cpu-support 8ebf8620 · reassociate-flag 19ff0276 · reassoc-subgroup-probe 9372c300 · r5-host-visible 67e27bc4 · spirv-vectorize 68bd7965 · algorithms-2 b12c125c · compiler-line 33e7dabf · n2-to-numpy-type 4a76ce7c · a10-nested-loop-raw c52711b5 · a19-stlf-fallback 3793c86d · a20-loop-var-scope 01d2037e · metal-i64 01d2037e · a7-m2-compound 869a00a0 · qd-native-bvh 76541b81 · cpu-head-state-per-iteration 4a400a11 · a32-static-return-order e0f35bdd · a34-bool-cast 91351dbd · a37-compile-uaf 345dd750 -->
+<!-- qd-copy-api 2ce5a850 · c2-emitter-fixes 83b2d1a2 · subgroup-cpu-support 8ebf8620 · reassociate-flag 19ff0276 · reassoc-subgroup-probe 9372c300 · r5-host-visible 67e27bc4 · spirv-vectorize 68bd7965 · algorithms-2 b12c125c · compiler-line 33e7dabf · n2-to-numpy-type 4a76ce7c · a10-nested-loop-raw c52711b5 · a19-stlf-fallback 3793c86d · a20-loop-var-scope 01d2037e · metal-i64 01d2037e · a7-m2-compound 869a00a0 · qd-native-bvh 76541b81 · cpu-head-state-per-iteration 4a400a11 · a32-static-return-order e0f35bdd · a34-bool-cast 91351dbd · a37-compile-uaf 345dd750 · familyr-realfunc-composite 57391b9f -->
 
 # robostudio_features.md — features ledger for robostudio-main
 
