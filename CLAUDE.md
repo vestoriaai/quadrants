@@ -26,3 +26,10 @@ Genesis AI Taichi fork 的 robostudio 部署分支。**`robostudio-main` 为 sin
 - **双 wheel 归因法**:区分"既有核心问题"vs"本轮回归"——老基线 wheel(venv3=dev36)与当前 wheel 对跑最小探针,行为一致 = 既有,不一致 = 回归。探针进 `_probe/a_evidence/` 并断言生效。
 - Metal 数值 flaky 先对号 A5/A10-A12(行序律/`+=` 形式/kernel 边界可见性),metal 门禁单列,CPU 基线放行。
 - GPU 共享:perf 前 `bash tests/robostudio/_gpu_busy.sh`;机器方差 ±4×,结论用交错中位。
+
+## 工具调用纪律(2026-10-20 事故后成文)
+
+- heredoc(python3 - <<EOF 等)传输长文本会**间歇性字符腐化**(当日事故:探针文件语法损坏、入口脚本路径乱码、间接诱发一次误 amend)。多行文件编辑一律用 Write 工具写入 + Read/cat 回读核验;确需 heredoc 时内容限 10 行内。
+- 构建/测试脚本:写 /tmp 小脚本(逐条短行 append,每条 ≤80 字符,写后 cat 验证)再执行;禁止单条超长内联命令。
+- 任何写文件操作完成后必须核验产物:python 过 ast.parse、shell 过语法检查、或 grep 关键行。
+- 主 worktree 禁用 git add -A(会吸入未跟踪垃圾,如 graft/);只 add 白名单路径。git commit --amend 前必查 HEAD 归属。
