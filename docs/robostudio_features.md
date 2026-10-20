@@ -1,5 +1,5 @@
 <!-- INDEX — merged lines (newest last; each entry's full section via its header below) -->
-<!-- qd-copy-api 2ce5a850 · c2-emitter-fixes 83b2d1a2 · subgroup-cpu-support 8ebf8620 · reassociate-flag 19ff0276 · reassoc-subgroup-probe 9372c300 · r5-host-visible 67e27bc4 · spirv-vectorize 68bd7965 · algorithms-2 b12c125c · compiler-line 33e7dabf · n2-to-numpy-type 4a76ce7c · a10-nested-loop-raw c52711b5 · a19-stlf-fallback 3793c86d · a20-loop-var-scope 01d2037e · metal-i64 01d2037e · a7-m2-compound 869a00a0 · qd-native-bvh 76541b81 · cpu-head-state-per-iteration 4a400a11 · a32-static-return-order e0f35bdd · a34-bool-cast 91351dbd · a37-compile-uaf 4da921ff · familyr-realfunc-composite 57391b9f · audit-lint 2bb6b7f4 · ruff-import-sort 41175f2a · a46-recursion-guard 96cbd731 · a24-phase1-cfg-threshold 8ae3bfe4 · a47-float-parity (this) -->
+<!-- qd-copy-api 2ce5a850 · c2-emitter-fixes 83b2d1a2 · subgroup-cpu-support 8ebf8620 · reassociate-flag 19ff0276 · reassoc-subgroup-probe 9372c300 · r5-host-visible 67e27bc4 · spirv-vectorize 68bd7965 · algorithms-2 b12c125c · compiler-line 33e7dabf · n2-to-numpy-type 4a76ce7c · a10-nested-loop-raw c52711b5 · a19-stlf-fallback 3793c86d · a20-loop-var-scope 01d2037e · metal-i64 01d2037e · a7-m2-compound 869a00a0 · qd-native-bvh 76541b81 · cpu-head-state-per-iteration 4a400a11 · a32-static-return-order e0f35bdd · a34-bool-cast 91351dbd · a37-compile-uaf 4da921ff · familyr-realfunc-composite 57391b9f · audit-lint 2bb6b7f4 · ruff-import-sort 41175f2a · a46-recursion-guard 96cbd731 · a24-phase1-cfg-threshold 8ae3bfe4 · a47-float-parity 7a077591 · a45-normalize-parity (this) -->
 
 # robostudio_features.md — features ledger for robostudio-main
 
@@ -1177,7 +1177,20 @@ test_state_history_get_set`:旧 wheel = A19 assert 拒编译(FAIL);新 wheel =
   (守卫为预防层);ownership 审计 pass(IR operand 存活性断言,估 ~50 行)评估
   为可选拍板项,未动手——malloc_history 只解归因不解检测,错值形态曾无崩溃签名。
 
-## a47-float-parity — CPU fast_math 去 reassoc + 修复消抵和 miscompile(ledger A47)
+## a45-normalize-parity — normalize(0) 返回零向量,warp parity(ledger A45/A26)
+- **设计**:mathimpl.normalize 由 `v / v.norm()`(0/0 = NaN)改为
+  `v / select(n > 0, n, 1.0)`(零输入 → 零向量)。对齐 warp 语义
+  (wp.normalize(0) = 0);全部 95 个移植 normalize 调用面随之 inherent-safe
+  (A26 的逐点审计需求消失),A26 的 quat_integrate select 守卫(已落)保持。
+- **sign 决议**:qd sign(0)=0 保留(GLSL 标准;warp +1 为少数派)——port 侧
+  `_wp_sign` 包装维持,不改 qd sign。
+- **数字**:探针 a45_normalize_parity_probe(normalize(0)=[0,0,0] 无 NaN;
+  (3,0,4)→(0.6,0,0.8) 回归 ✓);test_return 46/46;union 21/21 × {默认,audit};
+  collision 电池 84+2S(数值回归面);ruff 归零。
+- **footprint**:mathimpl.py +4/−1。语义变化 = normalize(0) NaN→0(warp parity);
+  依赖 NaN 传播的调用面无(全量门禁过)。
+
+## a24-phase1-cfg-threshold — CPU fast_math 去 reassoc + 修复消抵和 miscompile(ledger A47)
 - **归因**:fast_math(默认 ON)的 FMF 含 AllowReassoc(codegen_llvm.cpp
   initialize_context)——后端重排浮点和,翻转近抵消残差符号(GJK/EPA 刀锋分支
   在残差符号上分叉,collision_gjk 3F);且实证到更深的 **miscompile**:消抵形
