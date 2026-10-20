@@ -298,11 +298,7 @@ def normalize(v):
         >>> qd.math.normalize(v)
         [0.267261, 0.534522, 0.801784]
     """
-    # A45/A26 parity: warp's normalize(0) returns the zero vector, while a raw
-    # 0/0 here yields NaN. Guard the norm so a zero (or near-degenerate) input
-    # divides by 1 and propagates zeros instead of NaNs.
-    n = v.norm()
-    return v / ops.select(n > 0.0, n, 1.0)
+    return v / v.norm()
 
 
 @func

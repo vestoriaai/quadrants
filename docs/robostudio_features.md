@@ -1,5 +1,5 @@
 <!-- INDEX — merged lines (newest last; each entry's full section via its header below) -->
-<!-- qd-copy-api 2ce5a850 · c2-emitter-fixes 83b2d1a2 · subgroup-cpu-support 8ebf8620 · reassociate-flag 19ff0276 · reassoc-subgroup-probe 9372c300 · r5-host-visible 67e27bc4 · spirv-vectorize 68bd7965 · algorithms-2 b12c125c · compiler-line 33e7dabf · n2-to-numpy-type 4a76ce7c · a10-nested-loop-raw c52711b5 · a19-stlf-fallback 3793c86d · a20-loop-var-scope 01d2037e · metal-i64 01d2037e · a7-m2-compound 869a00a0 · qd-native-bvh 76541b81 · cpu-head-state-per-iteration 4a400a11 · a32-static-return-order e0f35bdd · a34-bool-cast 91351dbd · a37-compile-uaf 4da921ff · familyr-realfunc-composite 57391b9f · audit-lint 2bb6b7f4 · ruff-import-sort 41175f2a · a46-recursion-guard 96cbd731 · a24-phase1-cfg-threshold 8ae3bfe4 · a47-float-parity 7a077591 · a45-normalize-parity (this) -->
+<!-- qd-copy-api 2ce5a850 · c2-emitter-fixes 83b2d1a2 · subgroup-cpu-support 8ebf8620 · reassociate-flag 19ff0276 · reassoc-subgroup-probe 9372c300 · r5-host-visible 67e27bc4 · spirv-vectorize 68bd7965 · algorithms-2 b12c125c · compiler-line 33e7dabf · n2-to-numpy-type 4a76ce7c · a10-nested-loop-raw c52711b5 · a19-stlf-fallback 3793c86d · a20-loop-var-scope 01d2037e · metal-i64 01d2037e · a7-m2-compound 869a00a0 · qd-native-bvh 76541b81 · cpu-head-state-per-iteration 4a400a11 · a32-static-return-order e0f35bdd · a34-bool-cast 91351dbd · a37-compile-uaf 4da921ff · familyr-realfunc-composite 57391b9f · audit-lint 2bb6b7f4 · ruff-import-sort 41175f2a · a46-recursion-guard 96cbd731 · a24-phase1-cfg-threshold 8ae3bfe4 · a47-float-parity 7a077591 · a45-normalize-parity【已回退】 · binary-identity 4e729612 -->
 
 # robostudio_features.md — features ledger for robostudio-main
 
@@ -1188,6 +1188,14 @@ test_state_history_get_set`:旧 wheel = A19 assert 拒编译(FAIL);新 wheel =
   (3,0,4)→(0.6,0,0.8) 回归 ✓);test_return 46/46;union 21/21 × {默认,audit};
   collision 电池 84+2S(数值回归面);ruff 归零。
 - **footprint**:mathimpl.py +4/−1。语义变化 = normalize(0) NaN→0(warp parity);
+
+
+- **回退(2026-10-20)**:normalize(0)=0 使 implicitfast 路径 v_fast 角速度全 NaN
+  (discrete_gyro_with_unrelated_contacts ×2 + discrete_matches_implicit_damping_only
+  ×2;DISCRETE 正常保持初值)。干净轮二分:7a077591(无 parity)6 passed ✓ /
+  parity 轮 4 failed ✗ → 回归 = normalize parity。已 revert(恢复 NaN 语义);
+  A26 的 quat_integrate select 守卫保留;port `_wp_sign`/守卫维持。重启前置 =
+  implicitfast 路径 NaN 源头定位后按 per-site 落地。
   依赖 NaN 传播的调用面无(全量门禁过)。
 
 ## binary-identity — 离线缓存键二进制指纹 + build stamp(ledger A28/A29)
