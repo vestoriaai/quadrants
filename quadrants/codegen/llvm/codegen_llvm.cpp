@@ -3183,6 +3183,17 @@ void TaskCodeGenLLVM::initialize_context() {
     fast_flags.setNoSignedZeros();
     fast_flags.setAllowReassoc();
     fast_flags.setApproxFunc();
+    // A47: the parity reference (warp CPU, and numpy left-to-right) evaluates
+    // float chains with strict left-to-right rounding. AllowReassoc lets the
+    // backend regroup float sums, which flips the sign of near-cancellation
+    // residuals (GJK/EPA blade branches pick a side on those signs) and
+    // miscompiles cancellation-shaped sums outright (probe
+    // _probe/a47_reassoc_repro.py: a three-term sum returns one term under
+    // reassoc). Keep GPU semantics unchanged - vectorized GPU codegen may
+    // rely on it and no parity issue is reported there.
+    if (arch_is_cpu(compile_config.arch)) {
+      fast_flags.setAllowReassoc(false);
+    }
     builder->setFastMathFlags(fast_flags);
   }
 }

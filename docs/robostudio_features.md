@@ -1,5 +1,5 @@
 <!-- INDEX — merged lines (newest last; each entry's full section via its header below) -->
-<!-- qd-copy-api 2ce5a850 · c2-emitter-fixes 83b2d1a2 · subgroup-cpu-support 8ebf8620 · reassociate-flag 19ff0276 · reassoc-subgroup-probe 9372c300 · r5-host-visible 67e27bc4 · spirv-vectorize 68bd7965 · algorithms-2 b12c125c · compiler-line 33e7dabf · n2-to-numpy-type 4a76ce7c · a10-nested-loop-raw c52711b5 · a19-stlf-fallback 3793c86d · a20-loop-var-scope 01d2037e · metal-i64 01d2037e · a7-m2-compound 869a00a0 · qd-native-bvh 76541b81 · cpu-head-state-per-iteration 4a400a11 · a32-static-return-order e0f35bdd · a34-bool-cast 91351dbd · a37-compile-uaf 4da921ff · familyr-realfunc-composite 57391b9f · audit-lint 2bb6b7f4 · ruff-import-sort 41175f2a · a46-recursion-guard 96cbd731 · a24-phase1-cfg-threshold (this) -->
+<!-- qd-copy-api 2ce5a850 · c2-emitter-fixes 83b2d1a2 · subgroup-cpu-support 8ebf8620 · reassociate-flag 19ff0276 · reassoc-subgroup-probe 9372c300 · r5-host-visible 67e27bc4 · spirv-vectorize 68bd7965 · algorithms-2 b12c125c · compiler-line 33e7dabf · n2-to-numpy-type 4a76ce7c · a10-nested-loop-raw c52711b5 · a19-stlf-fallback 3793c86d · a20-loop-var-scope 01d2037e · metal-i64 01d2037e · a7-m2-compound 869a00a0 · qd-native-bvh 76541b81 · cpu-head-state-per-iteration 4a400a11 · a32-static-return-order e0f35bdd · a34-bool-cast 91351dbd · a37-compile-uaf 4da921ff · familyr-realfunc-composite 57391b9f · audit-lint 2bb6b7f4 · ruff-import-sort 41175f2a · a46-recursion-guard 96cbd731 · a24-phase1-cfg-threshold 8ae3bfe4 · a47-float-parity (this) -->
 
 # robostudio_features.md — features ledger for robostudio-main
 
@@ -1176,6 +1176,24 @@ test_state_history_get_set`:旧 wheel = A19 assert 拒编译(FAIL);新 wheel =
   46/46、union runner **21/21**(gate 14 x3 含)。④限制:SSOT 自身未表现过此洞
   (守卫为预防层);ownership 审计 pass(IR operand 存活性断言,估 ~50 行)评估
   为可选拍板项,未动手——malloc_history 只解归因不解检测,错值形态曾无崩溃签名。
+
+## a47-float-parity — CPU fast_math 去 reassoc + 修复消抵和 miscompile(ledger A47)
+- **归因**:fast_math(默认 ON)的 FMF 含 AllowReassoc(codegen_llvm.cpp
+  initialize_context)——后端重排浮点和,翻转近抵消残差符号(GJK/EPA 刀锋分支
+  在残差符号上分叉,collision_gjk 3F);且实证到更深的 **miscompile**:消抵形
+  三项和(l0=0,l1=l2=1,s2=1,s3=s4=2⁻²⁴)在 reassoc 下返回单项 u(任何 fp 正确
+  求值都应 = 2u),3/3 可复现。warp 参照(/tmp→_probe a47_warp_ref):严格
+  L2R;FMA 收缩两侧一致(FMA 判别探针三方验证)。
+- **修复**:CPU 后端 FMF 去 AllowReassoc(arch_is_cpu 分域,afn/ninf/nsz 保留;
+  GPU 不动——先例 = fdiv afn 按 arch 分域 codegen_llvm.cpp:605)。
+- **数字**:miscompile 复现探针 ON==L2R 恢复;u 异常消失;3 个 box_box 测试
+  原值未动(1.3928056e-06 等)——**残留分叉 = 工具链位级差异**(warp 自带
+  toolchain vs qd LLVM 22,fast-math 下调度/选择差异),非 qd codegen 可达;
+  三测试断言钉上游工具链位,处置归 port 测试口径(语义断言)。
+- **footprint**:codegen_llvm.cpp +9(arch_is_cpu 分域);spec 文档;探针
+  (a47_reassoc_repro 双形态 + FMA 判别 + warp 参照)。
+- **门禁**:test_return 46/46;union 21/21 × {默认,audit};ruff 归零;
+  clang-tidy codegen_llvm.cpp 0 repo warnings;A46 守卫回归验证通过。
 
 ## a24-phase1-cfg-threshold — cfg pass 大 kernel 阈值让位(ledger A24 Phase 1)
 - **设计**:`CompileConfig::cfg_auto_skip_threshold`(默认 150000,0=禁用):
