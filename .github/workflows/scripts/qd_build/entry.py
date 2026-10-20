@@ -1,11 +1,14 @@
 # -*- coding: utf-8 -*-
 
 import argparse
+import hashlib
 import glob
 import os
 import platform
 import shutil
 import sys
+import subprocess
+from pathlib import Path
 
 import psutil
 
@@ -21,10 +24,39 @@ from .tinysh import Command, CommandFailed, nice, sh
 
 
 # -- code --
+def _build_identity_stamp() -> str:
+    # A29: identity of what the build SHOULD produce. scikit-build-core + ninja
+    # are timestamp-driven, so a git checkout that rewinds file mtimes (branch
+    # switch, revert) leaves stale objects in the build dir and the wheel ships
+    # old binaries. The stamp = source commit + CMAKE_ARGS hash; a mismatch
+    # nukes the build dir so the next configure starts clean.
+    import hashlib
+
+    head = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+    ca = os.environ.get("CMAKE_ARGS", "")
+    return hashlib.sha256(f"{head}\n{ca}".encode()).hexdigest()
+
+
+def _enforce_build_stamp(stamp: str) -> None:
+    for bdir in glob.glob("build/cp*"):
+        sfile = Path(bdir) / ".build_stamp"
+        if sfile.exists() and sfile.read_text().strip() != stamp:
+            print(f"[A29] build dir {bdir} identity changed - removing stale build tree")
+            shutil.rmtree(bdir, ignore_errors=True)
+
+
+def _write_build_stamp(stamp: str) -> None:
+    for bdir in glob.glob("build/cp*"):
+        (Path(bdir) / ".build_stamp").write_text(stamp)
+
+
 @banner("Build Quadrants Wheel")
 def build_wheel(python: Command) -> None:
     # cmake_args.writeback() renders the effective options into CMAKE_ARGS for scikit-build-core.
     cmake_args.writeback()
+
+    stamp = _build_identity_stamp()
+    _enforce_build_stamp(stamp)
 
     plat = None
     u = platform.uname()
@@ -52,6 +84,8 @@ def build_wheel(python: Command) -> None:
         # scikit-build-core emits a bare linux_x86_64 / macosx_* tag; stamp the distribution platform tag the project
         # ships under (manylinux / macOS).
         python("-m", "wheel", "tags", "--platform-tag", plat, "--remove", wheels[0])
+
+    _write_build_stamp(stamp)
 
 
 def setup_basic_build_env():

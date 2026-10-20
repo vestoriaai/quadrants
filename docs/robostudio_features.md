@@ -1190,7 +1190,22 @@ test_state_history_get_set`:旧 wheel = A19 assert 拒编译(FAIL);新 wheel =
 - **footprint**:mathimpl.py +4/−1。语义变化 = normalize(0) NaN→0(warp parity);
   依赖 NaN 传播的调用面无(全量门禁过)。
 
-## a24-phase1-cfg-threshold — CPU fast_math 去 reassoc + 修复消抵和 miscompile(ledger A47)
+## binary-identity — 离线缓存键二进制指纹 + build stamp(ledger A28/A29)
+- **设计**:①A28:get_offline_cache_key_of_compile_config 首字段序列化加载态
+  .so 内容 SHA256(dladdr 定位,picosha2,进程内一次)——换任何二进制键即变,
+  杜绝旧产物假绿/假红。②A29:build.py(entry.py,scikit-build-core 之前)计算
+  身份戳 = git HEAD + CMAKE_ARGS 哈希,与 build/cp*/.build_stamp 比对,不符 →
+  删陈旧 build 树(ninja 时间戳驱动,git 回卷 mtime 回退即 stale wheel 机理)。
+- **数字**:A29 实证:CMAKE_ARGS 翻转 → "identity changed - removing stale
+  build tree" → 全量重配重编 + stamp 更新;A28 实证:wheel A 填缓存(3 qdc)→
+  wheel B(不同 .so)对同缓存 → 3 个全新哈希 .qdc(键变),同轮重跑命中;
+  T1-T5 全绿。
+- **footprint**:offline_cache_util.cpp +26(fingerprint+序列化+includes);
+  entry.py +34(stamp/enforce/write)。
+- **限制**:上线后全员缓存一次性失效重烤(预期);指纹哈希进程一次性 ~50ms;
+  A29 不覆盖未提交编辑的 mtime 回退(HEAD+CARGS 覆盖全部实测案例)。
+
+## a47-float-parity — CPU fast_math 去 reassoc + 修复消抵和 miscompile(ledger A47,7a077591)
 - **归因**:fast_math(默认 ON)的 FMF 含 AllowReassoc(codegen_llvm.cpp
   initialize_context)——后端重排浮点和,翻转近抵消残差符号(GJK/EPA 刀锋分支
   在残差符号上分叉,collision_gjk 3F);且实证到更深的 **miscompile**:消抵形

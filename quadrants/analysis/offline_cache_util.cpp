@@ -10,6 +10,9 @@
 
 #include "picosha2.h"
 
+#include <dlfcn.h>
+#include <fstream>
+
 #include <vector>
 
 namespace quadrants::lang {
@@ -31,9 +34,32 @@ static std::vector<std::uint8_t> get_offline_cache_key_of_rets(const std::vector
   return serializer.data;
 }
 
+// A28: fingerprint the loaded quadrants shared object into the offline cache
+// key. Cached artifacts are compiled by THIS binary; a different wheel (new
+// codegen, different flags, different build type) must not reuse them even
+// when the Python sources and config are identical. Hashed once per process.
+static std::string get_loaded_lib_fingerprint() {
+  static const std::string fingerprint = [] {
+    Dl_info info{};
+    if (dladdr(reinterpret_cast<void *>(&get_loaded_lib_fingerprint), &info) == 0 ||
+        info.dli_fname == nullptr) {
+      return std::string("unavailable");
+    }
+    std::ifstream lib_file(info.dli_fname, std::ios::binary);
+    if (!lib_file) {
+      return std::string("unavailable");
+    }
+    std::string content((std::istreambuf_iterator<char>(lib_file)),
+                        std::istreambuf_iterator<char>());
+    return picosha2::hash256_hex_string(content);
+  }();
+  return fingerprint;
+}
+
 static std::vector<std::uint8_t> get_offline_cache_key_of_compile_config(const CompileConfig &config) {
   BinaryOutputSerializer serializer;
   serializer.initialize();
+  serializer(get_loaded_lib_fingerprint());
   serializer(config.arch);
   serializer(config.debug);
   serializer(config.cfg_optimization);
