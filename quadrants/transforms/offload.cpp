@@ -915,6 +915,25 @@ void rebuild_head_state_per_iteration(Block *root_block) {
   for (auto *a : allocas)
     cluster_rep[a] = find(a);
 
+  // Last root position at which each cluster is referenced (load, store or
+  // atomic anywhere in that root statement's subtree). A cluster referenced
+  // after a loop has a post-loop consumer: a read after the loop, a later loop,
+  // a kernel return. Rebuilding such a cluster per-iteration would redirect the
+  // loop's stores into the clones and leave that consumer reading the
+  // never-updated original (ledger A52: `n = 0; for i in range(10): n += 1;
+  // use(n)` read back 0). Those clusters keep the promotion path instead - the
+  // launch-shared slot the pre-fix pipeline gave them, atomics staying atomic -
+  // which is the "post-loop consumers never enter this path" contract above.
+  std::unordered_map<Stmt *, int> last_ref_pos;
+  for (int i = 0; i < n_root; i++) {
+    ScanHeadStateUses scan(cluster_rep);
+    order[i]->accept(&scan);
+    for (auto *rep : scan.written_reps())
+      last_ref_pos[rep] = i;
+    for (auto *rep : scan.read_reps())
+      last_ref_pos[rep] = i;
+  }
+
   for (auto *loop : order) {
     const bool is_top_level_for =
         loop->is<RangeForStmt>() || loop->is<StructForStmt>() || loop->is<MeshForStmt>();
@@ -935,12 +954,15 @@ void rebuild_head_state_per_iteration(Block *root_block) {
 
     ScanHeadStateUses scan(cluster_rep);
     loop->accept(&scan);
-    // Rebuild only the write-and-read clusters (the defect signature). A
-    // write-only cluster -- disjoint slice stores with the consumer after the
-    // loop -- is legal and race-free today; leave its promotion untouched.
+    // Rebuild only the write-and-read clusters (the defect signature) that have
+    // no reference after this loop. A write-only cluster -- disjoint slice
+    // stores with the consumer after the loop -- is legal and race-free today;
+    // a cluster with any post-loop consumer must stay promoted (see
+    // last_ref_pos above). Both leave their promotion untouched.
+    const int loop_pos = root_pos.at(loop);
     std::set<Stmt *> rebuild_reps;
     for (auto *rep : scan.written_reps()) {
-      if (scan.read_reps().count(rep) > 0)
+      if (scan.read_reps().count(rep) > 0 && last_ref_pos.at(rep) <= loop_pos)
         rebuild_reps.insert(rep);
     }
     if (rebuild_reps.empty())
@@ -959,7 +981,6 @@ void rebuild_head_state_per_iteration(Block *root_block) {
     // source performs before the loop). Values produced by other root
     // statements (consts, argloads, root arithmetic) stay put and reach the
     // clones through the normal cross-task machinery, deterministically.
-    const int loop_pos = root_pos.at(loop);
     std::unordered_map<Stmt *, Stmt *> clone_of;  // member alloca -> clone
     std::set<Stmt *> has_prefix;
     VecStatement cloned;
