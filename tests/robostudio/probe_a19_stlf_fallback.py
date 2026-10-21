@@ -220,7 +220,7 @@ def ray_ellipsoid(pos: qd.math.vec3, mat: qd.math.mat3, size: qd.math.vec3, pnt:
     c = qd.math.dot((s) * (lpnt), lpnt) - 1.0
     sol, _ = _ray_quad(a, b, c)
     normal = qd.math.vec3(0.0)
-    l = 0.0
+    l = qd.math.vec3(0.0)  # A51: scalar `l = 0.0` rebound to vec3 is now a loud error
     if sol >= 0:
         l = lpnt + lvec * sol
         normal = (s) * (l)

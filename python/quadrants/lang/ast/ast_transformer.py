@@ -253,7 +253,10 @@ class ASTTransformer(Builder):
         the shape-mismatched tensor -> tensor case gets a clear message here too
         (it used to assert deep inside scalarize).
         """
-        if not isinstance(value, expr.Expr):
+        # Non-Expr targets (e.g. a python int held by a qd.static loop variable)
+        # keep the plain-assign path: var._assign raises the historical
+        # "cannot be assigned" error for them below (gate S2 G_staticfor_rebind).
+        if not isinstance(value, expr.Expr) or not isinstance(var, expr.Expr):
             return
         lhs_tensor = var.is_tensor()
         rhs_tensor = value.is_tensor()
