@@ -125,3 +125,25 @@ offline cache(kernel_compilation_manager key 未含二进制内容),gate/电池�
 ~/.cache/quadrants/qdcache;归缓存键线,非本线修复;(2) write-only+循环内读未来
 形态的响亮拒绝/lint 补位;(3) mujoqo 侧 10+ 序列化 workaround 移除回归(集成线);
 (4) metal 端到端(metal 冻结中,门禁 metal 臂单列)。
+
+## A52 后记(2026-10-21):循环后消费者保持提升
+
+battery 首次全量分类(630F)暴露本线判据的设计缺口:头声明在**未序列化顶层循环
+内被写∧读**即整簇重建,但若该簇**循环后还有消费者**(epilogue 读/后续循环/kernel
+return),重建把循环内 store 改写进克隆体,消费者只能读到从未更新的原 alloca
+——`n = 0; for i in range(10): n += 1; use(n)` 返回 0(qd 自家套件约 120 实例:
+offload_cross/local_atomics/reduction/ndrange/struct_for/fibonacci/matrixfree 等,
+即上游 Taichi 语义的"并行循环累加 + 循环后读",其 `+=` 在提升路径上是 atomic,
+launch 共享槽 + atomic 本就 race-free)。
+
+修复(offload.cpp `last_ref_pos`):预计算每个簇在根语句序列中的最后引用位置;
+写∧读簇**仅当循环后无任何引用**才重建。循环后有消费者的簇保持提升路径(上游
+语义,与上文"read-only/write-only 跨任务引用不进本路径"的契约一致);仅循环内
+消费的簇保持 per-iteration 重建(_flex_edges 竞态契约不变,gate 19 绿)。
+
+验证:探针三形态 10/45 全对(含 field/ndarray/kernel-return 通道);gate 19 PASS;
+union runner 21/21;上游簇 8 文件 73F→4F(余 4 = test_atomic_add_global,修复前
+dev130 同挂,独立既有问题);port CPU flex+ray+passive 380P/1F(已知 A47 tie)、
+metal ray 22P/1F 无回归;clang-tidy 零告警。分支 mujocoqd/a52-head-state-postloop
+(4a400a11 判据缺口 + A51 跟随两处:S2 G 非 Expr 守卫、a19 探针内嵌 ellipsoid
+更新为 vec3 形态)。
