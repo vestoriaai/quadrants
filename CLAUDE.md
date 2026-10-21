@@ -33,3 +33,11 @@ Genesis AI Taichi fork 的 robostudio 部署分支。**`robostudio-main` 为 sin
 - 构建/测试脚本:写 /tmp 小脚本(逐条短行 append,每条 ≤80 字符,写后 cat 验证)再执行;禁止单条超长内联命令。
 - 任何写文件操作完成后必须核验产物:python 过 ast.parse、shell 过语法检查、或 grep 关键行。
 - 主 worktree 禁用 git add -A(会吸入未跟踪垃圾,如 graft/);只 add 白名单路径。git commit --amend 前必查 HEAD 归属。
+
+## 测试编写(2026-10-21 A50/A51 battery 后成文)
+
+- tests/python 下测试的**内层 kernel/func 一律用带前缀的唯一名**(如 `a50a51_broken`),禁用
+  `broken`/`ok`/`k`/`test` 等通用名:全量 battery 上下文下内核物化缓存可能按名撞键,变换出
+  错误 AST(症状:无关报错如 "field cannot be called in Quadrants-scope"),单跑无法复现。
+- 顶层 range-for 后读局部变量 = 跨 offload 任务读(QD 语义下当前丢值,账本 A52),测试里的
+  循环累加要用 `qd.loop_config(serialize=True)` 或把循环嵌进单一任务再断言。
