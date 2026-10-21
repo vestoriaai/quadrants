@@ -165,6 +165,22 @@ def _infer_array_dt(arr):
     return functools.reduce(qd_python_core.promoted_type, map(_infer_entry_dt, arr))
 
 
+def _reject_tensor_entries(arr):
+    """Matrix elements must all be scalars: make_matrix_expr flattens entries into
+    one primitive-typed MatrixExpression (frontend_ir.cpp asserts dt->is<PrimitiveType>()).
+
+    A Tensor-typed entry is almost always a multi-value func return assigned whole
+    (`x = f(...)` routes the tuple here via Expr(tuple)); give the unpack fix instead
+    of dying in C++ asserts two layers deep (ledger A50)."""
+    for i, elt in enumerate(arr):
+        if isinstance(elt, expr.Expr) and elt.is_tensor():
+            raise QuadrantsTypeError(
+                f"Matrix elements must all be scalars, but element {i} is a Tensor with shape "
+                f"{elt.get_shape()}. If this came from a function returning multiple values, "
+                f"unpack it instead: `a, b = f(...)` (whole-tuple assign `x = f(...)` is not a value)."
+            )
+
+
 def make_matrix_with_shape(arr, shape, dt):
     return expr.Expr(
         impl.get_runtime()
@@ -189,6 +205,7 @@ def make_matrix(arr, dt=None):
             arr = [elt for row in arr for elt in row]
         else:  # vector
             shape = [len(arr)]
+        _reject_tensor_entries(arr)
         if dt is None:
             dt = _infer_array_dt(arr)
         else:

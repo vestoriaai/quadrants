@@ -244,6 +244,32 @@ class ASTTransformer(Builder):
         return None
 
     @staticmethod
+    def _check_reassign_type(target_id: str, var, value) -> None:
+        """A local variable's type is fixed by its first assignment (ledger A51).
+
+        A scalar variable assigned a Tensor has no coherent semantics: LLVM/CPU
+        silently truncated the tensor to its first component (wrong values), while
+        SPIR-V refused to compile. Scalar -> tensor stays a legal broadcast; only
+        the shape-mismatched tensor -> tensor case gets a clear message here too
+        (it used to assert deep inside scalarize).
+        """
+        if not isinstance(value, expr.Expr):
+            return
+        lhs_tensor = var.is_tensor()
+        rhs_tensor = value.is_tensor()
+        if not lhs_tensor and rhs_tensor:
+            raise exception.QuadrantsTypeError(
+                f"Variable '{target_id}' was created as a scalar but is assigned a Tensor "
+                f"with shape {value.get_shape()}. Variables keep a fixed type inside a kernel - "
+                f"initialize it as a vector instead, e.g. '{target_id} = qd.math.vec3(0.0)'."
+            )
+        if lhs_tensor and rhs_tensor and var.get_shape() != value.get_shape():
+            raise exception.QuadrantsTypeError(
+                f"Variable '{target_id}' has shape {var.get_shape()} but is assigned a Tensor "
+                f"with shape {value.get_shape()}. Variables keep a fixed shape inside a kernel."
+            )
+
+    @staticmethod
     def build_assign_basic(ctx: ASTTransformerFuncContext, target: ast.Name, value, is_static_assign: bool):
         """Build basic assignment like this: target = value.
 
@@ -272,6 +298,8 @@ class ASTTransformer(Builder):
             if is_local:
                 ctx.check_assign_not_loop_var(target.id)
             var = build_stmt(ctx, target)
+            if is_local:
+                ASTTransformer._check_reassign_type(target.id, var, value)
             try:
                 var._assign(value)
             except AttributeError:
