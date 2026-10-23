@@ -1346,3 +1346,25 @@ test_state_history_get_set`:旧 wheel = A19 assert 拒编译(FAIL);新 wheel =
   收口项,当前验收基于 clone venv);②torch 侧钉住 runtime 的具体引用未深挖
   (修复哲学:不依赖不拥有的清理顺序,防御性 atexit);③下次 bake A29 自动删树
   全量重编(build type 变化),sccache 热缓存 ~7min。
+
+## a57-lowerast-usage — lower_ast 每 assign 全块 usage-replace O(N²)(2026-10-24)
+
+- **设计**:lower_ast.cpp 全部 15 个 replace_with 调用点显式
+  `replace_usages=false` + LowerAST 类前注释固化约束。根因(A57 归因,
+  mujoqo-metal docs/qd-cfg超线性-归因.md):Frontend* AST 语句的 operand 只可能
+  来自 flatten_rvalue/lvalue 的 IR 产物,不可能被任何语句引用 → 默认
+  replace_usages=true 触发的 StatementUsageReplace 全块虚分发遍历是恒空集扫描,
+  每语句一次全块扫 = O(N²);带符号采样 242/367 在此路径。行为恒等(IR 逐位同),
+  仅消除空扫。归因反转同案:cfg pass 实测非当前瓶颈(真实 238k kernel 强制跑
+  threshold=0 CPU/metal 均 ~20s/1.11GB),A54 阈值守卫保留正确。
+- **数字**:scaling 链(cfg=0,adv=0)M=100 8.4s→2.7s、120 36-41s→4.6s、
+  160 >90s hang→11.9s、200 >180s hang→26.6s(指数 ~5→~3;残留 = light
+  simplify/die 同族 = P1 项挂账)。qd 全量 battery(dev140+A57 轮,xdist -n4,
+  9.5min)18F/6980P/694S/17XF,13 unique 嫌疑项(src_ll_cache×4/math_module
+  [metal]×2/overflow/offline_cache_changing_config[metal])经 dev140 轮与
+  dev136+A56 补丁轮三重对照同挂 = 零回归;union gates **21/21 PASS**。
+- **footprint**:lower_ast.cpp +23/−15(15 调用点 + 注释)。零旗标、零 native、
+  IR 形态不变 → offline cache 键无涉。
+- **限制**:①静态展开单块仍残留 ~O(N^2.x) 于无条件 light simplify/die 的
+  每变更全块重扫(P1 挂账,use-list/脏块集方案待评估);②cfg pass 内部
+  O(L×B)/O(R×K) 模式仍在码上(P2,真实 IR 有界,不急)。
