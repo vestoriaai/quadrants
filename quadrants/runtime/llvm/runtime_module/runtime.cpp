@@ -949,6 +949,14 @@ void runtime_initialize_snodes(LLVMRuntime *runtime,
 void LLVMRuntime_initialize_thread_pool(LLVMRuntime *runtime, void *thread_pool, void *parallel_for) {
   runtime->thread_pool = (Ptr)thread_pool;
   runtime->parallel_for = (parallel_for_type)parallel_for;
+  // C1.5: env-tunable inline threshold for small range-fors (default 64 tasks)
+  if (const char *env = std::getenv("QD_AUTO_SERIAL")) {
+    if (std::strcmp(env, "0") == 0)
+      runtime->serial_range_threshold = 0;
+  }
+  if (const char *env = std::getenv("QD_AUTO_SERIAL_THRESHOLD")) {
+    runtime->serial_range_threshold = std::atoi(env);
+  }
 }
 
 void runtime_NodeAllocator_initialize(LLVMRuntime *runtime, int snode_id, std::size_t node_size) {
@@ -1794,7 +1802,19 @@ void cpu_parallel_range_for(RuntimeContext *context,
   }
   range_task_context.body_loop_size = block_dim;
   auto runtime = context->runtime;
-  runtime->parallel_for(runtime->thread_pool, (end - begin + block_dim - 1) / block_dim, num_threads,
+  const int ntasks = (end - begin + block_dim - 1) / block_dim;
+  // C1.5 (QD_AUTO_SERIAL): small pure range-fors run inline on the submitting
+  // thread - the pool's wake-all barrier (~13us) dwarfs small loop bodies.
+  // Scoped here (not in the pool) so only plain range-fors take the fallback;
+  // graph do-while and other task shapes keep pool semantics. Each task is
+  // self-contained (stack TLS, per-task xlogue), so thread-0 replay is
+  // order-only different. Threshold 64 tasks by default, env-tunable.
+  if (ntasks <= runtime->serial_range_threshold && step == 1) {
+    for (int t = 0; t < ntasks; t++)
+      cpu_parallel_range_for_task(&range_task_context, 0, t);
+    return;
+  }
+  runtime->parallel_for(runtime->thread_pool, ntasks, num_threads,
                         &range_task_context, cpu_parallel_range_for_task);
 }
 

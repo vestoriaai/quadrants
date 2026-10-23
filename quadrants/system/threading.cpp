@@ -37,14 +37,6 @@ ThreadPool::ThreadPool(int max_num_threads) : max_num_threads(max_num_threads) {
   task_head = 0;
   task_tail = 0;
   thread_counter = 0;
-  // C1.5: env-configurable serial fallback for small task counts. Default on
-  // with a conservative threshold; QD_AUTO_SERIAL=0 restores wake-all behavior.
-  {
-    const char *env = std::getenv("QD_AUTO_SERIAL");
-    const char *thr = std::getenv("QD_AUTO_SERIAL_THRESHOLD");
-    serial_task_threshold = (env != nullptr && std::strcmp(env, "0") == 0) ? 0
-                            : (thr != nullptr ? std::atoi(thr) : 64);
-  }
   threads.resize((std::size_t)max_num_threads);
   for (int i = 0; i < max_num_threads; i++) {
     threads[i] = std::thread([this] { this->target(); });
@@ -52,17 +44,6 @@ ThreadPool::ThreadPool(int max_num_threads) : max_num_threads(max_num_threads) {
 }
 
 void ThreadPool::run(int splits, int desired_num_threads, void *task_context, TaskFn *task_fn) {
-  // C1.5 serial fallback: per-task semantics are self-contained (task TLS is a
-  // stack local; prologue/epilogue run per task; CPU range-for kernels have no
-  // cross-task synchronization), so replaying every task_id on thread 0 is
-  // order-only different from the wake-all path. Block-tier (simt.block)
-  // kernels spawn their own std::threads and do not route through this pool.
-  if (serial_task_threshold > 0 && splits <= serial_task_threshold) {
-    for (int t = 0; t < splits; t++) {
-      task_fn(task_context, 0, t);
-    }
-    return;
-  }
   {
     std::lock_guard _(mutex);
     this->task_context = task_context;

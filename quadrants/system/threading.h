@@ -38,12 +38,6 @@ class ThreadPool {
   void *task_context;
   int thread_counter;
 
-  // C1.5 (QD_AUTO_SERIAL): task splits at or below this threshold run inline on
-  // the submitting thread. The pool's mutex/condvar wake-all + master-wait round
-  // trip costs ~13us, which dwarfs small loop bodies (measured: 27-elem range-for
-  // 2.5us serial vs 16.9us parallel; 4096-elem still favors serial). 0 disables.
-  int serial_task_threshold;
-
   explicit ThreadPool(int max_num_threads);
 
   void run(int splits, int desired_num_threads, void *task_context, TaskFn *task_fn);

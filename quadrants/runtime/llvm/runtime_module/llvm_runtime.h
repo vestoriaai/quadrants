@@ -104,6 +104,8 @@ struct PreallocatedMemoryChunk {
 };
 
 struct LLVMRuntime {
+  // C1.5: small range-fors run inline (QD_AUTO_SERIAL / QD_AUTO_SERIAL_THRESHOLD)
+  int serial_range_threshold = 64;
   PreallocatedMemoryChunk runtime_objects_chunk;
   PreallocatedMemoryChunk runtime_memory_chunk;
 

@@ -1018,6 +1018,8 @@ class Kernel(FuncBase):
         """
         if self._mutable_nd_cached_val or self._tensor_unwrap_indices:
             return
+        if self.graph_do_while_levels or self.use_graph:
+            return  # graph/do-while launches carry per-launch ctx wiring the lane does not replicate
         if self._struct_ndarray_launch_info_by_key.get(key):
             return
         if compiled_kernel_data is None:
@@ -1074,11 +1076,20 @@ class Kernel(FuncBase):
         # call; any miss falls through to the full path below, which remains
         # the semantic authority.
         if self._c1_lane is not None and qd_stream is None and not self.use_checkpoints \
+                and not self.graph_do_while_levels and not self.use_graph \
                 and self.autodiff_mode == _NONE \
                 and self.runtime.target_tape is None and not self.runtime.fwd_mode_manager:
+            import os as _o
+            if _o.environ.get('C1DBG2'):
+                fn = getattr(self, 'func', None)
+                print('DBG gate PASS:', fn.__name__ if fn else '?', 'ug=', self.use_graph, 'gdl=', self.graph_do_while_levels)
             lane_get = self._c1_lane.get
             key_ids = tuple([id(a) for a in py_args])
             entry = lane_get(key_ids)
+            if entry is not None:
+                if _o.environ.get('C1DBG2'):
+                    fn2 = getattr(self, 'func', None)
+                    print('DBG fast HIT:', fn2.__name__ if fn2 else '?')
             if entry is not None:
                 t_kernel, cached_ctx, kernel_cpp, ckd, scalars = entry
                 for (sid, sval), a in zip(scalars, py_args):
@@ -1090,6 +1101,10 @@ class Kernel(FuncBase):
                         entry = None
                         break
                 if entry is not None:
+                    import os as _o
+                    if _o.environ.get('C1DBG'):
+                        fn = getattr(self, 'func', None)
+                        print('DBG fast hit:', fn.__name__ if fn else '?', 'ntotal_args=', len(py_args))
                     ctx = t_kernel.make_launch_context()
                     ctx.copy(cached_ctx)
                     prog = impl.get_runtime().prog
@@ -1191,7 +1206,12 @@ class Kernel(FuncBase):
             if compiled_kernel_data is None:
                 assert self._last_compiled_kernel_data is not None
                 self.compiled_kernel_data_by_key[key] = self._last_compiled_kernel_data
-            if self._c1_lane is not None:
+            # Return-value kernels (kernel returning a scalar) are excluded from
+            # the lane: the fast path cannot relay their return value.
+            import os as _o
+            if _o.environ.get('C1DBG') and self.name == 'total':
+                print('DBG total ret=', ret, 'lane_n=', len(self._c1_lane) if self._c1_lane else None)
+            if self._c1_lane is not None and ret is None:
                 self._c1_maybe_populate(py_args, key, kernel_cpp, compiled_kernel_data)
             return ret
         # Checkpoint-enabled slow path: translate the user-supplied `from_checkpoint=` label into the dense,
