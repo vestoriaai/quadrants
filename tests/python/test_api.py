@@ -129,6 +129,7 @@ user_api[qd] = [
     "checkpoint",
     "clock_counter",
     "clock_freq_hz",
+    "copy",
     "cos",
     "cpu",
     "create_event",
@@ -292,6 +293,8 @@ user_api[qd.algorithms] = [
     "select_scratch_slots",
     "sort",
     "sort_scratch_slots",
+    "sort_segmented",
+    "sort_segmented_scratch_slots",
 ]
 user_api[qd.Field] = [
     "copy_from",

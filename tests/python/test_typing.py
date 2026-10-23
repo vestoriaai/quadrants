@@ -1,4 +1,4 @@
-import test_utils
+from tests import test_utils
 
 import quadrants as qd
 
