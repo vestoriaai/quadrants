@@ -1,3 +1,4 @@
+import atexit
 import numbers
 import threading
 import weakref
@@ -526,6 +527,7 @@ class PyQuadrants:
     def create_program(self):
         if self._prog is None:
             self._prog = _qd_core.Program()
+            _register_exit_cache_dump()
 
     @staticmethod
     def materialize_root_fb(is_first_call):
@@ -649,6 +651,37 @@ pyquadrants = PyQuadrants()
 
 def get_runtime() -> PyQuadrants:
     return pyquadrants
+
+
+# A56: interpreter shutdown does not reliably destroy the Program -- co-imported heavy
+# frameworks (torch is pulled in transitively by ``import quadrants`` whenever it is
+# installed) change module-clear ordering so ``~Program`` (and the kernel-cache dump that
+# lives in ``Program::finalize``) never runs. The offline cache then misses on the next
+# process: the Python-side L1/L2 entries are written eagerly, but the C++ artifacts they
+# name are never dumped. Flush the dump via atexit instead. Only the dump, not finalize():
+# other exit hooks may still use the runtime, and ``KernelCompilationManager::dump`` is
+# idempotent (it moves out and clears ``caching_kernels_``), so the finalize-time dump
+# no-ops after ours.
+_exit_cache_dump_registered = False
+
+
+def _register_exit_cache_dump() -> None:
+    global _exit_cache_dump_registered
+    if _exit_cache_dump_registered:
+        return
+    _exit_cache_dump_registered = True
+
+    def _dump_caches_at_exit():
+        # Late-bind through the module global: ``reset()`` swaps in a fresh PyQuadrants
+        # (and Program) after this hook was registered.
+        prog = getattr(pyquadrants, "_prog", None)
+        if prog is not None:
+            try:
+                prog.dump_cache_data_to_disk()
+            except Exception:  # noqa: BLE001 - shutdown must not raise
+                pass
+
+    atexit.register(_dump_caches_at_exit)
 
 
 _reset_hooks: list[Callable[[], None]] = []

@@ -117,6 +117,13 @@ build-backend = "scikit_build_core.build"
 # Track the scikit-build-core pin in [build-system].requires so default behaviours
 # stay stable as scikit-build-core evolves.
 minimum-version = "build-system.requires"
+# Ship symbolized wheels: sample/atos/backward-cpp 崩溃回溯都要符号表+行号才能把地址
+# 翻回函数名(A56/A57 归因实证:剥符号轮曾让采样归因全盲)。scikit-build-core 默认
+# build-type=Release 且 install.strip=true,会把本地符号剥掉(25759 T / 0 t);
+# 注意 CMAKE_ARGS 里的 CMAKE_BUILD_TYPE 会被 scikit-build-core 当 unsupported define
+# 显式丢弃(builder.py:_UNSUPPORTED_ENV_DEFINES),改默认只能走这里。
+cmake.build-type = "RelWithDebInfo"
+install.strip = false
 # Persistent build dir keyed by wheel tag -> fast incremental rebuilds (esp. editable).
 build-dir = "build/{wheel_tag}"
 # Pure-Python packages live under python/; each final path element is the importable

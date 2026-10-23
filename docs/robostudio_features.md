@@ -1319,3 +1319,30 @@ test_state_history_get_set`:旧 wheel = A19 assert 拒编译(FAIL);新 wheel =
   方向撤销);②alias 索引数断言保守 uncertain 可能轻微增加保守性(正确性
   优先);③FRDBG/A42DBG 插桩已回退留史;④A37 线 UAF(a19 宿主)x3 防闪烁
   维持,根因 lldb 深挖另行立项。
+
+## a56-fastcache-torch — A56 offline-cache miss with torch + 符号轮默认(2026-10-23)
+
+- **设计**:①**A56 修复**(impl.py):Program 创建时注册 atexit 钩子,只调
+  `dump_cache_data_to_disk()`。根因 = `import quadrants` 经 `has_pytorch()` 探测
+  传递性拉起 torch → torch 改变解释器关闭期模块清除顺序 → `~Program` 不执行 →
+  `KernelCompilationManager::dump` 不跑 → C++ artifact 缺失;Python 侧 L1/L2
+  运行期已落盘,二次进程 L2 校验过但 `load_fast_cache` 加载空。两级 key 全组成
+  逐位一致(key 分叉假设被探针推翻)。dump 幂等(dump 移空 caching_kernels_,
+  finalize 期二次 no-op);不调 finalize(其它退出钩子可能还用 runtime);钩子经
+  模块全局 late-bind,reset() 换新 Program 后仍指向现役。②**符号轮默认**
+  (pyproject.toml):`cmake.build-type="RelWithDebInfo"` + `install.strip=false`。
+  发售轮此前剥本地符号(25759 T / 0 t),sample/atos/backward-cpp 全盲(A56/A57
+  归因实证);CMAKE_ARGS 里的 CMAKE_BUILD_TYPE 被 scikit-build-core
+  `_UNSUPPORTED_ENV_DEFINES` 设计性丢弃,pyproject 一等设置是唯一正道
+  (SettingsReader 实读验证,探针 verify_pyproject_settings.py)。
+- **数字**:A56 测试(clone venv 直改 wheel 验证,共享 venv 未动)torch 轮
+  2/2(arm64+metal)、checkpoint 族 84P、cache 族 78P+1S+1XF;无 torch 干净轮
+  53P/1S 不回归。符号轮 .so 53→73MB、wheel 压缩后 23.5→26.3MB(+3MB),
+  运行时零影响。
+- **footprint**:impl.py +33;pyproject.toml +7;_probe 新件 7(两级 key 探针 ×2/
+  关闭期四模式/gc 引用体检/wheel 直改 ×2/settings 验证)。零旗标、零 native、
+  缓存 schema 无涉(cachevalue-v6 不变)。
+- **限制**:①发布级 wheel 重烤后的 qd tests/python 全量 battery 待跑(A56 验收
+  收口项,当前验收基于 clone venv);②torch 侧钉住 runtime 的具体引用未深挖
+  (修复哲学:不依赖不拥有的清理顺序,防御性 atexit);③下次 bake A29 自动删树
+  全量重编(build type 变化),sccache 热缓存 ~7min。
