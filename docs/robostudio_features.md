@@ -1368,3 +1368,22 @@ test_state_history_get_set`:旧 wheel = A19 assert 拒编译(FAIL);新 wheel =
 - **限制**:①静态展开单块仍残留 ~O(N^2.x) 于无条件 light simplify/die 的
   每变更全块重扫(P1 挂账,use-list/脏块集方案待评估);②cfg pass 内部
   O(L×B)/O(R×K) 模式仍在码上(P2,真实 IR 有界,不急)。
+
+## a58-baseline-cleanup — qd battery 13 unique 鉴别清理(2026-10-24,进行中)
+
+- **设计**:dev142 battery 18F/13 unique 逐项三重对照(dev136 纯轮 / dev138 原版轮 /
+  dev140+A57 轮)归因分桶。结论:①**C1/C1.5 窗口回归包(移交 C1 线,非本线修复)**:
+  src_ll_cache 全 4 例 + test_offline_cache_with_changing_compile_config 双 arch +
+  test_math_module[metal](translate/scale/rotation3d) + test_quadrants_other_than_ti
+  ——dev136 干净、dev138 起挂,含 worker 崩溃(Bus error/SIGSEGV,"node down"),
+  嫌疑 = C1a fast lane × qd.reset() 生命周期交互(崩溃可级联同 worker 邻测,
+  math [metal] 的"worker crashed"疑为级联非真挂);②**真基线既有**:overflow 8 例
+  (dev136 同挂,语义账)、print family(A53 缓冲 flush,dev136 同挂 6 例)、
+  ast_refactor::test_func_in_python_func(A46 递归守卫误伤静态终止递归 idiom
+  — qd.static(x) 模板递归是 taichi 合法惯用法,守卫需语义升级)、pyi_stubs
+  (pyright 子进程 env 缺失类)、test_api/typing(机械项,本 commit 已修)。
+- **数字**:机械项修复后 test_api 19P + test_typing 4P;其余分桶见上。
+- **footprint**:test_api.py +3(期望列表 copy/sort_segmented×2);test_typing.py
+  import 路径 1 行。
+- **限制**:①C1 窗口回归包待 C1 线归因修复(门禁未覆盖 src_ll_cache/急速 reset
+  流程);②A53/A46/overflow 为独立语义立项,未在本 commit 处理。
