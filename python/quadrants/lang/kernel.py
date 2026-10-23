@@ -6,6 +6,10 @@ import pathlib
 import time
 import warnings
 from collections import defaultdict
+
+
+def _c1_lane_pop(d, k):
+    d.pop(k, None)
 from dataclasses import _FIELDS  # type: ignore[reportAttributeAccessIssue]
 
 # Must import 'partial' directly instead of the entire module to avoid attribute lookup overhead.
@@ -398,6 +402,14 @@ class Kernel(FuncBase):
         self._mutable_nd_cached_key: CompiledKernelKeyType | None = None
         self._mutable_nd_cached_val: list = []
         self._tensor_unwrap_indices: tuple[int, ...] | None = None
+        # C1a fast lane: args-identity tuple -> (t_kernel, cached_launch_ctx,
+        # kernel_cpp, compiled_kernel_data). Populated only for kernels whose
+        # guard chain is statically empty (no struct-ndarray args); every keyed
+        # ndarray registers a weakref finalizer to drop entries on death.
+        # QD_LAUNCH_FAST=0 disables.
+        self._c1_lane: dict | None = (
+            {} if os.environ.get("QD_LAUNCH_FAST", "1") != "0" else None
+        )
 
     def ast_builder(self) -> ASTBuilder:
         assert self.kernel_cpp is not None
@@ -992,6 +1004,52 @@ class Kernel(FuncBase):
                 else:
                     launch_ctx_buffer[_INT].append((arg_id, int(obj)))
 
+    def _c1_maybe_populate(self, py_args, key, kernel_cpp, compiled_kernel_data):
+        """Fill the C1a fast lane for this args identity, if fully eligible.
+
+        Eligibility (all must hold; any miss simply leaves the lane empty for
+        this key and the full path stays authoritative):
+        - no struct-ndarray guard chain for this key (mutable containers would
+          need the per-call guard re-check);
+        - no tensor-unwrap rewrite happened;
+        - the launch-context cache holds a binding for this identity;
+        - every argument supports weakref (death of any keyed ndarray must
+          drop the entry — id reuse must never alias a dead binding).
+        """
+        if self._mutable_nd_cached_val or self._tensor_unwrap_indices:
+            return
+        if self._struct_ndarray_launch_info_by_key.get(key):
+            return
+        if compiled_kernel_data is None:
+            compiled_kernel_data = self._last_compiled_kernel_data
+            if compiled_kernel_data is None:
+                return
+        t_kernel = self.materialized_kernels[key]
+        cached_ctx = self.launch_context_buffer_cache._launch_ctx_cache.get(
+            (id(kernel_cpp), *[id(a) for a in py_args])
+        )
+        if cached_ctx is None:
+            return
+        import weakref as _wk
+        # Scalars are not weakrefable and their ids can be recycled with a
+        # different value: store (id, value) pairs and re-validate on hit.
+        # Ref types register a finalizer that drops the entry on death.
+        scalars = []
+        for a in py_args:
+            if isinstance(a, (int, float, bool)):
+                scalars.append((id(a), a))
+                continue
+            try:
+                _wk.ref(a)
+            except TypeError:
+                return  # unknown unweakrefable ref type: stay conservative
+            scalars.append((None, None))
+        args_hash = tuple(id(a) for a in py_args)
+        self._c1_lane[args_hash] = (t_kernel, cached_ctx, kernel_cpp, compiled_kernel_data, tuple(scalars))
+        for a in py_args:
+            if not isinstance(a, (int, float, bool)):
+                _wk.finalize(a, _c1_lane_pop, self._c1_lane, args_hash)
+
     def ensure_compiled(self, *py_args: tuple[Any, ...]) -> tuple[Callable, int, AutodiffMode]:
         try:
             instance_id, arg_features = self.mapper.lookup(self.raise_on_templated_floats, py_args)
@@ -1006,6 +1064,37 @@ class Kernel(FuncBase):
     @_shell_pop_print
     def __call__(self, *py_args, **kwargs) -> Any:
         qd_stream = kwargs.pop("qd_stream", None)
+        # C1a fast lane (QD_LAUNCH_FAST, default on): replay a fully-bound
+        # launch for a previously-seen args identity tuple. Eligibility is
+        # decided on the slow path (no struct-ndarray guard chain, no fuse
+        # rewrite, no tensor unwrap, non-checkpoint, autodiff-free) and every
+        # ndarray in the key registers a weakref finalizer that drops the lane
+        # entry, so id reuse can never alias a dead binding. Runtime gates
+        # (tape / fwd_mode / checkpoints / stream) are re-checked here each
+        # call; any miss falls through to the full path below, which remains
+        # the semantic authority.
+        if self._c1_lane is not None and qd_stream is None and not self.use_checkpoints \
+                and self.autodiff_mode == _NONE \
+                and self.runtime.target_tape is None and not self.runtime.fwd_mode_manager:
+            lane_get = self._c1_lane.get
+            key_ids = tuple([id(a) for a in py_args])
+            entry = lane_get(key_ids)
+            if entry is not None:
+                t_kernel, cached_ctx, kernel_cpp, ckd, scalars = entry
+                for (sid, sval), a in zip(scalars, py_args):
+                    if sid is None:
+                        continue  # ref-type arg, guarded by its weakref finalizer
+                    if sid != id(a) or a != sval:
+                        # scalar id recycled with a different value: stale lane
+                        self._c1_lane.pop(key_ids, None)
+                        entry = None
+                        break
+                if entry is not None:
+                    ctx = t_kernel.make_launch_context()
+                    ctx.copy(cached_ctx)
+                    prog = impl.get_runtime().prog
+                    prog.launch_kernel(ckd, ctx)
+                    return None
         # `use_checkpoints` is the kernel-construction-time flag set by `@qd.kernel(graph=True, checkpoints=True)`. The
         # `_qd_from_checkpoint` kwarg can only be injected by `QuadrantsCallable.resume()`, which is the user-facing
         # entry that requires `use_checkpoints=True`. So for the dominant (non-checkpoint) launch path we can skip the
@@ -1102,6 +1191,8 @@ class Kernel(FuncBase):
             if compiled_kernel_data is None:
                 assert self._last_compiled_kernel_data is not None
                 self.compiled_kernel_data_by_key[key] = self._last_compiled_kernel_data
+            if self._c1_lane is not None:
+                self._c1_maybe_populate(py_args, key, kernel_cpp, compiled_kernel_data)
             return ret
         # Checkpoint-enabled slow path: translate the user-supplied `from_checkpoint=` label into the dense,
         # source-order internal cp_id the runtime uses. Translation happens here (after `ensure_compiled`) because

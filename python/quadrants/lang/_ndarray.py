@@ -1,5 +1,6 @@
 # type: ignore
 
+import os
 from typing import TYPE_CHECKING, Union
 
 import numpy as np
@@ -505,7 +506,15 @@ class ScalarNdarray(Ndarray):
                 arr_shape,
                 layout=Layout.NULL,
                 zero_fill=True,
-                dbg_info=_qd_core.DebugInfo(get_traceback()),
+                # C1a (QD_ALLOC_DBG, default off): unconditional per-allocation
+                # traceback extraction (extract_stack + linecache stats) costs
+                # tens of us per ndarray and dominated flex workloads. Set
+                # QD_ALLOC_DBG=1 to restore allocation-site debug info.
+                dbg_info=(
+                    _qd_core.DebugInfo(get_traceback())
+                    if os.environ.get("QD_ALLOC_DBG", "0") == "1"
+                    else _qd_core.DebugInfo()
+                ),
                 host_visible=host_visible,
             )
             self._qd_host_visible = host_visible
