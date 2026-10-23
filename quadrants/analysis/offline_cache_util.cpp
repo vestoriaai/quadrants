@@ -64,6 +64,7 @@ static std::vector<std::uint8_t> get_offline_cache_key_of_compile_config(const C
   serializer(config.debug);
   serializer(config.cfg_optimization);
   serializer(config.cfg_auto_skip_threshold);
+  serializer(config.advanced_optimization_auto_skip_threshold);
   serializer(config.check_out_of_bound);
   serializer(config.opt_level);
   serializer(config.external_optimization_level);

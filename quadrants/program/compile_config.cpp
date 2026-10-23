@@ -21,6 +21,7 @@ CompileConfig::CompileConfig() {
   debug = false;
   cfg_optimization = true;
   cfg_auto_skip_threshold = 150000;
+  advanced_optimization_auto_skip_threshold = 150000;
   check_out_of_bound = false;
   serial_schedule = false;
   move_loop_invariant_outside_if = false;

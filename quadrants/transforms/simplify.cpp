@@ -531,7 +531,25 @@ void full_simplify(IRNode *root, const CompileConfig &config, const FullSimplify
       ofs << ir_str;
     }
   };
-  if (config.advanced_optimization) {
+  // A54: the loop below iterates constant-fold / die / alg_simp / LICM /
+  // simplify / CSE to a fixpoint; like the cfg pass (Phase 1 threshold) these
+  // scale superlinearly with IR size. On the SPIR-V path a 150k+-statement
+  // scalarized kernel (_sdf_narrowphase with the mesh-SDF ray path live) held
+  // several GB for minutes and got SIGKILLed, while the light path below
+  // compiled it in 33 s / 1.2 GB. Above the threshold take the light path -
+  // every skipped pass is semantics-preserving, the code is just less optimized.
+  bool skip_advanced = false;
+  if (config.advanced_optimization && config.advanced_optimization_auto_skip_threshold != 0) {
+    const std::size_t n_stmts = analysis::count_statements(root);
+    if (n_stmts > config.advanced_optimization_auto_skip_threshold) {
+      skip_advanced = true;
+      QD_WARN(
+          "advanced_optimization skipped for kernel {}: {} statements exceed "
+          "advanced_optimization_auto_skip_threshold={}",
+          args.kernel_name, n_stmts, config.advanced_optimization_auto_skip_threshold);
+    }
+  }
+  if (config.advanced_optimization && !skip_advanced) {
     bool first_iteration = true;
     int iteration = 0;
     if (should_dump)

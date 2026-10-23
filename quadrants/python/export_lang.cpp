@@ -197,6 +197,11 @@ void export_lang(nb::module_ &m) {
               "data structures scale superlinearly, which dominates compile time and memory on huge kernels. 0 "
               "disables the skip; default 150000 (above every legitimate kernel). The skip changes codegen, so the "
               "value participates in the offline cache key.")
+      .def_rw("advanced_optimization_auto_skip_threshold", &CompileConfig::advanced_optimization_auto_skip_threshold,
+              "Skip the whole advanced-optimization simplify loop (fall back to the light constant-fold/die/simplify "
+              "path) when a kernel's IR statement count exceeds this threshold (ledger A54): iterated to a fixpoint on "
+              "150k+-statement scalarized SPIR-V kernels the loop held several GB for minutes. Semantics identical, "
+              "less optimized. 0 disables; default 150000; participates in the offline cache key.")
       .def_rw("check_out_of_bound", &CompileConfig::check_out_of_bound,
               "Enable the field out-of-bounds check on tensor indexing without turning on the rest of debug mode. "
               "Reset to off (with a warning) on backends without assertion support, i.e. Vulkan and Metal.")

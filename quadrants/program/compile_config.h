@@ -13,6 +13,12 @@ struct CompileConfig {
   // this threshold (its data structures scale superlinearly on huge kernels).
   // 0 disables the skip; default chosen above every legitimate kernel.
   std::size_t cfg_auto_skip_threshold;
+  // A54: same guard for the whole advanced-optimization simplify loop. Its
+  // passes (constant fold / die / alg_simp / LICM / simplify / CSE) iterated to
+  // a fixpoint also scale superlinearly; on a 150k+-statement scalarized SPIR-V
+  // kernel they held several GB for minutes. Above the threshold the light
+  // path runs instead (semantics identical, less optimized). 0 disables.
+  std::size_t advanced_optimization_auto_skip_threshold;
   bool check_out_of_bound;
   bool validate_autodiff;
   int simd_width;
