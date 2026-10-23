@@ -11,7 +11,9 @@ struct CompileConfig {
   bool cfg_optimization;
   // A24 Phase 1: skip the cfg pass for kernels whose IR statement count exceeds
   // this threshold (its data structures scale superlinearly on huge kernels).
-  // 0 disables the skip; default chosen above every legitimate kernel.
+  // 0 disables the skip. Default 50000 (A54 recalibration): the 150000 of
+  // Phase 1 let a 143k-statement scalarized SPIR-V kernel (ccd_hfield) through,
+  // where the pass held 9 GB; typical kernels are a few thousand statements.
   std::size_t cfg_auto_skip_threshold;
   // A54: same guard for the whole advanced-optimization simplify loop. Its
   // passes (constant fold / die / alg_simp / LICM / simplify / CSE) iterated to

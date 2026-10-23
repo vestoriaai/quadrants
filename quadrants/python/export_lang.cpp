@@ -195,7 +195,7 @@ void export_lang(nb::module_ &m) {
       .def_rw("cfg_auto_skip_threshold", &CompileConfig::cfg_auto_skip_threshold,
               "Skip the cfg_optimization pass when a kernel's IR statement count exceeds this threshold: the pass's "
               "data structures scale superlinearly, which dominates compile time and memory on huge kernels. 0 "
-              "disables the skip; default 150000 (above every legitimate kernel). The skip changes codegen, so the "
+              "disables the skip; default 50000 (A54: cfg held 9 GB on a 143k-statement kernel). The skip changes codegen, so the "
               "value participates in the offline cache key.")
       .def_rw("advanced_optimization_auto_skip_threshold", &CompileConfig::advanced_optimization_auto_skip_threshold,
               "Skip the whole advanced-optimization simplify loop (fall back to the light constant-fold/die/simplify "
