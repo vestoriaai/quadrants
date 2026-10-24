@@ -30,6 +30,7 @@ RhiResult CpuDevice::allocate_memory(const AllocParams &params, DeviceAllocation
       return RhiResult::out_of_memory;
     }
   }
+  info.pool_gen = HostMemoryPool::get_instance().generation();  // A60 stamp
   *out_devalloc = DeviceAllocation{};
   out_devalloc->alloc_id = allocations_.size();
   out_devalloc->device = this;
@@ -60,6 +61,14 @@ void CpuDevice::dealloc_memory(DeviceAllocation handle) {
   }
   if (info.ptr == nullptr) {
     QD_ERROR("the DeviceAllocation is already deallocated");
+  }
+  // A60: stamp mismatch => this allocation's memory was already globally
+  // unmapped by HostMemoryPool::reset() (every qd.reset()/re-init). A late
+  // destructor arriving here must not release: the OS may have recycled the
+  // address into a live new-generation allocation. Drop the stale entry only.
+  if (info.pool_gen != HostMemoryPool::get_instance().generation()) {
+    info.ptr = nullptr;
+    return;
   }
   if (!info.use_cached) {
     HostMemoryPool::get_instance().release(info.size, info.ptr);
@@ -137,6 +146,7 @@ DeviceAllocation CpuDevice::import_memory(void *ptr, size_t size) {
   AllocInfo info;
   info.ptr = ptr;
   info.size = size;
+  info.pool_gen = HostMemoryPool::get_instance().generation();  // A60 stamp
 
   DeviceAllocation alloc;
   alloc.alloc_id = allocations_.size();

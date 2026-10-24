@@ -1387,3 +1387,31 @@ test_state_history_get_set`:旧 wheel = A19 assert 拒编译(FAIL);新 wheel =
   import 路径 1 行。
 - **限制**:①C1 窗口回归包待 C1 线归因修复(门禁未覆盖 src_ll_cache/急速 reset
   流程);②A53/A46/overflow 为独立语义立项,未在本 commit 处理。
+
+## c15-serial-default — A59/A60/A46 修复线 + C1a 硬化 + A61-perf 实验(2026-10-24,squash of mujocoqd/c15-serial-default)
+
+- **设计**:①A59 runtime:C1.5 串行内联默认阈值从未生效——LLVMRuntime 裸分配
+  无构造,`serial_range_threshold=64` 默认初始化器不执行,实测读 0,全部
+  range-for launch 恒走线程池(每次白付 11-18µs 整池唤醒);修复 =
+  initialize_thread_pool 显式默认。②A60 rhi:qd.reset() 后新 ndarray 写
+  未映射页——HostMemoryPool 跨代地址复用 ABA(整池 munmap 后 fresh mmap
+  复用地址,旧代 Ndarray 迟到析构按 ptr 在新分配器命中并释放新代页);
+  修复 = 池代际戳(reset++),CpuDevice 分配盖戳、释放戳不符只清表项。
+  ③A46 升级:静态终止递归(qd.static 惯用法)从"同名即报错"改为
+  静态作用域计数 + 128 层上限,运行时值递归深度 2 即命名报错;专用
+  thread-local 计数器与 is_in_static_scope 解耦(复用会改编译语义,
+  solver 4F 回归换来的教训)。④C1a 随行硬化:reset 清 fast-lane/LCBC
+  双缓存 + fast hit prog 身份校验(同类 UAF 防御)。
+- **数字**:A59 修复后 launch_kernel 直调 10.9→0.12µs,27-elem 核 16.9→
+  2.28µs;mujoqo S1-S6 eager 全线 2.5-3× 提速(S1 2.15→0.75/S5 7.3→4.0/
+  S6 2.9→1.24ms)。A58 回归包全绿(src_ll_cache 55P×3、offline_cache、
+  math_module、ast_refactor 99P 含 other_than_ti);test_return 46P;
+  A60 最小组合(此前必崩)3 连绿。
+- **footprint**:runtime.cpp +9;host_memory_pool +13;cpu_device +12;
+  kernel.py +22(reset 清缓存/prog 校验);_func_base +ast_transformer*
+  +49(A46);codegen 实验已回退,残留 0。
+- **限制**:①MT 改写形态下 threshold 语义失真(ntasks 恒=线程数,大核
+  全串行;S5 实测净效应为正)待设计复核;②A61-perf 入口块载荷提升
+  需任务序言级重构(ctx 栈副本 SROA 阻断 LICM),WIP+诊断见 mujoqo
+  docs/a61-perf-entry-hoist-wip.patch;③GPU(cuda/amdgpu)路径未审计
+  同类 ABA。

@@ -422,6 +422,18 @@ class Kernel(FuncBase):
         self._last_compiled_kernel_data = None
         self.src_ll_cache_observations = SrcLlCacheObservations()
         self.fe_ll_cache_observations = FeLlCacheObservations()
+        # C1a fast-lane entries bind the previous program's t_kernel/ckd with
+        # raw device pointers. Surviving Python objects (data-oriented structs
+        # whose ids outlive reset) can re-hit them and launch into freed
+        # runtime memory (Bus error, A58 regression package). The slow path is
+        # the semantic authority: drop the whole lane and let it repopulate.
+        self._c1_lane = (
+            {} if os.environ.get("QD_LAUNCH_FAST", "1") != "0" else None
+        )
+        lcbc = getattr(self, "launch_context_buffer_cache", None)
+        if lcbc is not None:
+            lcbc._launch_ctx_cache.clear()
+            lcbc._launch_ctx_cache_tracker.clear()
 
     def _try_load_fastcache(self, args: tuple[Any, ...], key: "CompiledKernelKeyType") -> set[str] | None:
         """Two-phase fastcache lookup: L1 (source+config, no args) for pruning info, then a narrow args walk over
@@ -1047,7 +1059,7 @@ class Kernel(FuncBase):
                 return  # unknown unweakrefable ref type: stay conservative
             scalars.append((None, None))
         args_hash = tuple(id(a) for a in py_args)
-        self._c1_lane[args_hash] = (t_kernel, cached_ctx, kernel_cpp, compiled_kernel_data, tuple(scalars))
+        self._c1_lane[args_hash] = (t_kernel, cached_ctx, kernel_cpp, compiled_kernel_data, tuple(scalars), impl.get_runtime().prog)
         for a in py_args:
             if not isinstance(a, (int, float, bool)):
                 _wk.finalize(a, _c1_lane_pop, self._c1_lane, args_hash)
@@ -1091,7 +1103,15 @@ class Kernel(FuncBase):
                     fn2 = getattr(self, 'func', None)
                     print('DBG fast HIT:', fn2.__name__ if fn2 else '?')
             if entry is not None:
-                t_kernel, cached_ctx, kernel_cpp, ckd, scalars = entry
+                t_kernel, cached_ctx, kernel_cpp, ckd, scalars, entry_prog = entry
+                # Program-swap guard: entries bind raw pointers into the program
+                # that filled them. A hit under a different program (any path
+                # that swaps programs without reset()) must fall through.
+                if entry_prog is not impl.get_runtime().prog:
+                    self._c1_lane.pop(key_ids, None)
+                    entry = None
+            if entry is not None:
+                t_kernel, cached_ctx, kernel_cpp, ckd, scalars, _ = entry
                 for (sid, sval), a in zip(scalars, py_args):
                     if sid is None:
                         continue  # ref-type arg, guarded by its weakref finalizer

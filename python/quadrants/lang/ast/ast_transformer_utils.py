@@ -1,6 +1,7 @@
 # type: ignore
 
 import ast
+import threading
 import builtins
 import dataclasses
 import traceback
@@ -87,6 +88,29 @@ class VariableScopeGuard:
 class StaticScopeStatus:
     def __init__(self):
         self.is_in_static_scope = False
+
+
+# A46 upgrade: thread-local depth of open qd.static scopes across ALL active
+# func transforms. Consumed by inline_cycle_guard to distinguish static-
+# guarded (compile-time, terminating) recursion from runtime-value recursion.
+_static_scope_tls = threading.local()
+
+
+def in_any_static_scope() -> bool:
+    # A46: dedicated depth for the inline_cycle_guard static-recursion arm.
+    # Fed by static_branch_tls_enter/exit (build_If static branches) — kept
+    # separate from is_in_static_scope, whose semantics other consumers depend
+    # on (solver regression: wrapping static-if in static_scope_guard changed
+    # compiled code for kernels with qd.static branches).
+    return getattr(_static_scope_tls, "branch_depth", 0) > 0
+
+
+def static_branch_tls_enter() -> None:
+    _static_scope_tls.branch_depth = getattr(_static_scope_tls, "branch_depth", 0) + 1
+
+
+def static_branch_tls_exit() -> None:
+    _static_scope_tls.branch_depth = getattr(_static_scope_tls, "branch_depth", 1) - 1
 
 
 class StaticScopeGuard:

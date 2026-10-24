@@ -54,6 +54,12 @@ class CpuDevice : public LlvmDevice {
     void *ptr{nullptr};
     size_t size{0};
     bool use_cached{false};
+    // A60: HostMemoryPool generation this allocation was made under. A release
+    // whose stamp no longer matches the live pool generation belongs to an
+    // allocation whose backing memory was already globally unmapped by
+    // HostMemoryPool::reset() (qd.reset()/re-init) — releasing it would munmap
+    // whatever new-generation allocation now owns the recycled address.
+    uint64_t pool_gen{0};
   };
 
   AllocInfo get_alloc_info(const DeviceAllocation handle);

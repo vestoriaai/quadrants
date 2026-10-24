@@ -220,19 +220,45 @@ def _get_frozen_dc_unwrapped(v: Any, struct_cls: type, fields_dict: dict) -> dic
 _inline_tls = threading.local()
 
 
+# A46 semantics upgrade (2026-10-24, A58 ledger followup): static-terminated
+# template recursion (`if qd.static(x): ... bar(x // 2)`) is a legal idiom —
+# the tracer evaluates the static condition at trace time and the recursion
+# bottoms out at the static else-branch. The original depth-2 guard rejected
+# it outright. Instead, bound the recursion DEPTH: each level inlines once, so
+# a runaway runtime-value recursion now fails fast at the cap with bounded IR
+# (no OOM), while legal static idioms (depth <= cap) pass. Python's own
+# recursion limit additionally bounds the tracer frames.
+_INLINE_CYCLE_MAX_DEPTH = 128
+
+
 @contextlib.contextmanager
 def inline_cycle_guard(func):
   stack = getattr(_inline_tls, "stack", None)
   if stack is None:
     stack = []
     _inline_tls.stack = stack
+  repeats = 0
   for f, name in stack:
     if f is func:
-      chain = " <- ".join(n for _, n in stack)
-      raise QuadrantsSyntaxError(
-          f"Recursive @qd.func call detected (inline cycle): {chain} <- "
-          f"{func.__qualname__}. quadrants does not support recursive "
-          "functions; restructure with an explicit loop instead.")
+      repeats += 1
+  from quadrants.lang.ast.ast_transformer_utils import in_any_static_scope
+  if repeats >= 1 and not in_any_static_scope():
+    # Runtime-value recursion: every level materializes inlined IR with no
+    # compile-time termination — the original A46 OOM case. Fail at depth 2.
+    chain = " <- ".join(n for _, n in stack[-8:])
+    raise QuadrantsSyntaxError(
+        f"Recursive @qd.func call detected (inline cycle): ... <- {chain} <- "
+        f"{func.__qualname__}. Runtime-value recursion is not supported; "
+        "restructure with an explicit loop, or guard every recursive call "
+        "behind a qd.static condition (compile-time recursion).")
+  if repeats >= _INLINE_CYCLE_MAX_DEPTH:
+    chain = " <- ".join(n for _, n in stack[-8:])
+    raise QuadrantsSyntaxError(
+        f"Recursive @qd.func call exceeded inline depth "
+        f"{_INLINE_CYCLE_MAX_DEPTH} (inline cycle): ... <- {chain} <- "
+        f"{func.__qualname__}. Runtime-value recursion is not supported; for "
+        "compile-time recursion, make sure every recursive call is guarded by "
+        "a qd.static condition that terminates within the depth cap.")
   stack.append((func, func.__qualname__))
   try:
     yield

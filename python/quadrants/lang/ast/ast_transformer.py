@@ -1615,7 +1615,17 @@ class ASTTransformer(Builder):
             # names would be semantically wrong, and initialize-before-if
             # remains the contract there).
             branch = node.body if node.test.ptr else node.orelse
-            build_stmts(ctx, branch, scope_guard=False)
+            # A46 upgrade: a taken qd.static branch is compile-time code. Track
+            # the depth in a DEDICATED counter (NOT is_in_static_scope — other
+            # consumers key on that and changing it alters name resolution /
+            # compiled semantics, regression-tested by solver_test). Consumers:
+            # inline_cycle_guard's static-recursion arm.
+            from quadrants.lang.ast.ast_transformer_utils import static_branch_tls_enter, static_branch_tls_exit
+            static_branch_tls_enter()
+            try:
+                build_stmts(ctx, branch, scope_guard=False)
+            finally:
+                static_branch_tls_exit()
             return node
 
         with ctx.non_static_if_guard(node):

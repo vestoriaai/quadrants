@@ -2,6 +2,7 @@
 #include "quadrants/common/core.h"
 #include "quadrants/rhi/common/unified_allocator.h"
 #include "quadrants/rhi/device.h"
+#include <atomic>
 #include <mutex>
 #include <vector>
 #include <memory>
@@ -23,6 +24,15 @@ class QD_DLL_EXPORT HostMemoryPool {
   HostMemoryPool();
   ~HostMemoryPool();
 
+  // A60: bump-allocator generation. `reset()` (invoked from Program::finalize on
+  // every qd.reset()/re-init) unmaps EVERY chunk the pool owns. A new generation
+  // then re-mmaps and the OS frequently recycles the just-freed addresses, so a
+  // late `~Ndarray` from the old generation can resolve its stale pointer inside
+  // the NEW allocator and munmap the new generation's live page (ABA -> SIGBUS).
+  // Devices stamp each allocation with the generation it was made under and skip
+  // releases whose stamp no longer matches; see CpuDevice::dealloc_memory.
+  uint64_t generation() const { return generation_.load(std::memory_order_relaxed); }
+
  protected:
   void *allocate_raw_memory(std::size_t size);
   void deallocate_raw_memory(void *ptr);
@@ -33,6 +43,7 @@ class QD_DLL_EXPORT HostMemoryPool {
 
   std::unique_ptr<UnifiedAllocator> allocator_;
   std::mutex mut_allocation_;
+  std::atomic<uint64_t> generation_{0};
 
   friend class UnifiedAllocator;
 };

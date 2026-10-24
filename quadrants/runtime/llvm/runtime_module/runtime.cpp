@@ -949,7 +949,14 @@ void runtime_initialize_snodes(LLVMRuntime *runtime,
 void LLVMRuntime_initialize_thread_pool(LLVMRuntime *runtime, void *thread_pool, void *parallel_for) {
   runtime->thread_pool = (Ptr)thread_pool;
   runtime->parallel_for = (parallel_for_type)parallel_for;
-  // C1.5: env-tunable inline threshold for small range-fors (default 64 tasks)
+  // C1.5: env-tunable inline threshold for small range-fors (default 64 tasks).
+  // LLVMRuntime is raw-allocated in runtime_initialize (host_allocator, no
+  // constructor runs), so the header's `int serial_range_threshold = 64`
+  // default member initializer never executes and the field reads malloc
+  // garbage (observed: 0 on fresh pages) — the serial-inline branch then
+  // never engages and every range-for pays the full pool wake barrier
+  // (~11-14us/launch). Set the default explicitly before the env overrides.
+  runtime->serial_range_threshold = 64;
   if (const char *env = std::getenv("QD_AUTO_SERIAL")) {
     if (std::strcmp(env, "0") == 0)
       runtime->serial_range_threshold = 0;

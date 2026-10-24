@@ -114,6 +114,10 @@ void HostMemoryPool::reset() {
   for (auto &ptr : ptr_map_copied) {
     deallocate_raw_memory(ptr.first);
   }
+  // A60: everything the pool owned is now unmapped; allocations stamped with an
+  // older generation must never be released again (their addresses may already
+  // have been recycled to the new generation). See HostMemoryPool::generation().
+  generation_.fetch_add(1, std::memory_order_relaxed);
 }
 
 HostMemoryPool::~HostMemoryPool() {
