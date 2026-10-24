@@ -802,10 +802,16 @@ class ScanHeadStateUses : public BasicStmtVisitor {
     for (const auto &entry : cluster_rep_) {
       if (chain_reaches(dest, entry.first, 0)) {
         written_reps_.insert(entry.second);
-        if (stmt->is<AtomicOpStmt>())
+        if (stmt->is<AtomicOpStmt>()) {
           // An atomic update is itself a read-modify-write on the (slice of
           // the) head alloca: counts as the read half as well.
           read_reps_.insert(entry.second);
+          // A62: an atomic whose returned old value is observable must stay
+          // atomic -- per-iteration rebuild turns `y[i] = atomic_add(ck, s)`
+          // into a private-slot load-op-store, and every iteration then reads
+          // the initial value (test_atomic_add_global: y[1..8] == 0).
+          atomic_reps_.insert(entry.second);
+        }
       }
     }
   }
@@ -818,10 +824,15 @@ class ScanHeadStateUses : public BasicStmtVisitor {
     return read_reps_;
   }
 
+  const std::set<Stmt *> &atomic_reps() const {
+    return atomic_reps_;
+  }
+
  private:
   const std::unordered_map<Stmt *, Stmt *> &cluster_rep_;  // member -> rep
   std::set<Stmt *> written_reps_;
   std::set<Stmt *> read_reps_;
+  std::set<Stmt *> atomic_reps_;
 };
 
 // Rewire operands inside a loop subtree from original head allocas to their
@@ -962,8 +973,17 @@ void rebuild_head_state_per_iteration(Block *root_block) {
     const int loop_pos = root_pos.at(loop);
     std::set<Stmt *> rebuild_reps;
     for (auto *rep : scan.written_reps()) {
-      if (scan.read_reps().count(rep) > 0 && last_ref_pos.at(rep) <= loop_pos)
-        rebuild_reps.insert(rep);
+      if (scan.read_reps().count(rep) > 0 && last_ref_pos.at(rep) <= loop_pos) {
+        // A62: a cluster updated via atomic_add keeps the launch-shared
+        // promotion -- the atomic's returned old value is observable inside
+        // the loop, and a per-iteration clone would give every iteration a
+        // private slot (breaking the RMW chain). Same upstream-Taichi-semantics
+        // rule as the post-loop-consumer guard above ("atomics stay atomic");
+        // parallel iterations racing on this slot is the user's semantic, not
+        // a race this rebuild may silently fix by cloning.
+        if (scan.atomic_reps().count(rep) == 0)
+          rebuild_reps.insert(rep);
+      }
     }
     if (rebuild_reps.empty())
       continue;

@@ -1443,3 +1443,24 @@ test_state_history_get_set`:旧 wheel = A19 assert 拒编译(FAIL);新 wheel =
   需任务序言级重构(ctx 栈副本 SROA 阻断 LICM),WIP+诊断见 mujoqo
   docs/a61-perf-entry-hoist-wip.patch;③GPU(cuda/amdgpu)路径未审计
   同类 ABA。
+
+## residual-cleanup — A62 局部标量 atomic 修复 + battery 全绿(2026-10-25)
+
+- **设计**:offload.cpp 的 head-state rebuild 判定排除 atomic cluster。
+  根因:`y[i] = qd.atomic_add(ck, step)`(ck 为 kernel 局部标量)命中 rebuild
+  签名(写 ∧ RMW 读 ∧ 无 post-loop)→ ck 被克隆成每迭代私有槽 → 返回旧值全 0
+  (runtime RangeFor 形态;static 展开形态无 RangeFor 任务本就正确——
+  _probe/a62_diagnose_v2.py 二形态对照)。修复 = ScanHeadStateUses 记录
+  atomic_reps_, rebuild 判定排除——与 A52 "atomics stay atomic" 上游语义
+  原则同源(A52 只覆盖 post-loop consumer, 本修复补循环内 RMW 消费形态);
+  gate 19 _flex_edges 契约(纯 store)不受影响。
+- **数字**:a62_diagnose_v2 双形态全绿;test_atomic 93P(4F 清零);
+  battery 全量 **7545P/0F**(qd battery 首次全绿;基线 18F/13 unique → 0);
+  union gates 21/21。
+- **footprint**:offload.cpp +23/−3;_probe/a62_diagnose_v2.py +a62 复现探针
+  ×2(源 a60_local_atomic_repro)。C++ 改动 = dev151 验证轮。
+- **限制**:①并行迭代对同一 alloca atomic 是用户语义(竞态), 保持 promotion
+  后与上游 Taichi 行为一致——rebuild 的防竞态保护对 atomic cluster 不生效,
+  依赖用户正确使用;②test_xdist_worker_retirement ×2 为 pytest 版本问题
+  (9.1.1 违反 b60dda49 的 8.4.2 pin → 崩溃替身多计数), 按 requirements-test.txt
+  钉 8.4.2 后消失, 非 qd 代码问题;venv 装轮须带 requirements-test.txt。
