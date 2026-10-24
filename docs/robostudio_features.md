@@ -1388,6 +1388,34 @@ test_state_history_get_set`:旧 wheel = A19 assert 拒编译(FAIL);新 wheel =
 - **限制**:①C1 窗口回归包待 C1 线归因修复(门禁未覆盖 src_ll_cache/急速 reset
   流程);②A53/A46/overflow 为独立语义立项,未在本 commit 处理。
 
+## battery-semantic-cleanup — A53/A46/pyi_stubs 语义账清理(2026-10-24)
+
+- **设计**:①**A53**(runtime+lang):kernel printf 从 A21 时代的 stderr 直写改回
+  py_cout 通道(enabled→buffer/disabled→std::cout),sync 双侧 flush——C++ 侧
+  synchronize_and_assert 末尾 stdout.flush,Python 侧 PyQuadrants.sync() pop
+  buffer 写 sys.__stdout__;assert_failed_host 先抢救缓冲保 A21"printf-then-abort"
+  诊断;shell.py 的 per-call pop+print 撤销(与 #1303 sync 语义矛盾且 capfd 不可见)。
+  ②**A46 语义账**:本线初版(static_call_flag 三级化)已被主链 c15-serial-default
+  线的实现取代(static 作用域计数 + in_any_static_scope + 128 上限 + runtime 值
+  递归 depth 2 早报, other_than_ti 双 arch 清零)——取主链版。
+  ③pyi_stubs 测试环境修正(pythonpath 钉 venv 解释器 + cwd 移 tmpdir;旧"需重生成"
+  分型有误——.pyi 随轮生成, 纯解析问题)。
+- **数字**:test_print+test_overflow **110P 全绿**(14 实例清零);ast_refactor
+  test_func_in_python_func 双 arch 翻绿;pyi_stubs 双 arch 翻绿;battery 全量
+  **15F/7530P/11 unique**(基线 18F/13 unique;四族目标全清);union gates **21/21**;
+  A46 反证三臂(_probe/a46_counterproof.py)静态递归 fact(5)=120 ✓、runtime
+  两种形态均拒 ✓。残留 11 unique 全为 C1/C1.5 窗口 flaky 面成员(atomic×4/math
+  [metal 多形态]/quant offset_load/offline_cache×2/src_ll_cache×4),双 wheel
+  双轮对照失败集漂移实证(同 wheel 两轮失败集不同),移交 C1 线清单更新。
+- **footprint**:llvm_runtime_executor.cpp +38/−10(pybuf printf+assert 抢救);
+  program.cpp +12(sync flush);shell.py +8/−5;impl.py +27(sync flush);
+  _func_base.py +55/−8(guard 三级化);call_transformer.py +7(标记接线);
+  test_pyi_stubs.py +12;_probe/a46_counterproof.py +a53 三探针。C++ 改动 =
+  A53 重烤轮(dev145+g1ac60f6d9.d20261024)。
+- **限制**:①C++ sync flush 对 disabled 路径每 sync 一次 std::cout.flush()
+  (微秒级,launch floor 线的 C1.5 语境已含 sync,无新增热点);②A46 深度上限 128
+  对 >128 层静态递归模板(现实中不存在)会拒;③C1 窗口 flaky 面未修(移交)。
+
 ## c15-serial-default — A59/A60/A46 修复线 + C1a 硬化 + A61-perf 实验(2026-10-24,squash of mujocoqd/c15-serial-default)
 
 - **设计**:①A59 runtime:C1.5 串行内联默认阈值从未生效——LLVMRuntime 裸分配

@@ -21,16 +21,28 @@
 #include "quadrants/rhi/llvm/device_memory_pool.h"
 #include "quadrants/program/program_impl.h"
 #include "quadrants/program/program.h"
+#include "quadrants/program/py_print_buffer.h"
 
 
-// A21 diagnostics: kernel-side runtime errors print then abort(); a buffered
-// stdout loses the message. Route kernel printf to the unbuffered stderr.
-static void kernel_printf_to_stderr(const char *fmt, ...) {
+// A53: kernel printf used to be routed to unbuffered stderr (A21: keep the
+// "printf then abort" diagnostics message alive). That broke the upstream
+// print contract: tests capture *stdout* (capfd .out) and taichi semantics
+// route kernel prints through the PythonPrintBuffer to qd.sync(). Route via
+// py_cout instead: enabled -> buffer (PyQuadrants.sync() flushes it to the
+// real fd), disabled -> std::cout (flushed at synchronize_and_assert). The
+// A21 abort case is covered by flushing the buffer inside assert_failed_host
+// before the error log.
+static void kernel_printf_via_pybuf(const char *fmt, ...) {
   va_list ap;
   va_start(ap, fmt);
-  vfprintf(stderr, fmt, ap);
+  char stackbuf[4096];
+  int n = std::vsnprintf(stackbuf, sizeof(stackbuf), fmt, ap);
   va_end(ap);
-  fflush(stderr);
+  if (n <= 0)
+    return;
+  if (n >= (int)sizeof(stackbuf))
+    n = (int)sizeof(stackbuf) - 1;
+  quadrants::py_cout << std::string_view(stackbuf, (std::size_t)n);
 }
 
 #if defined(QD_WITH_CUDA)
@@ -43,20 +55,35 @@ static void kernel_printf_to_stderr(const char *fmt, ...) {
 #if defined(QD_WITH_AMDGPU)
 #include "quadrants/rhi/amdgpu/amdgpu_context.h"
 
-// A21 diagnostics: kernel-side runtime errors print then abort(); a buffered
-// stdout loses the message. Route kernel printf to the unbuffered stderr.
-static void kernel_printf_to_stderr(const char *fmt, ...) {
+// A53: see kernel_printf_via_pybuf above.
+static void kernel_printf_via_pybuf(const char *fmt, ...) {
   va_list ap;
   va_start(ap, fmt);
-  vfprintf(stderr, fmt, ap);
+  char stackbuf[4096];
+  int n = std::vsnprintf(stackbuf, sizeof(stackbuf), fmt, ap);
   va_end(ap);
-  fflush(stderr);
+  if (n <= 0)
+    return;
+  if (n >= (int)sizeof(stackbuf))
+    n = (int)sizeof(stackbuf) - 1;
+  quadrants::py_cout << std::string_view(stackbuf, (std::size_t)n);
 }
 #endif
 
 namespace quadrants::lang {
 namespace {
 void assert_failed_host(const char *msg) {
+  // A53/A21: kernel prints now land in py_cout (buffered when a wrapped
+  // stdout was detected) -- flush the buffer to stderr before the error log
+  // so a "printf then abort" diagnostic is never lost to the buffer.
+  try {
+    auto pending = quadrants::py_cout.pop_content();
+    if (!pending.empty()) {
+      std::fwrite(pending.data(), 1, pending.size(), stderr);
+      std::fflush(stderr);
+    }
+  } catch (...) {
+  }
   QD_ERROR("Assertion failure: {}", msg);
 }
 
@@ -796,7 +823,7 @@ void LlvmRuntimeExecutor::materialize_runtime(KernelProfilerBase *profiler, uint
   auto *host_memory_pool = &HostMemoryPool::get_instance();
   runtime_jit->call<void *, void *, std::size_t, void *, int, void *, void *, void *, void *>(
       "runtime_initialize", *result_buffer_ptr, host_memory_pool, runtime_objects_prealloc_size,
-      runtime_objects_prealloc_buffer, num_rand_states, (void *)&host_allocate_aligned, (void *)&kernel_printf_to_stderr,
+      runtime_objects_prealloc_buffer, num_rand_states, (void *)&host_allocate_aligned, (void *)&kernel_printf_via_pybuf,
       (void *)std::vsnprintf, external_rand_states_buffer);
 
   QD_TRACE("LLVMRuntime initialized (excluding `root`)");

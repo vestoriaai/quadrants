@@ -19,17 +19,20 @@ _qd_core.toggle_python_print_buffer(pybuf_enabled)
 
 def _shell_pop_print(old_call):
     if not pybuf_enabled:
-        # zero-overhead!
+        # zero-overhead! (C++ writes kernel prints straight to the real fd)
         return old_call
 
     info("Graphical python shell detected, using wrapped sys.stdout")
 
+    # A53: kernel prints go to the C++ python print buffer and take effect at
+    # qd.sync() (taichi #1303 semantics) -- PyQuadrants.sync() pops the buffer
+    # and writes it to sys.__stdout__ (the real fd), so pytest capfd/capsys and
+    # Jupyter both see it. The per-call pop+print that used to live here wrote
+    # to the *wrapped* sys.stdout (invisible to capfd) and contradicted the
+    # documented sync-only semantics. Keeping the wrapper (instead of removing
+    # the decoration) preserves the wrapped-shell detection log line.
     @functools.wraps(old_call)
     def new_call(*args, **kwargs):
-        ret = old_call(*args, **kwargs)
-        # print's in kernel won't take effect until qd.sync(), discussion:
-        # https://github.com/taichi-dev/taichi/pull/1303#discussion_r444897102
-        print(_qd_core.pop_python_print_buffer(), end="")
-        return ret
+        return old_call(*args, **kwargs)
 
     return new_call

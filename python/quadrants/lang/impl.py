@@ -1,5 +1,6 @@
 import atexit
 import numbers
+import sys
 import threading
 import weakref
 from types import FunctionType, MethodType
@@ -644,6 +645,28 @@ class PyQuadrants:
             if wrapped is e:
                 raise
             raise wrapped from None
+        self._flush_python_print_buffer()
+
+    @staticmethod
+    def _flush_python_print_buffer():
+        # A53: kernel prints land in the C++ python print buffer whenever a
+        # wrapped sys.stdout was detected at import (shell.py) -- flush them to
+        # sys.__stdout__ (the real fd) here, restoring the documented
+        # "prints take effect at qd.sync()" semantics for capfd/capsys/Jupyter
+        # alike. No-op when the buffer path is disabled (C++ already wrote to
+        # the real fd). Late imports guarded: shell imports kernel machinery,
+        # so import it lazily to avoid an import cycle.
+        from quadrants.lang.shell import pybuf_enabled
+
+        if not pybuf_enabled:
+            return
+        try:
+            buf = _qd_core.pop_python_print_buffer()
+        except Exception:  # noqa: BLE001 - flush must never break sync
+            return
+        if buf:
+            sys.__stdout__.write(buf)
+            sys.__stdout__.flush()
 
 
 pyquadrants = PyQuadrants()

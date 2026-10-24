@@ -1,5 +1,7 @@
 // Program, context for Quadrants program execution
 
+#include <iostream>
+#include <cstdio>
 #include "program.h"
 
 #include <mutex>
@@ -278,6 +280,13 @@ void Program::synchronize() {
 
 void Program::synchronize_and_assert() {
   program_impl_->synchronize_and_assert();
+  // A53: kernel printf goes to std::cout when the PythonPrintBuffer is
+  // disabled (no wrapped stdout) -- flush here so the documented
+  // "prints take effect at qd.sync()" lands in capfd at the sync point
+  // instead of whenever the C runtime buffer drains. The buffered path is
+  // flushed by PyQuadrants.sync() (Python side); this flush is a no-op there.
+  std::cout.flush();
+  std::fflush(stdout);
 }
 
 void Program::check_adstack_overflow_and_assert() {
