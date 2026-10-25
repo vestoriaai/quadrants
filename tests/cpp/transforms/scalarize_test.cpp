@@ -261,4 +261,58 @@ TEST(Scalarize, ScalarizeBugInvalidRedundantConstantRemoval) {
   EXPECT_TRUE(foundMatrixPtr);
 }
 
+TEST(Scalarize, OutOfRangeConstMatrixPtrDemotesAlloca) {
+  // A63 regression: a const-offset MatrixPtr beyond the origin alloca's
+  // element count (speculative/dead IR that full cfg_optimization used to
+  // fold away before scalarize; reachable again since A54 lets huge kernels
+  // skip cfg) must demote the alloca from scalarization instead of throwing
+  // inside ScalarizePointers mid-rewrite.
+  TestProgram test_prog;
+  test_prog.setup();
+
+  auto block = std::make_unique<Block>();
+
+  auto func = []() {};
+  auto kernel = std::make_unique<Kernel>(*test_prog.prog(), func, "fake_kernel");
+
+  auto &type_factory = TypeFactory::get_instance();
+  std::vector<int> tensor_shape = {2, 3};  // 6 elements
+  auto tensor_type = type_factory.get_tensor_type(
+      tensor_shape, type_factory.get_primitive_type(PrimitiveTypeID::f32));
+
+  block->push_back<OffloadedStmt>(OffloadedStmt::TaskType::range_for, Arch::vulkan, kernel.get());
+  auto offloaded = block->statements.back()->as<OffloadedStmt>();
+
+  auto alloc = offloaded->body->push_back<AllocaStmt>(tensor_type);
+  auto oob_offset = offloaded->body->push_back<ConstStmt>(TypedConstant(6));  // == num_elements
+  auto oob_ptr = offloaded->body->push_back<MatrixPtrStmt>(alloc, oob_offset);
+  // Keep alloca and pointer alive through any die pass inside scalarize.
+  auto val = offloaded->body->push_back<ConstStmt>(TypedConstant(1.0f));
+  offloaded->body->push_back<LocalStoreStmt>(oob_ptr, val);
+
+  // Pre-A63 this threw "MatrixPtr offset 6 out of range for local tensor of
+  // 6 elements" out of ScalarizePointers. Now the alloca is demoted: no
+  // throw, the tensor alloca and the out-of-range pointer survive untouched
+  // (ordinary cleanup owns the dead pointer from here).
+  irpass::scalarize(block.get());
+
+  bool found_alloca = false;
+  bool found_oob_ptr = false;
+  int scalar_allocas = 0;
+  for (auto &stmt : offloaded->body->statements) {
+    if (stmt.get() == alloc) {
+      found_alloca = true;
+    }
+    if (stmt.get() == oob_ptr) {
+      found_oob_ptr = true;
+    }
+    if (stmt->is<AllocaStmt>() && stmt->ret_type.ptr_removed()->is<TensorType>()) {
+      ++scalar_allocas;
+    }
+  }
+  EXPECT_TRUE(found_alloca);
+  EXPECT_TRUE(found_oob_ptr);
+  EXPECT_EQ(scalar_allocas, 1);  // exactly the original tensor alloca — not scalarized away
+}
+
 }  // namespace quadrants::lang

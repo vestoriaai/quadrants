@@ -972,6 +972,23 @@ class GatherScalarizableLocalPointers : public BasicStmtVisitor {
       QD_ASSERT(is_alloca_scalarizable_.count(stmt->origin) == 1);
       if (!stmt->offset->is<ConstStmt>()) {
         is_alloca_scalarizable_[stmt->origin] = false;
+        return;
+      }
+      // A63: since A54, kernels above cfg_auto_skip_threshold reach this
+      // pass without the full cfg_optimization (light simplify path only),
+      // so speculative/dead out-of-range MatrixPtr IR that full cfg used to
+      // fold away before scalarize can survive to here. ScalarizePointers
+      // throws on an out-of-range const offset mid-rewrite, which would
+      // abort a compile that the pre-A54 pipeline handled. Demote the
+      // alloca instead: semantics unchanged (the alloca keeps tensor
+      // storage and the dead pointer is dropped by ordinary cleanup; a
+      // genuinely executed out-of-range access is a kernel-level bug that
+      // scalarize must not paper over either way).
+      const auto tensor_type = stmt->origin->ret_type.ptr_removed()->cast<TensorType>();
+      QD_ASSERT(tensor_type != nullptr);
+      const int offset = stmt->offset->cast<ConstStmt>()->val.val_int32();
+      if (offset < 0 || offset >= (int)tensor_type->get_num_elements()) {
+        is_alloca_scalarizable_[stmt->origin] = false;
       }
     }
   }
