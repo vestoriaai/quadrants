@@ -335,8 +335,14 @@ class IdentifyIndependentBlocks : public BasicStmtVisitor {
  public:
   using BasicStmtVisitor::visit;
 
+  // A65 专项②: WhileStmt reverse is supported downstream by MakeAdjoint's
+  // scoped visitor (non-real carried allocas + adstack replay). Treat the
+  // while as an ordinary statement of the enclosing IB: do not throw, and do
+  // not descend into its body - IB identification only needs for-loop
+  // scopes, and MakeAdjoint walks the while body itself. Descending would
+  // also trip the WhileControlStmt (break) rejection below on every lowered
+  // while head, which is internal to the supported replay form.
   void visit(WhileStmt *stmt) override {
-    QD_ERROR("WhileStmt is not supported in AutoDiff.");
   }
 
   void visit(ContinueStmt *stmt) override {

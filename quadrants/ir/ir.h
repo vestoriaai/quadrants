@@ -246,6 +246,11 @@ class IRNode {
 
   template <typename T>
   T *as() {
+    if (!is<T>()) {
+      const IRNode &self_ref = *this;
+      std::fprintf(stderr, "[a65-trace] as<T> failed: actual type=%s\n", typeid(self_ref).name());
+      std::fflush(stderr);
+    }
     QD_ASSERT(is<T>());
     return dynamic_cast<T *>(this);
   }

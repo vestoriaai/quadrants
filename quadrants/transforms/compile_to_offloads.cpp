@@ -127,10 +127,13 @@ void compile_to_offloads(IRNode *ir,
     irpass::demote_atomics(ir, config);
 
     irpass::full_simplify(ir, config, {false, /*autodiff_enabled*/ true, kernel->get_name(), verbose, "pre_autodiff"});
+    dump_ir("a3_pre_autodiff");
     irpass::auto_diff(ir, config, autodiff_mode, ad_use_stack);
+    dump_ir("a4_after_autodiff");
     // TODO: Be carefull with the full_simplify when do high-order autodiff
     irpass::full_simplify(ir, config,
                           {false, /*autodiff_enabled*/ false, kernel->get_name(), verbose, "post_autodiff"});
+    dump_ir("a5_post_autodiff");
     irpass::analysis::verify_if_debug(ir, config);
   }
 
@@ -138,6 +141,7 @@ void compile_to_offloads(IRNode *ir,
     irpass::check_out_of_bound(ir, config, {kernel->get_name()});
     irpass::analysis::verify_if_debug(ir, config);
   }
+  dump_ir("a6_out_of_bound");
 
   // Merge a global's separate read/write GlobalPtrStmts (same address) into one shared, activate=true pointer BEFORE
   // this first flag_access, so flag_access cannot stamp a read-only (activate=false) copy that the CSE eliminability
@@ -149,12 +153,15 @@ void compile_to_offloads(IRNode *ir,
   // compile regression for no extra benefit).
   irpass::merge_global_ptrs(ir);
   irpass::analysis::verify_if_debug(ir, config);
+  dump_ir("a7_merge_global_ptrs");
 
   irpass::flag_access(ir);
   irpass::analysis::verify_if_debug(ir, config);
+  dump_ir("a8_flag_access");
 
   irpass::full_simplify(ir, config, {false, /*autodiff_enabled*/ false, kernel->get_name(), verbose, "simplify_II"});
   irpass::analysis::verify_if_debug(ir, config);
+  dump_ir("a9_simplify2");
 
   irpass::offload(ir, config);
   irpass::analysis::verify_if_debug(ir, config);
@@ -242,6 +249,33 @@ void offload_to_executable(IRNode *ir,
 
   auto print = make_pass_printer(verbose, config.print_ir_dbg_info, kernel->get_name(), ir);
 
+  // A68 audit: per-task stage dumps (QD_DUMP_IR=1), mirroring the main-thread dump_ir in
+  // compile_to_offloads. task_index disambiguates sibling tasks of the same kernel.
+  const char *dump_ir_env = std::getenv(DUMP_IR_ENV.data());
+  std::filesystem::path ir_dump_dir = config.debug_dump_path;
+  bool should_dump = (dump_ir_env != nullptr && std::string(dump_ir_env) == "1");
+  int pertask_dump_idx = 0;
+  if (auto *root_blk = ir->cast<Block>()) {
+    if (!root_blk->statements.empty()) {
+      if (auto *off0 = root_blk->statements[0]->cast<OffloadedStmt>()) {
+        pertask_dump_idx = off0->task_index;
+      }
+    }
+  }
+  auto dump_ir = [&](const std::string &stage_name) {
+    if (!should_dump)
+      return;
+    std::filesystem::create_directories(ir_dump_dir);
+    std::filesystem::path filename =
+        ir_dump_dir / (kernel->name + "_t" + std::to_string(pertask_dump_idx) + "_" + stage_name + ".ll");
+    std::string ir_str;
+    irpass::print(ir, &ir_str);
+    std::ofstream ofs(filename.string());
+    if (ofs.good()) {
+      ofs << ir_str;
+    }
+  };
+
   // TODO: This is just a proof that we can demote struct-fors after offloading.
   // Eventually we might want the order to be TLS/BLS -> demote struct-for.
   // For now, putting this after TLS will disable TLS, because it can only
@@ -256,15 +290,18 @@ void offload_to_executable(IRNode *ir,
     irpass::detect_read_only(ir);
     print("Detect read-only accesses");
   }
+  dump_ir("01_detect_ro");
 
   irpass::demote_atomics(ir, config);
   print("Atomics demoted I");
   irpass::analysis::verify_if_debug(ir, config);
+  dump_ir("02_demote_atomic1");
 
   if (config.cache_loop_invariant_global_vars) {
     irpass::cache_loop_invariant_global_vars(ir, config);
     print("Cache loop-invariant global vars");
   }
+  dump_ir("03_cligv");
 
   if (config.demote_dense_struct_fors) {
     irpass::demote_dense_struct_fors(ir);
@@ -272,6 +309,7 @@ void offload_to_executable(IRNode *ir,
     print("Dense struct-for demoted");
     irpass::analysis::verify_if_debug(ir, config);
   }
+  dump_ir("04_demote_dsfor");
 
   if (config.make_cpu_multithreading_loop && arch_is_cpu(config.arch)) {
     irpass::make_cpu_multithreaded_range_for(ir, config);
@@ -279,6 +317,7 @@ void offload_to_executable(IRNode *ir,
     print("Make CPU multithreaded range-for");
     irpass::analysis::verify_if_debug(ir, config);
   }
+  dump_ir("05_cpu_mt");
 
   if (is_extension_supported(config.arch, Extension::mesh) && config.demote_no_access_mesh_fors) {
     irpass::demote_no_access_mesh_fors(ir);
@@ -291,6 +330,7 @@ void offload_to_executable(IRNode *ir,
     irpass::make_thread_local(ir, config);
     print("Make thread local");
   }
+  dump_ir("06_tls");
 
   if (is_extension_supported(config.arch, Extension::mesh)) {
     irpass::make_mesh_thread_local(ir, config, {kernel->get_name()});
@@ -307,6 +347,7 @@ void offload_to_executable(IRNode *ir,
     irpass::make_block_local(ir, config, {kernel->get_name(), verbose});
     print("Make block local");
   }
+  dump_ir("07_block_local");
 
   if (is_extension_supported(config.arch, Extension::mesh)) {
     irpass::demote_mesh_statements(ir, config, {kernel->get_name()});
@@ -316,6 +357,7 @@ void offload_to_executable(IRNode *ir,
   irpass::demote_atomics(ir, config);
   print("Atomics demoted II");
   irpass::analysis::verify_if_debug(ir, config);
+  dump_ir("08_demote_atomic2");
 
   if (is_extension_supported(config.arch, Extension::quant) && config.quant_opt_atomic_demotion) {
     irpass::analysis::gather_uniquely_accessed_bit_structs(ir, amgr.get());
@@ -323,10 +365,12 @@ void offload_to_executable(IRNode *ir,
 
   irpass::remove_range_assumption(ir);
   print("Remove range assumption");
+  dump_ir("09_remove_range_assumption");
 
   irpass::remove_loop_unique(ir);
   print("Remove loop_unique");
   irpass::analysis::verify_if_debug(ir, config);
+  dump_ir("10_remove_loop_unique");
 
   if (lower_global_access) {
     irpass::full_simplify(ir, config,
@@ -344,13 +388,16 @@ void offload_to_executable(IRNode *ir,
     print("Access flagged III");
     irpass::analysis::verify_if_debug(ir, config);
   }
+  dump_ir("11_lower_access");
 
   irpass::demote_operations(ir, config);
   print("Operations demoted");
+  dump_ir("12_demote_ops");
 
   irpass::full_simplify(ir, config,
                         {lower_global_access, /*autodiff_enabled*/ false, kernel->get_name(), verbose, "simplify_IV"});
   print("Simplified IV");
+  dump_ir("13_simplify4");
 
   // `determine_ad_stack_size` used to run here, but the pre-pass needs the full kernel IR (all offloaded
   // tasks as siblings) so cross-task `GlobalTemporaryStmt` sources can be resolved. It now runs at the end
@@ -377,6 +424,7 @@ void offload_to_executable(IRNode *ir,
       print("Scalarized");
     }
   }
+  dump_ir("14_scalarize");
 
   // Final field registration correctness & type checking
   irpass::type_check(ir, config);

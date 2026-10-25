@@ -1,4 +1,5 @@
 #include "quadrants/transforms/auto_diff/auto_diff_common.h"
+#include "quadrants/common/exceptions.h"
 #include "quadrants/transforms/auto_diff/make_adjoint.h"
 
 namespace quadrants::lang {
@@ -6,6 +7,10 @@ namespace quadrants::lang {
 namespace {
 
 // Generate the adjoint version of an independent block
+// A65: first-touch classification of locals inside a loop body (program
+// order). A local whose first access is a READ (incl. atomic read-modify-write)
+// is a loop-carried accumulator; a local whose first access is a STORE is a
+// per-iteration temporary. Descends into if/else bodies in program order.
 class MakeAdjoint : public ADTransform {
  public:
   using ADTransform::visit;
@@ -18,17 +23,23 @@ class MakeAdjoint : public ADTransform {
   // IB root: stays constant across visitor recursion. Used when we need to allocate persistent storage that must
   // survive enclosing for-loop iterations (e.g. the dedicated ad-stacks that snapshot IfStmt conds in visit(IfStmt)).
   Block *ib_root;
+
   std::map<Stmt *, Stmt *> adjoint_stmt;
 
-  explicit MakeAdjoint(Block *block) {
+  // Stack capacity (config.ad_stack_size). The WhileStmt reverse visitor sizes its synthetic
+  // iteration-trail stack with it and refuses to run in non-stack mode.
+  int ad_stack_size_ = 0;
+
+  explicit MakeAdjoint(Block *block, int ad_stack_size = 0) {
     current_block = nullptr;
     alloca_block = block;
     forward_backup = block;
     ib_root = block;
+    ad_stack_size_ = ad_stack_size;
   }
 
-  static void run(Block *block) {
-    auto p = MakeAdjoint(block);
+  static void run(Block *block, int ad_stack_size = 0) {
+    auto p = MakeAdjoint(block, ad_stack_size);
     block->accept(&p);
   }
 
@@ -262,6 +273,9 @@ class MakeAdjoint : public ADTransform {
       }
     } else if (stmt->op_type == UnaryOpType::logic_not) {
       // do nothing
+    } else if (stmt->op_type == UnaryOpType::round) {
+      // d(round(x)) = 0 almost everywhere (piecewise-constant): the adjoint
+      // contributes nothing. Matches autodiff conventions for quantization.
     } else {
       QD_P(unary_op_type_name(stmt->op_type));
       QD_NOT_IMPLEMENTED;
@@ -413,6 +427,294 @@ class MakeAdjoint : public ADTransform {
     }
   }
 
+  // A65 专项②: scoped WhileStmt reverse — "linear control-replay" form.
+  // Sound when: (1) every loop-carried alloca (stored inside the loop body,
+  // allocated outside it) is NON-gradient (int/bool control state); (2) the
+  // loop condition and in-loop control (break/continue) depend only on such
+  // state; (3) gradient flows through the body via grad-array loads + atomic
+  // accumulations (self-adjoint) and LINEAR value chains. The reverse = the
+  // forward while STAYS in the IR (primal replay: per-iteration pushes of
+  // promoted guard/carried values + a synthetic iteration-trail marker) and
+  // the adjoint while terminates on the trail sentinel, with the body
+  // visited by the standard per-statement adjoint machinery in REVERSE
+  // statement order (consumer adjoints emit before producers - same rule as
+  // visit(RangeForStmt); accumulations into adjoints are order-free). Each
+  // replay iteration consumes exactly one executed iteration's push block in
+  // LIFO order. Real-typed carried allocas need per-iteration primal stacks
+  // (adstack-for-while) — future work; rejected loudly.
+  void visit(WhileStmt *while_stmt) override {
+    auto *body = while_stmt->body.get();
+
+    // 1. collect allocas stored inside the loop body
+    std::unordered_set<Stmt *> stored_inside;
+    {
+      class StoreCollector : public BasicStmtVisitor {
+       public:
+        using BasicStmtVisitor::visit;
+        std::unordered_set<Stmt *> dests;
+        void mark(Stmt *s) {
+          if (auto *al = s->cast<AllocaStmt>())
+            dests.insert(al);
+          else if (auto *mp = s->cast<MatrixPtrStmt>()) {
+            if (auto *al2 = mp->origin->cast<AllocaStmt>())
+              dests.insert(al2);
+          }
+        }
+        void visit(LocalStoreStmt *stmt) override {
+          mark(stmt->dest);
+        }
+        void visit(LocalLoadStmt *stmt) override {
+          mark(stmt->src);
+        }
+        void visit(AtomicOpStmt *stmt) override {
+          mark(stmt->dest);
+        }
+      };
+      StoreCollector sc;
+      body->accept(&sc);
+      stored_inside = std::move(sc.dests);
+    }
+
+    // 2. carried allocas = stored inside body, allocated outside it
+    std::vector<AllocaStmt *> carried_allocas;
+    for (auto *al : stored_inside) {
+      bool outside = false;
+      for (Block *b = al->parent; b != nullptr; b = b->parent_block()) {
+        if (b == body) {
+          outside = false;
+          break;
+        }
+        if (b == while_stmt->parent) {
+          outside = true;
+          break;
+        }
+      }
+      if (outside)
+        carried_allocas.push_back(al->as<AllocaStmt>());
+    }
+
+    // 3. applicability: carried allocas must be non-real (int/bool)
+    for (auto *al : carried_allocas) {
+      if (is_real(al->ret_type.get_element_type())) {
+        throw QuadrantsError(
+            "[a65] WhileStmt reverse: a REAL-typed local variable is carried "
+            "across loop iterations (needs per-iteration primal stacks - "
+            "adstack-for-while, future work). Restructure the kernel or "
+            "exclude it from autodiff. Alloca id=" +
+            std::to_string(al->id));
+      }
+    }
+
+    // 4. entry-state restore sources: nearest pre-loop LocalStore per carried
+    //    alloca, scanned along the DOMINATING block chain (program order):
+    //    container -> ... -> root. A while nested in an if-branch has its init
+    //    stores in enclosing blocks - the direct-parent-only scan misses them.
+    Block *container = while_stmt->parent;
+    int while_pos = -1;
+    for (int i = 0; i < (int)container->statements.size(); i++) {
+      if (container->statements[i].get() == while_stmt) {
+        while_pos = i;
+        break;
+      }
+    }
+    // build the chain [(block, scan_limit)] from root down to container
+    std::vector<std::pair<Block *, int>> chain;
+    {
+      std::vector<std::pair<Block *, int>> rev;
+      Block *b = container;
+      int limit = while_pos;
+      rev.push_back({b, limit});
+      while (true) {
+        Stmt *ps = b->parent_stmt();
+        if (ps == nullptr)
+          break;
+        Block *pb = ps->parent;
+        if (pb == nullptr)
+          break;
+        int ppos = -1;
+        for (int i = 0; i < (int)pb->statements.size(); i++) {
+          if (pb->statements[i].get() == ps) {
+            ppos = i;
+            break;
+          }
+        }
+        if (ppos < 0)
+          break;
+        rev.push_back({pb, ppos});
+        b = pb;
+      }
+      for (auto it = rev.rbegin(); it != rev.rend(); ++it)
+        chain.push_back(*it);
+    }
+    // program-order scan along the chain; the LAST store before the while wins
+    std::unordered_map<Stmt *, LocalStoreStmt *> init_stores;
+    for (auto &entry : chain) {
+      Block *b = entry.first;
+      int scan_to = std::min(entry.second, (int)b->statements.size());
+      for (int i = 0; i < scan_to; i++) {
+        auto &s = b->statements[i];
+        if (auto *ls = s->cast<LocalStoreStmt>()) {
+          if (auto *al = ls->dest->cast<AllocaStmt>()) {
+            if (stored_inside.count(al))
+              init_stores[al] = ls;
+          }
+        }
+      }
+    }
+
+    // 5. termination + emission. The adjoint while terminates via a synthetic
+    //    iteration-trail stack: the forward while (kept in the IR, executing
+    //    the primal replay) pushes an i32 1-marker immediately after its
+    //    lowered termination-if - once per body-executing iteration - and the
+    //    trail carries an initial 0 sentinel (mirroring
+    //    ReplaceLocalVarWithStacks' initial push). The adjoint while keeps
+    //    only the lowered head latch and peeks the trail at its top: LIFO
+    //    order makes replay iteration k consume exactly the k-th-from-last
+    //    executed iteration's push block (its marker via the walk-emitted
+    //    trail-pop, its body pushes via the per-site adjoint pops), and the
+    //    sentinel surfacing terminates the loop. This needs no assumption on
+    //    the lowered guard shape beyond the existence of the termination-if,
+    //    and cannot loop forever because the forward pass pushes exactly one
+    //    marker per executed iteration.
+    if (ad_stack_size_ <= 0) {
+      throw QuadrantsError(
+          "[a65] WhileStmt reverse requires the adstack (use_stack) pipeline");
+    }
+    // locate the lowered termination-if: an IfStmt in the forward body with a
+    // WhileControlStmt break in either branch (the lowered form puts the
+    // break's `while control nullptr, const-0` inside an IfStmt branch; the
+    // head latch's WhileControlStmt sits at body top level, outside any if).
+    Stmt *term_if = nullptr;
+    {
+      auto branch_has_break = [](Block *b) {
+        if (b == nullptr)
+          return false;
+        for (auto &s : b->statements)
+          if (s->is<WhileControlStmt>())
+            return true;
+        return false;
+      };
+      for (int i = 0; i < (int)body->statements.size(); i++) {
+        auto *is = body->statements[i]->cast<IfStmt>();
+        if (is == nullptr)
+          continue;
+        if (branch_has_break(is->true_statements.get()) ||
+            branch_has_break(is->false_statements.get())) {
+          term_if = is;
+          break;
+        }
+      }
+    }
+    QD_ASSERT_INFO(term_if != nullptr,
+                   "[a65] WhileStmt reverse: lowered while has no termination-if (no WhileControlStmt break "
+                   "under any IfStmt branch)");
+
+    // synthetic iteration-trail stack: 0 sentinel + one 1-marker per executed
+    // iteration.
+    auto trail = Stmt::make<AdStackAllocaStmt>(PrimitiveType::i32, ad_stack_size_);
+    auto *trail_ptr = trail->as<AdStackAllocaStmt>();
+    ib_root->insert(std::move(trail), 0);
+    auto trail_zero = insert_const(PrimitiveType::i32, trail_ptr, 0);
+    trail_zero->insert_after_me(Stmt::make<AdStackPushStmt>(trail_ptr, trail_zero));
+    auto trail_one = insert_const(PrimitiveType::i32, term_if, 1);
+    trail_one->insert_after_me(Stmt::make<AdStackPushStmt>(trail_ptr, trail_one));
+
+    auto new_while = while_stmt->clone();
+    auto *new_while_ptr = new_while->as<WhileStmt>();
+    auto *adj_body = new_while_ptr->body.get();
+    // keep only the head latch (everything up to and including the first
+    // WhileControlStmt); the body proper is regenerated by the adjoint walk.
+    int latch_end = -1;
+    for (int i = 0; i < (int)adj_body->size(); i++) {
+      if (adj_body->statements[i]->is<WhileControlStmt>()) {
+        latch_end = i;
+        break;
+      }
+    }
+    QD_ASSERT_INFO(latch_end >= 0,
+                   "[a65] WhileStmt reverse: lowered while has no WhileControlStmt latch");
+    const int blen = adj_body->size();
+    for (int i = latch_end + 1; i < blen; i++)
+      adj_body->erase(latch_end + 1);
+    // trail termination head: peek the trail; break when the 0 sentinel has
+    // surfaced (all executed iterations consumed).
+    auto trail_peek = adj_body->insert(Stmt::make<AdStackLoadTopStmt>(trail_ptr), adj_body->size());
+    trail_peek->ret_type = PrimitiveType::i32;
+    auto sentinel = adj_body->insert(
+        Stmt::make_typed<ConstStmt>(TypedConstant(PrimitiveType::i32, 0)), adj_body->size());
+    auto reached_sentinel = adj_body->insert(
+        Stmt::make_typed<BinaryOpStmt>(BinaryOpType::cmp_eq, trail_peek, sentinel), adj_body->size());
+    reached_sentinel->ret_type = PrimitiveType::u1;
+    auto exit_zero = adj_body->insert(
+        Stmt::make_typed<ConstStmt>(TypedConstant(PrimitiveType::i32, 0)), adj_body->size());
+    auto break_if = Stmt::make_typed<IfStmt>(reached_sentinel);
+    break_if->set_true_statements(std::make_unique<Block>());
+    break_if->true_statements->insert(Stmt::make<WhileControlStmt>(nullptr, exit_zero), 0);
+    adj_body->insert(std::move(break_if), adj_body->size());
+
+    for (auto &kv : init_stores) {
+      auto cloned_store = kv.second->clone();
+      insert_grad_stmt(std::move(cloned_store));
+    }
+    insert_grad_stmt(std::move(new_while));
+
+    auto old_alloca_block = alloca_block;
+    auto old_current_block = current_block;
+    auto old_forward_backup = forward_backup;
+    forward_backup = body;
+    // iterate a COPY of the statement pointers: nested WhileStmt visitors
+    // erase from body->statements during the walk (live-list iteration would
+    // invalidate the iterator). Reverse statement order - same rationale as
+    // visit(RangeForStmt): consumer adjoints must emit before producer
+    // adjoints so the chain-rule reads of an adjoint slot see the full
+    // accumulated contribution. The walk snapshot is taken AFTER the trail
+    // marker push was inserted above, so the trail's adjoint pop is emitted
+    // by the standard visit(AdStackPushStmt) machinery - it lands after the
+    // body adjoints in each replay iteration (reverse statement order),
+    // right before the next head peek.
+    std::vector<Stmt *> statements;
+    for (auto &stmt : body->statements)
+      statements.push_back(stmt.get());
+    std::reverse(statements.begin(), statements.end());
+    for (auto stmt : statements) {
+      alloca_block = adj_body;
+      current_block = adj_body;
+      stmt->accept(this);
+      forward_backup = body;
+    }
+    alloca_block = old_alloca_block;
+    current_block = old_current_block;
+    forward_backup = old_forward_backup;
+
+    // A68: the forward while MUST stay in the IR tree (same protocol as
+    // visit(RangeForStmt), which never erases for_stmt). The adjoint emissions
+    // above legitimately share forward-body statements as operands - promoted
+    // guard/value stacks (pushes live in the forward body), IfStmt conds
+    // (reverse_cond = if_stmt->cond), and snap-stack pushes inserted before
+    // forward ifs. Erasing the forward while left those operands dangling:
+    // erase() marks statements erased and the later DIE pass frees them, so
+    // references decayed into use-after-free (observed as a GlobalLoadStmt
+    // read of an unrelated stack operand in scalarize). With the forward
+    // while kept, the reverse kernel runs forward-while pushes (per-iteration
+    // guard + carried-value stacks), the entry-restores above rewind the
+    // carried allocas, and the adjoint while replays LIFO (iterations N..1),
+    // each replay iteration popping exactly one iteration's push block -
+    // matching the range-for protocol.
+  }
+
+  // A65 专项②: break/continue in control-replay whiles need no adjoint
+  // emission of their own - the cloned while's condition re-evaluates the
+  // same non-gradient control state per replay iteration, so the break/continue
+  // points match the forward trace exactly. (Linear bodies only; see
+  // visit(WhileStmt) soundness notes.)
+  void visit(WhileControlStmt *stmt) override {
+    // do nothing (no gradient through non-gradient control flow)
+  }
+
+  void visit(ContinueStmt *stmt) override {
+    // do nothing
+  }
+
   void visit(RangeForStmt *for_stmt) override {
     auto new_for = for_stmt->clone();
     auto new_for_ptr = new_for->as<RangeForStmt>();
@@ -482,6 +784,12 @@ class MakeAdjoint : public ADTransform {
 
   // Equivalent to AdStackPushStmt when no stack is needed
   void visit(LocalStoreStmt *stmt) override {
+    // A65 note: loop-carried head accumulators are rejected at the FRONTEND
+    // (reverse_segments CarriedDestFinder: head-assigned local written inside
+    // the top-level loop, incl. atomic-dest form). First-touch classification
+    // here is unreliable - store-to-load forwarding + DCE remove init stores,
+    // making per-iteration temporaries look read-first (false positives on
+    // e.g. _small_cholesky_factorize_solve_block).
     accumulate(stmt->val, load(adjoint(stmt->dest)));
 
     // Clear the adjoint of the dest after local store, because LocalStoreStmt overwrites the dest:
@@ -703,6 +1011,9 @@ class MakeAdjoint : public ADTransform {
       stmt->parent->erase(stmt);
       return;
     }
+
+    // A65 note: atomic-dest head accumulators are rejected at the FRONTEND
+    // (CarriedDestFinder). See visit(LocalStoreStmt) note above.
   }
 
   void visit(MatrixPtrStmt *stmt) override {
@@ -830,8 +1141,8 @@ class MakeAdjoint : public ADTransform {
 
 }  // namespace
 
-void make_adjoint(Block *ib) {
-  MakeAdjoint::run(ib);
+void make_adjoint(Block *ib, int ad_stack_size) {
+  MakeAdjoint::run(ib, ad_stack_size);
 }
 
 }  // namespace quadrants::lang

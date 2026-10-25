@@ -318,8 +318,12 @@ class BackupSSA : public BasicStmtVisitor {
     stmt->body->accept(this);
   }
 
+  // A65 专项②: the reverse of a WhileStmt (emitted by MakeAdjoint's scoped
+  // control-replay visitor) contains the same statement kinds as any other
+  // loop body - walk it like RangeFor/StructFor so the cleanup covers it too.
   void visit(WhileStmt *stmt) override {
-    QD_ERROR("WhileStmt not supported in AutoDiff for now.");
+    generic_visit(stmt);
+    stmt->body->accept(this);
   }
 
   void visit(Block *block) override {

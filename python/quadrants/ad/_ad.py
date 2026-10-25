@@ -252,6 +252,14 @@ class Tape:
         assert self.entered, "Before evaluating gradients tape must be entered."
         assert not self.gradient_evaluated, "Gradients of grad can be evaluated only once."
 
+        # Detach the tape before evaluating gradients. Grad functions (grad_for
+        # blocks, host-side FD reruns) launch forward kernels legitimately; with
+        # the tape still mounted those launches were appended to self.calls and
+        # picked up by the reversed iteration below, compiling adjoints that the
+        # user never asked for (crashing on unsupported shapes, e.g. non-static
+        # ranges in actuator kernels) and polluting recorded-gradient state.
+        self.runtime.target_tape = None
+
         # Set grad for loss
         if isinstance(self.loss, (Field, Ndarray)):
             self.loss.grad.fill(1.0)

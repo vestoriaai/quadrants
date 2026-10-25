@@ -1,3 +1,5 @@
+#include <typeinfo>
+#include <cstdio>
 #include "quadrants/program/kernel.h"
 
 #include "quadrants/rhi/cuda/cuda_driver.h"
@@ -48,6 +50,12 @@ Kernel::Kernel(Program &program,
   is_accessor = false;
   ir_is_ast_ = false;  // CHI IR
 
+  if (!this->ir->is<Block>()) {
+    std::string dump;
+    irpass::print(this->ir.get(), &dump);
+    std::fprintf(stderr, "[a68-trace] non-Block kernel body IR:\n%s\n", dump.c_str());
+    std::fflush(stderr);
+  }
   QD_ASSERT(this->ir->is<Block>());
   this->ir->as<Block>()->set_parent_callable(this);
 
@@ -116,6 +124,13 @@ void Kernel::init(Program &program,
                                               /*is_kernel_=*/true);
   ir = context->get_root();
 
+  if (!ir->is<Block>()) {
+    auto &ir_ref = *ir;
+    QD_WARN("[a68-trace] kernel root is NOT Block: type={}", typeid(ir_ref).name());
+    std::string ir_dump;
+    irpass::print(&ir_ref, &ir_dump);
+    QD_WARN("[a68-trace] body IR:\n{}", ir_dump);
+  }
   QD_ASSERT(ir->is<Block>());
   ir->as<Block>()->set_parent_callable(this);
 

@@ -47,7 +47,7 @@ void auto_diff(IRNode *root, const CompileConfig &config, AutodiffMode autodiff_
         eliminate_recomputable_ad_stack_pushes(ib);
         type_check(root, config);
 
-        make_adjoint(ib);
+        make_adjoint(ib, config.ad_stack_size);
         type_check(root, config);
         backup_ssa(ib);
         // After MakeAdjoint emits the reverse-pass body, an outer-loop-invariant value pulled into the reverse
