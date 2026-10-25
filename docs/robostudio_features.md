@@ -1,5 +1,5 @@
 <!-- INDEX — merged lines (newest last; each entry's full section via its header below) -->
-<!-- qd-copy-api 2ce5a850 · c2-emitter-fixes 83b2d1a2 · subgroup-cpu-support 8ebf8620 · reassociate-flag 19ff0276 · reassoc-subgroup-probe 9372c300 · r5-host-visible 67e27bc4 · spirv-vectorize 68bd7965 · algorithms-2 b12c125c · compiler-line 33e7dabf · n2-to-numpy-type 4a76ce7c · a10-nested-loop-raw c52711b5 · a19-stlf-fallback 3793c86d · a20-loop-var-scope 01d2037e · metal-i64 01d2037e · a7-m2-compound 869a00a0 · qd-native-bvh 76541b81 · cpu-head-state-per-iteration 4a400a11 · a32-static-return-order e0f35bdd · a34-bool-cast 91351dbd · a37-compile-uaf 4da921ff · familyr-realfunc-composite 57391b9f · audit-lint 2bb6b7f4 · ruff-import-sort 41175f2a · a46-recursion-guard 96cbd731 · a24-phase1-cfg-threshold 8ae3bfe4 · a47-float-parity 7a077591 · a45-normalize-parity【已回退】 · binary-identity 4e729612 · a56-fastcache-torch 68ce9b48 · a57-lowerast-usage e55c4c98 · a58-baseline-cleanup f4414e44 · render-perf e5015761 · residual-cleanup bc366ef7 · a63-scalarize-oor 233e60194 · a63-gdar-ndarray-scan 4e4573fb2 · a65-reverse-top-scalar 8e93b637d -->
+<!-- qd-copy-api 2ce5a850 · c2-emitter-fixes 83b2d1a2 · subgroup-cpu-support 8ebf8620 · reassociate-flag 19ff0276 · reassoc-subgroup-probe 9372c300 · r5-host-visible 67e27bc4 · spirv-vectorize 68bd7965 · algorithms-2 b12c125c · compiler-line 33e7dabf · n2-to-numpy-type 4a76ce7c · a10-nested-loop-raw c52711b5 · a19-stlf-fallback 3793c86d · a20-loop-var-scope 01d2037e · metal-i64 01d2037e · a7-m2-compound 869a00a0 · qd-native-bvh 76541b81 · cpu-head-state-per-iteration 4a400a11 · a32-static-return-order e0f35bdd · a34-bool-cast 91351dbd · a37-compile-uaf 4da921ff · familyr-realfunc-composite 57391b9f · audit-lint 2bb6b7f4 · ruff-import-sort 41175f2a · a46-recursion-guard 96cbd731 · a24-phase1-cfg-threshold 8ae3bfe4 · a47-float-parity 7a077591 · a45-normalize-parity【已回退】 · binary-identity 4e729612 · a56-fastcache-torch 68ce9b48 · a57-lowerast-usage e55c4c98 · a58-baseline-cleanup f4414e44 · render-perf e5015761 · residual-cleanup bc366ef7 · a63-scalarize-oor 233e60194 · a63-gdar-ndarray-scan 4e4573fb2 · a65-reverse-top-scalar 8e93b637d · a69-metal-fastmath 6bdba421b -->
 
 # robostudio_features.md — features ledger for robostudio-main
 
@@ -1550,7 +1550,7 @@ test_state_history_get_set`:旧 wheel = A19 assert 拒编译(FAIL);新 wheel =
 - **背景需求**:mujoqo metal-battery 线(需求清单 A69)——此前 `fast_math=False` 对 SPIR-V→MSL 路径
   零作用,CPU/metal 位级 parity 不可控:util_misc 相切用例 metal `sol11.y`=4.06e-10(纯 f32 应为 0)、
   collision_gjk box_box_max/max2 metal 专属 A47 平局。
-- **状态**:landed on branch(664dd6c17,待 squash)。门:union **21/21 存量全过 + gate 22 PASS**
+- **状态**:landed(6bdba421b,squash of mujocoqd/a69-metal-fastmath;分支轮 dev157+g664dd6c17,主链轮见 INDEX 后装轮记录)。门:union **21/21 存量全过 + gate 22 PASS**
   (gate 19 "cpu head state" 在基线 dev152 主链轮上同样 FAIL——既有,CPU/LLVM 路径,本线不触达,
   见 metal-overhead 线 §11.1 移交记录);上游 test_return 46/46;新轮 banner 664dd6c1。
   gate 22 判据 = strict 与 numpy f32 逐步孪生逐位相等(新轮 metal 0/40,旧轮 dev152 FAIL),fast 档
