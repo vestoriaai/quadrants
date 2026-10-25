@@ -32,7 +32,22 @@ void auto_diff(IRNode *root, const CompileConfig &config, AutodiffMode autodiff_
       auto IB = identify_independent_blocks(root);
       reverse_outer_loops(root, IB);
 
+      // A83 defense-in-depth: processing an IB mutates its region in place
+      // (adjoint code appended into walked blocks), so an IB that is the same
+      // block as - or nested inside - an already-processed IB would walk
+      // first-pass adjoint code (AdStackPopStmt) as if it were primal and hit
+      // the missing visit(AdStackPopStmt) handler. Skip covered IBs loudly.
+      std::unordered_set<Block *> a83_processed;
       for (auto ib : IB) {
+        bool a83_covered = a83_processed.find(ib) != a83_processed.end();
+        for (Block *b = ib->parent_block(); !a83_covered && b != nullptr; b = b->parent_block()) {
+          a83_covered = a83_processed.find(b) != a83_processed.end();
+        }
+        if (a83_covered) {
+          QD_WARN("[a83] IB {:p} already covered by a processed IB; skipping", (void *)ib);
+          continue;
+        }
+        a83_processed.insert(ib);
         promote_ssa_to_local_var(ib);
         replace_local_var_with_stacks(ib, config.ad_stack_size);
         type_check(root, config);

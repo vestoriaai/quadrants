@@ -310,6 +310,18 @@ class DuplicateIndependentBlocksCleaner : public BasicStmtVisitor {
     check_children_ib(stmt->body.get());
     stmt->body->accept(this);
   }
+  // A83: a non-IB for-body pushes its parent_block() into the IB set
+  // (IdentifyIndependentBlocks::visit_loop_body), and that parent may be an
+  // IfStmt branch. The ancestor IB that contains this branch walks it during
+  // its own make_adjoint pass, so a surviving branch IB would be processed a
+  // second time over first-pass adjoint code (AdStackPopStmt in walked IR ->
+  // QD_NOT_IMPLEMENTED). Erase branch IBs nested under the block being
+  // visited, same contract as the for-body case above.
+  void visit(IfStmt *stmt) override {
+    check_children_ib(stmt->true_statements.get());
+    check_children_ib(stmt->false_statements.get());
+    BasicStmtVisitor::visit(stmt);
+  }
 
   static std::set<Block *> run(const std::vector<std::pair<int, Block *>> &raw_IBs) {
     DuplicateIndependentBlocksCleaner cleaner;
