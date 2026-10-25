@@ -17,12 +17,16 @@ void MetalProgramImpl::materialize_runtime(KernelProfilerBase *profiler, uint64 
   *result_buffer_ptr =
       (uint64 *)HostMemoryPool::get_instance().allocate(sizeof(uint64) * quadrants_result_buffer_entries, 8);
 
+  metal::MetalDevice *mtl_dev = nullptr;
   if (config->external_metal_command_queue != 0) {
-    device_ = std::unique_ptr<metal::MetalDevice>(
-        metal::MetalDevice::create_with_external_queue(config->external_metal_command_queue));
+    mtl_dev = metal::MetalDevice::create_with_external_queue(config->external_metal_command_queue);
   } else {
-    device_ = std::unique_ptr<metal::MetalDevice>(metal::MetalDevice::create());
+    mtl_dev = metal::MetalDevice::create();
   }
+  // A69: forward the Program-level fast_math flag to the MSL compiler (device-level
+  // setting; one qd.init == one Program == one device). Default true keeps old behaviour.
+  mtl_dev->set_fast_math(config->fast_math);
+  device_ = std::unique_ptr<metal::MetalDevice>(mtl_dev);
 
   gfx::GfxRuntime::Params params;
   params.device = device_.get();

@@ -1618,17 +1618,34 @@ MTLFunction_id MetalDevice::get_mtl_function(MTLLibrary_id mtl_lib, const std::s
 MTLLibrary_id MetalDevice::get_mtl_library(const std::string &source) const {
   MTLLibrary_id mtl_library = nil;
   NSError *err = nil;
-  NSString *msl_ns = [[NSString alloc] initWithUTF8String:source.c_str()];
+  // A69: floating-point contraction is a separate knob from the math mode on Metal
+  // (MTLMathModeSafe makes division/compare IEEE but still lets the compiler fuse
+  // a*b-c*d into FMA; measured 7234/20000 mismatches up to 1664 ulp vs step-wise f32).
+  // The LLVM backends never contract without the fast_math flag, so strict mode also
+  // pins contraction off at the source level.
+  std::string src_text = fast_math_ ? source : ("#pragma METAL fp contract(off)\n" + source);
+  NSString *msl_ns = [[NSString alloc] initWithUTF8String:src_text.c_str()];
   // Match SPIRV-Cross's MSL version. `atomic_float` (from OpAtomicFAddEXT) is only valid under
   // MTLLanguageVersion3_0+; compiling with options:nil rejects it as "unknown type name".
-  MTLCompileOptions *compile_opts = nil;
+  // A69: options are now always built so the Program-level `fast_math` flag reaches the
+  // shader compiler. Metal defaults to fast math (FMA contraction, reassociation, no-NaN/Inf
+  // assumptions); `fast_math=False` selects the IEEE-strict mode that matches the LLVM
+  // backends, which emit plain fmul/fadd without contraction when the flag is off.
+  MTLCompileOptions *compile_opts = [[MTLCompileOptions alloc] init];
   DeviceCapabilityConfig caps = get_caps();
   if (caps.contains(DeviceCapability::spirv_has_atomic_float_add) ||
       caps.contains(DeviceCapability::spirv_has_atomic_float)) {
-    compile_opts = [[MTLCompileOptions alloc] init];
     if (@available(macOS 13.0, iOS 16.0, *)) {
       compile_opts.languageVersion = MTLLanguageVersion3_0;
     }
+  }
+  if (@available(macOS 15.0, iOS 18.0, *)) {
+    compile_opts.mathMode = fast_math_ ? MTLMathModeFast : MTLMathModeSafe;
+  } else {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    compile_opts.fastMathEnabled = fast_math_ ? YES : NO;
+#pragma clang diagnostic pop
   }
   mtl_library = [mtl_device_ newLibraryWithSource:msl_ns options:compile_opts error:&err];
   [compile_opts release];

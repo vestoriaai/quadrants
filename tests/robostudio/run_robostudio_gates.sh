@@ -56,7 +56,7 @@ trap 'rm -rf "$TMP"' EXIT
 
 [[ -x "$PY" ]] || { echo "FATAL: no venv python at $PY (create .venv-consolidated, see docs/build_robostudio.md)" >&2; exit 1; }
 
-PASS=0; NFAIL=0; TOTAL=21
+PASS=0; NFAIL=0; TOTAL=22
 gate_pass() { echo "gate $1/$TOTAL [$2]: PASS"; (( PASS = PASS + 1 )); }
 gate_fail() { echo "gate $1/$TOTAL [$2]: FAIL -- $3"; (( NFAIL = NFAIL + 1 )); }
 
@@ -395,6 +395,29 @@ G21=0
   && grep -q "REALFUNC COMPOSITE GATE \\[cpu\\]: ALL PASS" "$TMP/g21_cpu.log" && G21=1 \
   || { echo "  realfunc-composite cpu arm: expected ALL PASS:"; tail -12 "$TMP/g21_cpu.log"; }
 (( G21 == 1 )) && gate_pass 21 "realfunc composite (cpu)" || gate_fail 21 "realfunc composite (cpu)" "see output above"
+
+# 22 metal fast_math flag (mujocoqd/a69-metal-fastmath) ------------------------
+# Program-level `fast_math` must reach the MSL compiler (MTLMathModeSafe /
+# fastMathEnabled=NO). Hard arm: fast_math=0 -> the wrap_circle tangent
+# numerator is exactly 0 on cpu AND metal (strict IEEE, no contraction).
+# Info arm: fast_math=1 on metal prints the contracted value (default path
+# unchanged == old behaviour). One qd.init per process -> one process per arm.
+G22=0
+"$PY" -u "$ROOT/tests/robostudio/probe_metal_fastmath.py" cpu 0 >"$TMP/g22_cpu0.log" 2>&1 \
+  && grep -q "FASTMATH GATE \\[cpu fast_math=0\\]: PASS" "$TMP/g22_cpu0.log" && G22=$((G22 + 1)) \
+  || { echo "  fastmath cpu strict arm: expected PASS:"; tail -6 "$TMP/g22_cpu0.log"; }
+if wait_gpu_idle; then
+  "$PY" -u "$ROOT/tests/robostudio/probe_metal_fastmath.py" metal 0 >"$TMP/g22_metal0.log" 2>&1 \
+    && grep -q "FASTMATH GATE \\[metal fast_math=0\\]: PASS" "$TMP/g22_metal0.log" && G22=$((G22 + 1)) \
+    || { echo "  fastmath metal strict arm: expected PASS:"; tail -6 "$TMP/g22_metal0.log"; }
+  "$PY" -u "$ROOT/tests/robostudio/probe_metal_fastmath.py" metal 1 >"$TMP/g22_metal1.log" 2>&1 \
+    && grep -q "FASTMATH GATE \\[metal fast_math=1\\]: PASS" "$TMP/g22_metal1.log" && G22=$((G22 + 1)) \
+    || { echo "  fastmath metal fast arm (info): expected PASS:"; tail -6 "$TMP/g22_metal1.log"; }
+  grep "num=" "$TMP/g22_metal1.log" | sed 's/^/  /'
+else
+  echo "  fastmath metal arms: skipped (gpu-busy)"
+fi
+(( G22 == 3 )) && gate_pass 22 "metal fast_math flag (cpu strict + metal strict/fast)" || gate_fail 22 "metal fast_math flag" "see arms above"
 
 echo "UNION GATE: $PASS/$TOTAL PASS"
 if (( NFAIL > 0 )); then echo "(logs kept in $TMP)"; trap - EXIT; exit 1; fi

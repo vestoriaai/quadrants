@@ -586,6 +586,18 @@ class MetalDevice final : public GraphicsDevice {
   MTLFunction_id get_mtl_function(MTLLibrary_id mtl_lib, const std::string &func_name) const;
   MTLLibrary_id get_mtl_library(const std::string &source) const;
 
+  // A69: Metal shader-compiler math mode. `fast_math` is a Program-level
+  // CompileConfig flag that the LLVM backends already honour; MSL compilation
+  // used to leave MTLCompileOptions at Metal's default (fast math ON), so a
+  // user setting `fast_math=False` still got FMA contraction / reassociation
+  // on metal and could not reach CPU bit-parity. Default true == old behaviour.
+  void set_fast_math(bool enabled) {
+    fast_math_ = enabled;
+  }
+  bool fast_math() const {
+    return fast_math_;
+  }
+
  private:
   MTLDevice_id mtl_device_;
   rhi_impl::SyncedPtrStableObjectList<MetalMemory> memory_allocs_;
@@ -595,6 +607,7 @@ class MetalDevice final : public GraphicsDevice {
   std::unique_ptr<MetalSampler> default_sampler_;
 
   bool is_destroyed_{false};
+  bool fast_math_{true};
 };
 
 }  // namespace metal

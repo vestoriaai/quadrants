@@ -1535,3 +1535,34 @@ test_state_history_get_set`:旧 wheel = A19 assert 拒编译(FAIL);新 wheel =
   4.67e-5 / FD 4.67e-5; 上游 test_ad_* 357P/1S/2xf。边界: real-typed
   carried while 仍响亮拒绝(真 adstack-for-while=未来工作); while 内嵌套
   range-for 不作独立 IB。
+
+## a69-metal-fastmath — Metal 库编译接通 Program 级 `fast_math`(2026-10-25,mujocoqd/a69-metal-fastmath)
+
+- **设计**:`MetalDevice::set_fast_math()`(device 级,默认 true = 旧行为逐位一致),
+  `MetalProgramImpl::materialize_runtime` 创建 device 时转发 `config->fast_math`;
+  `get_mtl_library` 无条件构造 `MTLCompileOptions`,macOS15+/iOS18+ 设
+  `mathMode = fast ? Fast : Safe`(旧系统 `fastMathEnabled`),**strict 档另向 MSL 源头注入
+  `#pragma METAL fp contract(off)`**——实测 Safe 模式只修除法(fast 最大 2 ulp → 0),FMA 收缩是
+  独立开关不随 mathMode 关闭(`a*b-c*d` 两档均 7234/20000 失配、最大 1664 ulp;加 pragma 后 0)。
+  缓存:offline cache key 已含 fast_math,MTLLibrary 每进程由 SPIR-V 重编,无 stale 命中;raster
+  vert/frag 库同受控。文件:`rhi/metal/metal_device.{h,mm}`、`runtime/program_impls/metal/
+  metal_program.cpp`、`tests/robostudio/probe_metal_fastmath.py`(gate 22)、runner TOTAL 21→22。
+- **背景需求**:mujoqo metal-battery 线(需求清单 A69)——此前 `fast_math=False` 对 SPIR-V→MSL 路径
+  零作用,CPU/metal 位级 parity 不可控:util_misc 相切用例 metal `sol11.y`=4.06e-10(纯 f32 应为 0)、
+  collision_gjk box_box_max/max2 metal 专属 A47 平局。
+- **状态**:landed on branch(664dd6c17,待 squash)。门:union **21/21 存量全过 + gate 22 PASS**
+  (gate 19 "cpu head state" 在基线 dev152 主链轮上同样 FAIL——既有,CPU/LLVM 路径,本线不触达,
+  见 metal-overhead 线 §11.1 移交记录);上游 test_return 46/46;新轮 banner 664dd6c1。
+  gate 22 判据 = strict 与 numpy f32 逐步孪生逐位相等(新轮 metal 0/40,旧轮 dev152 FAIL),fast 档
+  信息臂 14/40 漂移(4.06e-10 实锤复现)。**port 侧实弹(mujoqo-mbwt,克隆 venv 装轮)**:相切探针
+  strict `sol11.y` → 0;collision_gjk **box_box_max 转绿**;box_box_max2 仍挂 → 真因 = A55(metal 无 f64,
+  `_linear_combine` 退 f32),非 fast-math;**cylinder_cylinder_contact 新挂**(strict -0.0009999274 vs
+  -0.001 @ places=7,差 7.3e-8;fast 档 FMA 单次舍入反而更准)= f32 GJK 7 位小数断言的刀锋;util_misc
+  wrap0 在 strict 下暴露 C 同款退化(重合切点 → 闭区间 is_intersect 判相交 → 远侧解),port 侧 D20 守卫
+  后 strict/fast/cpu 129/129。perf(humanoid×64,100 步 min-of-6 ×3 轮交错):fast 13.86/13.86/9.73 ms vs
+  strict 14.16/14.51/8.93 ms,差异在非独占机器噪声内。全量 strict metal battery:见 mujoqo TODO
+  metal-battery 线条目(本线收口时补数)。
+- **限制**:①`sqrt` 两档均 ≤1 ulp 非正确舍入(5216/20000,Apple GPU 库属性,MTLCompileOptions 不可
+  控;若需 IEEE sqrt 须 SPIRV-Cross 后处理为 `precise::sqrt`,另行立项);②strict 不等于"更接近 f64
+  参考"——无 FMA 时近抵消项误差可能更大(cylinder 案例),metal f32 的 A47 刀锋需 f64(A55)或测试口径
+  解决;③默认档不变(fast),port conftest 按 arch 自选。
