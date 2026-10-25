@@ -1,5 +1,5 @@
 <!-- INDEX — merged lines (newest last; each entry's full section via its header below) -->
-<!-- qd-copy-api 2ce5a850 · c2-emitter-fixes 83b2d1a2 · subgroup-cpu-support 8ebf8620 · reassociate-flag 19ff0276 · reassoc-subgroup-probe 9372c300 · r5-host-visible 67e27bc4 · spirv-vectorize 68bd7965 · algorithms-2 b12c125c · compiler-line 33e7dabf · n2-to-numpy-type 4a76ce7c · a10-nested-loop-raw c52711b5 · a19-stlf-fallback 3793c86d · a20-loop-var-scope 01d2037e · metal-i64 01d2037e · a7-m2-compound 869a00a0 · qd-native-bvh 76541b81 · cpu-head-state-per-iteration 4a400a11 · a32-static-return-order e0f35bdd · a34-bool-cast 91351dbd · a37-compile-uaf 4da921ff · familyr-realfunc-composite 57391b9f · audit-lint 2bb6b7f4 · ruff-import-sort 41175f2a · a46-recursion-guard 96cbd731 · a24-phase1-cfg-threshold 8ae3bfe4 · a47-float-parity 7a077591 · a45-normalize-parity【已回退】 · binary-identity 4e729612 · a56-fastcache-torch 68ce9b48 · a57-lowerast-usage e55c4c98 · a58-baseline-cleanup f4414e44 · render-perf e5015761 · residual-cleanup bc366ef7 · a63-scalarize-oor 233e60194 -->
+<!-- qd-copy-api 2ce5a850 · c2-emitter-fixes 83b2d1a2 · subgroup-cpu-support 8ebf8620 · reassociate-flag 19ff0276 · reassoc-subgroup-probe 9372c300 · r5-host-visible 67e27bc4 · spirv-vectorize 68bd7965 · algorithms-2 b12c125c · compiler-line 33e7dabf · n2-to-numpy-type 4a76ce7c · a10-nested-loop-raw c52711b5 · a19-stlf-fallback 3793c86d · a20-loop-var-scope 01d2037e · metal-i64 01d2037e · a7-m2-compound 869a00a0 · qd-native-bvh 76541b81 · cpu-head-state-per-iteration 4a400a11 · a32-static-return-order e0f35bdd · a34-bool-cast 91351dbd · a37-compile-uaf 4da921ff · familyr-realfunc-composite 57391b9f · audit-lint 2bb6b7f4 · ruff-import-sort 41175f2a · a46-recursion-guard 96cbd731 · a24-phase1-cfg-threshold 8ae3bfe4 · a47-float-parity 7a077591 · a45-normalize-parity【已回退】 · binary-identity 4e729612 · a56-fastcache-torch 68ce9b48 · a57-lowerast-usage e55c4c98 · a58-baseline-cleanup f4414e44 · render-perf e5015761 · residual-cleanup bc366ef7 · a63-scalarize-oor 233e60194 · a63-gdar-ndarray-scan 4e4573fb2 · a65-reverse-top-scalar 8e93b637d -->
 
 # robostudio_features.md — features ledger for robostudio-main
 
@@ -1489,3 +1489,49 @@ test_state_history_get_set`:旧 wheel = A19 assert 拒编译(FAIL);新 wheel =
 - **footprint**:scalarize.cpp +20/−3(gather visitor);scalarize_test.cpp
   +52(UT);docs/a63_scalarize_oor_development_spec.md 新增。wheel:
   1.3.4.dev153+gd82444b92(robostudio 生产 venv 已装并过门)。
+
+## a63-gdar-ndarray-scan — A63 GDAR 检查器 ndarray 优雅跳过 + 静态扫描 pass(2026-10-25)
+- **描述**: differentiation_validation_check 对含 ndarray 参数的 kernel 类型无关
+  兜底跳过(此前无条件走 SNode 路径 abort 编译);新增 GdarStaticScanChecker
+  编译期静态扫描 pass(ExternalPtrStmt/ExternalTensorBasePtrStmt, arg_id 键,
+  SSA index 相等配对, definite/potential/safe 三档 QD_WARN),挂在
+  compile_to_offloads 的 CheckAutodiffValid 路径,独立 debug 门
+  (cmake/QuadrantsCore.cmake),不继承 check-bit 副作用。文件:
+  `quadrants/transforms/auto_diff/validation.cpp`、`quadrants/ir/transforms.h`、
+  `quadrants/transforms/compile_to_offloads.cpp`、`cmake/QuadrantsCore.cmake`、
+  `tests/python/test_ad_gdar_static_scan.py`(4 测试, fd 级 stderr 捕获)、
+  `docs/a63-gdar-ndarray-scan-development-spec.md`。
+- **背景需求**: A63 战役 —— GDAR 检查器对 ndarray kernel 无条件崩溃
+  (判别实验证明好 kernel 也抛);静态扫描替代运行期检查, 支持 needs_grad
+  Data(autodiff 链 ndarray 暴露面)的编译期诊断。
+- **状态**: landed(4e4573fb2, squash of mujocoqd/a63-gdar-ndarray-scan)。
+  门: AD 回归 276P/1S(分支线实证); 4 新测试绿。
+
+## a65-reverse-top-scalar — A65+A68 WhileStmt 反向 visitor, 自动伴随全链全绿(2026-10-25)
+- **描述**: 编译器自动伴随对混合顶层形态的解锁。①reverse_segments 混合形态
+  定向放行 + 前端 first-touch carried 检测(CarriedDestFinder 两遍法,
+  real-typed 响亮拒绝)+ round 零伴随; ②make_adjoint visit(WhileStmt) 线性
+  控制回放反向 visitor + WhileControlStmt/ContinueStmt no-op +
+  post_adjoint_cleanup WhileStmt 接受; ③A68 根因修复三缺陷: erase(while_stmt)
+  悬空 UB(修=保留正向 while, range-for 协议对齐)、clone body 全清无终止
+  (修=合成迭代轨迹栈: 正向终止 if 后每迭代 push 1-marker + 栈底 0 哨兵,
+  adjoint while 头 peek, LIFO 使回放迭代恰消费一次迭代的 push 块)、体伴随
+  正序走查(修=std::reverse); ④make_adjoint 贯通 ad_stack_size; ⑤ir_shaping
+  IdentifyIndependentBlocks WhileStmt QD_ERROR(实为 log+throw)→ 不抛不
+  descend; ⑥Tape.grad 摘除 target_tape(grad 阶段宿主重跑不再被记录);
+  ⑦ir.h as<T> 失败 typeid 打印 + kernel.cpp 非 Block root 诊断 +
+  compile_to_offloads 逐阶段 IR dump 插桩(QD_DUMP_IR=1 门控, 惰性)。
+  文件: `quadrants/transforms/auto_diff/{make_adjoint,make_adjoint.h,
+  ir_shaping,auto_diff,post_adjoint_cleanup}.cpp`、`quadrants/transforms/
+  reverse_segments.cpp`、`quadrants/program/kernel.cpp`、`quadrants/ir/ir.h`、
+  `quadrants/transforms/compile_to_offloads.cpp`、`python/quadrants/ad/_ad.py`、
+  `docs/a65-reverse-top-scalar-spec.md`。
+- **背景需求**: A65 战役(混合顶层形态伴随解锁, 43-kernel 暴露面)+ A68
+  (scalarize as<AdStackAllocaStmt> 失败 receiver=GlobalLoadStmt, 逐阶段
+  dump 二分定位 make_adjoint); 优先编译器优化而非手写 VJP(用户裁决)。
+- **状态**: landed(8e93b637d, squash of mujocoqd/a65-reverse-top-scalar)。
+  门: 无接触链 102/102 adjoint 编译(islands OFF); 端到端自动伴随 FD 门
+  rel_err=2.03e-06(p1_autoadj_fd, 含 while 回放); BPTT 1.49e-4 / contact
+  4.67e-5 / FD 4.67e-5; 上游 test_ad_* 357P/1S/2xf。边界: real-typed
+  carried while 仍响亮拒绝(真 adstack-for-while=未来工作); while 内嵌套
+  range-for 不作独立 IB。
