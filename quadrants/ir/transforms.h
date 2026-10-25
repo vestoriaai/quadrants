@@ -87,6 +87,9 @@ void auto_diff(IRNode *root, const CompileConfig &config, AutodiffMode autodiffM
  * access rule
  */
 void differentiation_validation_check(IRNode *root, const CompileConfig &config, const std::string &kernel_name);
+
+// A63: static GDAR scan for ndarray arguments (compile-time diagnostics only).
+void gdar_static_scan(IRNode *root, const std::string &kernel_name);
 /**
  * Determine all adaptive AD-stacks' size. This pass is idempotent, i.e.,
  * there are no side effects if called more than once or called when not needed.

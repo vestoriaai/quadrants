@@ -115,6 +115,12 @@ void compile_to_offloads(IRNode *ir,
     irpass::differentiation_validation_check(ir, config, kernel->get_name());
     irpass::analysis::verify_if_debug(ir, config);
   }
+  if (autodiff_mode == AutodiffMode::kCheckAutodiffValid) {
+    // A63: static GDAR scan for ndarray arguments. Runs with or without debug:
+    // the scan is compile-time only (QD_WARN diagnostics) and must not inherit
+    // the debug-mode bounds-check side effects of the check-bit branch above.
+    irpass::gdar_static_scan(ir, kernel->get_name());
+  }
 
   if (autodiff_mode == AutodiffMode::kReverse || autodiff_mode == AutodiffMode::kForward) {
     // Remove local atomics here so that we don't have to handle their gradients

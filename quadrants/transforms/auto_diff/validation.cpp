@@ -170,12 +170,24 @@ class GloablDataAccessRuleChecker : public BasicStmtVisitor {
   using BasicStmtVisitor::visit;
 
   void visit(GlobalLoadStmt *stmt) override {
+    if (!stmt->src->is<GlobalPtrStmt>() && !stmt->src->is<MatrixPtrStmt>()) {
+      // Non-SNode loads (ndarray ExternalPtrStmt / ExternalTensorBasePtrStmt /
+      // other external-tensor forms): the check-bit machinery covers SNode
+      // fields only - external arrays are covered by GdarStaticScanChecker
+      // (A63). Diagnostic pass must not abort compilation on unknown forms.
+      return;
+    }
     GlobalPtrStmt *src = nullptr;
     if (stmt->src->is<GlobalPtrStmt>()) {
       src = stmt->src->as<GlobalPtrStmt>();
     } else {
-      QD_ASSERT(stmt->src->is<MatrixPtrStmt>());
-      src = stmt->src->as<MatrixPtrStmt>()->origin->as<GlobalPtrStmt>();
+      auto *mp = stmt->src->as<MatrixPtrStmt>();
+      if (!mp->origin->is<GlobalPtrStmt>()) {
+        // ndarray element access (MatrixPtr over ExternalPtr/BasePtr): covered
+        // by GdarStaticScanChecker (A63), no SNode check-bit exists.
+        return;
+      }
+      src = mp->origin->as<GlobalPtrStmt>();
     }
     auto snode = src->snode;
     if (!snode->has_adjoint_checkbit()) {
@@ -212,23 +224,35 @@ class GloablDataAccessRuleChecker : public BasicStmtVisitor {
   }
 
   void visit(GlobalStoreStmt *stmt) override {
+    if (!stmt->dest->is<GlobalPtrStmt>() && !stmt->dest->is<MatrixPtrStmt>()) {
+      return;  // non-SNode dest: see GdarStaticScanChecker (A63).
+    }
     GlobalPtrStmt *dest = nullptr;
     if (stmt->dest->is<GlobalPtrStmt>()) {
       dest = stmt->dest->as<GlobalPtrStmt>();
     } else {
-      QD_ASSERT(stmt->dest->is<MatrixPtrStmt>());
-      dest = stmt->dest->as<MatrixPtrStmt>()->origin->as<GlobalPtrStmt>();
+      auto *mp = stmt->dest->as<MatrixPtrStmt>();
+      if (!mp->origin->is<GlobalPtrStmt>()) {
+        return;  // ndarray element access: see GdarStaticScanChecker (A63).
+      }
+      dest = mp->origin->as<GlobalPtrStmt>();
     }
     visit_gloabl_store_stmt_and_atomic_add(stmt, dest);
   }
 
   void visit(AtomicOpStmt *stmt) override {
+    if (!stmt->dest->is<GlobalPtrStmt>() && !stmt->dest->is<MatrixPtrStmt>()) {
+      return;  // non-SNode dest: see GdarStaticScanChecker (A63).
+    }
     GlobalPtrStmt *dest = nullptr;
     if (stmt->dest->is<GlobalPtrStmt>()) {
       dest = stmt->dest->as<GlobalPtrStmt>();
     } else {
-      QD_ASSERT(stmt->dest->is<MatrixPtrStmt>());
-      dest = stmt->dest->as<MatrixPtrStmt>()->origin->as<GlobalPtrStmt>();
+      auto *mp = stmt->dest->as<MatrixPtrStmt>();
+      if (!mp->origin->is<GlobalPtrStmt>()) {
+        return;  // ndarray element access: see GdarStaticScanChecker (A63).
+      }
+      dest = mp->origin->as<GlobalPtrStmt>();
     }
     visit_gloabl_store_stmt_and_atomic_add(stmt, dest);
   }
@@ -243,6 +267,173 @@ class GloablDataAccessRuleChecker : public BasicStmtVisitor {
   std::string kernel_name_;
 };
 
+
+// A63: static (compile-time) global-data-access-rule scan for ndarray arguments.
+// The runtime check-bit machinery above covers SNode fields only; external
+// arrays (ndarray kernel arguments) have no check-bit storage. This visitor
+// walks the kernel in program order and pairs loads/stores/atomics per
+// external argument (keyed by ArgLoadStmt::arg_id):
+//   - definite: a store/atomic whose index vector (element-wise Stmt* pointer
+//     equality, same trick as OffloadLevelGlobalCrossIterRAWChecker) matches an
+//     earlier load in program order - the adjoint would re-read the post-write
+//     primal; silent wrong gradients.
+//   - potential: the argument is both read and written but no provable
+//     ordered same-index pair exists (indices are distinct Stmts that may
+//     alias at runtime).
+//   - safe: read-only / write-only / atomic-only.
+// Conservative by design (loops: same LoopIndex Stmt across iterations counts
+// as same-index; cross-iter hazards through ndarrays are not separately
+// modeled). Diagnostic only - reports via QD_WARN, never aborts.
+class GdarStaticScanChecker : public BasicStmtVisitor {
+ public:
+  using BasicStmtVisitor::visit;
+
+  struct AccessEvent {
+    int order;
+    bool is_write;
+    bool is_atomic;
+    std::vector<Stmt *> indices;
+  };
+
+  void visit(GlobalLoadStmt *stmt) override {
+    if (auto *ep = external_access(stmt->src))
+      record(ep, /*is_write=*/false, /*is_atomic=*/false);
+    else if (auto *base = stmt->src->cast<ExternalTensorBasePtrStmt>())
+      record_base(base, /*is_write=*/false, /*is_atomic=*/false);
+  }
+
+  void visit(GlobalStoreStmt *stmt) override {
+    if (auto *ep = external_access(stmt->dest))
+      record(ep, /*is_write=*/true, /*is_atomic=*/false);
+    else if (auto *base = stmt->dest->cast<ExternalTensorBasePtrStmt>())
+      record_base(base, /*is_write=*/true, /*is_atomic=*/false);
+  }
+
+  void visit(AtomicOpStmt *stmt) override {
+    if (auto *ep = external_access(stmt->dest))
+      record(ep, /*is_write=*/true, /*is_atomic=*/true);
+    else if (auto *base = stmt->dest->cast<ExternalTensorBasePtrStmt>())
+      record_base(base, /*is_write=*/true, /*is_atomic=*/true);
+  }
+
+  // External tensor access, directly (whole-element load/store) or through a
+  // MatrixPtr element select (vec/mat-typed ndarray args). Returns the
+  // underlying ExternalPtrStmt with the element-select offset appended to its
+  // index vector, or nullptr when `s` is not an external-tensor access.
+  ExternalPtrStmt *external_access(Stmt *s) {
+    if (auto *ep = s->cast<ExternalPtrStmt>())
+      return ep;
+    if (auto *mp = s->cast<MatrixPtrStmt>()) {
+      if (auto *ep = mp->origin->cast<ExternalPtrStmt>()) {
+        element_select_indices_[ep].push_back(mp->offset);
+        return ep;
+      }
+    }
+    return nullptr;
+  }
+
+  static void run(IRNode *root, const std::string &kernel_name) {
+    GdarStaticScanChecker checker;
+    checker.kernel_name_ = kernel_name;
+    root->accept(&checker);
+    checker.report();
+  }
+
+ private:
+  void record(ExternalPtrStmt *ep, bool is_write, bool is_atomic) {
+    if (ep->is_grad) {
+      // The .grad slot belongs to the adjoint's own bookkeeping, not to the
+      // primal data flow the GDAR rule governs.
+      return;
+    }
+    auto *arg = ep->base_ptr->cast<ArgLoadStmt>();
+    if (arg == nullptr) {
+      return;  // unexpected base; skip rather than abort a diagnostic pass
+    }
+    std::vector<Stmt *> indices = ep->indices;
+    if (auto it = element_select_indices_.find(ep); it != element_select_indices_.end()) {
+      // MatrixPtr element select over this access: fold the offset(s) into the
+      // index identity (element components are part of the entry).
+      indices.insert(indices.end(), it->second.begin(), it->second.end());
+      element_select_indices_.erase(it);
+    }
+    auto &events = events_[arg->arg_id];
+    events.push_back(AccessEvent{order_++, is_write, is_atomic, std::move(indices)});
+  }
+
+  void record_base(ExternalTensorBasePtrStmt *base, bool is_write, bool is_atomic) {
+    if (base->is_grad)
+      return;
+    auto &events = events_[base->arg_id];
+    // No index info at this stage: empty index vector never matches a
+    // with-indices event, so the arg lands in the POTENTIAL bucket.
+    events.push_back(AccessEvent{order_++, is_write, is_atomic, {}});
+  }
+
+  static bool same_indices(const std::vector<Stmt *> &a, const std::vector<Stmt *> &b) {
+    if (a.size() != b.size())
+      return false;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+      if (a[i] != b[i])
+        return false;
+    }
+    return true;
+  }
+
+  void report() {
+    int total_definite = 0;
+    int total_potential = 0;
+    for (const auto &kv : events_) {
+      const auto &events = kv.second;
+      int reads = 0;
+      int writes = 0;
+      int atomics = 0;
+      int definite = 0;
+      for (const auto &e : events) {
+        if (e.is_atomic)
+          atomics += 1;
+        if (e.is_write)
+          writes += 1;
+        else
+          reads += 1;
+      }
+      for (const auto &w : events) {
+        if (!w.is_write)
+          continue;
+        for (const auto &r : events) {
+          if (r.is_write || r.order >= w.order)
+            continue;
+          if (same_indices(r.indices, w.indices)) {
+            definite += 1;
+            break;
+          }
+        }
+      }
+      total_definite += definite;
+      const bool both = reads > 0 && writes > 0;
+      const int potential = (!definite && both) ? 1 : 0;
+      total_potential += potential;
+      if (definite > 0) {
+        QD_WARN("[gdar-static-scan] (kernel={}) arg_id [{}]: DEFINITE read-then-overwrite on same ndarray entries "
+                "(writes={}, reads={}, atomics={}, definite pairs={}) - reverse-mode gradients through these "
+                "entries are silently wrong unless the kernel is restructured or excluded from autodiff",
+                kernel_name_, fmt::join(kv.first, ", "), writes, reads, atomics, definite);
+      } else if (potential) {
+        QD_WARN("[gdar-static-scan] (kernel={}) arg_id [{}]: POTENTIAL read/write aliasing on ndarray (writes={}, "
+                "reads={}, atomics={}) - indices are distinct Stmts and may alias at runtime",
+                kernel_name_, fmt::join(kv.first, ", "), writes, reads, atomics);
+      }
+    }
+    QD_INFO("[gdar-static-scan] (kernel={}) summary: ndarray_args={} definite={} potential={}", kernel_name_,
+            events_.size(), total_definite, total_potential);
+  }
+
+  std::unordered_map<std::vector<int>, std::vector<AccessEvent>, hashing::Hasher<std::vector<int>>> events_;
+  std::unordered_map<ExternalPtrStmt *, std::vector<Stmt *>> element_select_indices_;
+  std::string kernel_name_;
+  int order_ = 0;
+};
+
 }  // namespace
 
 void offload_level_global_cross_iter_raw_check(Block *offload_body) {
@@ -254,6 +445,10 @@ void global_data_access_rule_check(IRNode *root, const std::string &kernel_name)
 }
 
 namespace irpass {
+
+void gdar_static_scan(IRNode *root, const std::string &kernel_name) {
+  GdarStaticScanChecker::run(root, kernel_name);
+}
 
 void differentiation_validation_check(IRNode *root, const CompileConfig &config, const std::string &kernel_name) {
   global_data_access_rule_check(root, kernel_name);
