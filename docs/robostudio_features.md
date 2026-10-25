@@ -1,5 +1,5 @@
 <!-- INDEX — merged lines (newest last; each entry's full section via its header below) -->
-<!-- qd-copy-api 2ce5a850 · c2-emitter-fixes 83b2d1a2 · subgroup-cpu-support 8ebf8620 · reassociate-flag 19ff0276 · reassoc-subgroup-probe 9372c300 · r5-host-visible 67e27bc4 · spirv-vectorize 68bd7965 · algorithms-2 b12c125c · compiler-line 33e7dabf · n2-to-numpy-type 4a76ce7c · a10-nested-loop-raw c52711b5 · a19-stlf-fallback 3793c86d · a20-loop-var-scope 01d2037e · metal-i64 01d2037e · a7-m2-compound 869a00a0 · qd-native-bvh 76541b81 · cpu-head-state-per-iteration 4a400a11 · a32-static-return-order e0f35bdd · a34-bool-cast 91351dbd · a37-compile-uaf 4da921ff · familyr-realfunc-composite 57391b9f · audit-lint 2bb6b7f4 · ruff-import-sort 41175f2a · a46-recursion-guard 96cbd731 · a24-phase1-cfg-threshold 8ae3bfe4 · a47-float-parity 7a077591 · a45-normalize-parity【已回退】 · binary-identity 4e729612 · a56-fastcache-torch 68ce9b48 · a57-lowerast-usage e55c4c98 · a58-baseline-cleanup f4414e44 · render-perf e5015761 · residual-cleanup bc366ef7 -->
+<!-- qd-copy-api 2ce5a850 · c2-emitter-fixes 83b2d1a2 · subgroup-cpu-support 8ebf8620 · reassociate-flag 19ff0276 · reassoc-subgroup-probe 9372c300 · r5-host-visible 67e27bc4 · spirv-vectorize 68bd7965 · algorithms-2 b12c125c · compiler-line 33e7dabf · n2-to-numpy-type 4a76ce7c · a10-nested-loop-raw c52711b5 · a19-stlf-fallback 3793c86d · a20-loop-var-scope 01d2037e · metal-i64 01d2037e · a7-m2-compound 869a00a0 · qd-native-bvh 76541b81 · cpu-head-state-per-iteration 4a400a11 · a32-static-return-order e0f35bdd · a34-bool-cast 91351dbd · a37-compile-uaf 4da921ff · familyr-realfunc-composite 57391b9f · audit-lint 2bb6b7f4 · ruff-import-sort 41175f2a · a46-recursion-guard 96cbd731 · a24-phase1-cfg-threshold 8ae3bfe4 · a47-float-parity 7a077591 · a45-normalize-parity【已回退】 · binary-identity 4e729612 · a56-fastcache-torch 68ce9b48 · a57-lowerast-usage e55c4c98 · a58-baseline-cleanup f4414e44 · render-perf e5015761 · residual-cleanup bc366ef7 · a63-scalarize-oor 233e60194 -->
 
 # robostudio_features.md — features ledger for robostudio-main
 
@@ -1464,3 +1464,28 @@ test_state_history_get_set`:旧 wheel = A19 assert 拒编译(FAIL);新 wheel =
   依赖用户正确使用;②test_xdist_worker_retirement ×2 为 pytest 版本问题
   (9.1.1 违反 b60dda49 的 8.4.2 pin → 崩溃替身多计数), 按 requirements-test.txt
   钉 8.4.2 后消失, 非 qd 代码问题;venv 装轮须带 requirements-test.txt。
+
+## a63-scalarize-oor — A63 scalarize 越界 const MatrixPtr 降级(2026-10-25)
+
+- **设计**:GatherScalarizableLocalPointers 的 const-offset 分支加边界
+  检查(offset ∉ [0, num_elements) → alloca 降级出 scalarizable 集合)。
+  根因:A24/A54 cfg_auto_skip_threshold=50000 后,巨型内核(如 robostudio
+  fv_c84,>50k 语句)走轻量 simplify、不再跑全量 cfg_optimization——
+  过去被 full cfg 在 scalarize 前折掉的投机/死代码越界 MatrixPtr IR
+  (Tensor(7,9) alloca + const offset 63)存活到 ScalarizePointers 逐元素
+  改写,按 A21 可捕获异常抛出编译中止。降级 = 保留张量存储、死指针交给
+  常规清理;真执行的越界是内核级 bug,scalarize 不掩盖。语义零变化。
+- **背景需求**:robostudio batch_kin 套件 dev152 实弹抓回
+  (test_fv_parity[cpu] 编译失败,dev119 全绿)——robostudio 侧升级门
+  首个拦下的上游真回归;修复是 dev153 升级重走门的前置。
+- **状态**:landed(233e60194)。门:fv_parity cpu+metal dev153 全绿
+  (精确生产失败场景端到端);batch_kin 50/8/0;robostudio 根套件
+  570P/42S/1xf/0F;S2/S3/readback PASS(5.536/3.333ms 钉内)。UT
+  Scalarize.OutOfRangeConstMatrixPtrDemotesAlloca 已入库,随
+  tests-enabled build 执行(wheel 配置 QD_BUILD_TESTS=OFF,本地未跑——
+  见 docs/a63_scalarize_oor_development_spec.md 门表)。对照实验注记:
+  运行时覆盖 cfg_auto_skip_threshold(qd.cfg 与 prog.config 两路径)在
+  init 快照下不可达,机制判定靠①-④证据链(见 spec),置信=高。
+- **footprint**:scalarize.cpp +20/−3(gather visitor);scalarize_test.cpp
+  +52(UT);docs/a63_scalarize_oor_development_spec.md 新增。wheel:
+  1.3.4.dev153+gd82444b92(robostudio 生产 venv 已装并过门)。
