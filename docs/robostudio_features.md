@@ -1,5 +1,5 @@
 <!-- INDEX — merged lines (newest last; each entry's full section via its header below) -->
-<!-- qd-copy-api 2ce5a850 · c2-emitter-fixes 83b2d1a2 · subgroup-cpu-support 8ebf8620 · reassociate-flag 19ff0276 · reassoc-subgroup-probe 9372c300 · r5-host-visible 67e27bc4 · spirv-vectorize 68bd7965 · algorithms-2 b12c125c · compiler-line 33e7dabf · n2-to-numpy-type 4a76ce7c · a10-nested-loop-raw c52711b5 · a19-stlf-fallback 3793c86d · a20-loop-var-scope 01d2037e · metal-i64 01d2037e · a7-m2-compound 869a00a0 · qd-native-bvh 76541b81 · cpu-head-state-per-iteration 4a400a11 · a32-static-return-order e0f35bdd · a34-bool-cast 91351dbd · a37-compile-uaf 4da921ff · familyr-realfunc-composite 57391b9f · audit-lint 2bb6b7f4 · ruff-import-sort 41175f2a · a46-recursion-guard 96cbd731 · a24-phase1-cfg-threshold 8ae3bfe4 · a47-float-parity 7a077591 · a45-normalize-parity【已回退】 · binary-identity 4e729612 · a56-fastcache-torch 68ce9b48 · a57-lowerast-usage e55c4c98 · a58-baseline-cleanup f4414e44 · render-perf e5015761 · residual-cleanup bc366ef7 · a63-scalarize-oor 233e60194 · a63-gdar-ndarray-scan 4e4573fb2 · a65-reverse-top-scalar 8e93b637d · a69-metal-fastmath 6bdba421b -->
+<!-- qd-copy-api 2ce5a850 · c2-emitter-fixes 83b2d1a2 · subgroup-cpu-support 8ebf8620 · reassociate-flag 19ff0276 · reassoc-subgroup-probe 9372c300 · r5-host-visible 67e27bc4 · spirv-vectorize 68bd7965 · algorithms-2 b12c125c · compiler-line 33e7dabf · n2-to-numpy-type 4a76ce7c · a10-nested-loop-raw c52711b5 · a19-stlf-fallback 3793c86d · a20-loop-var-scope 01d2037e · metal-i64 01d2037e · a7-m2-compound 869a00a0 · qd-native-bvh 76541b81 · cpu-head-state-per-iteration 4a400a11 · a32-static-return-order e0f35bdd · a34-bool-cast 91351dbd · a37-compile-uaf 4da921ff · familyr-realfunc-composite 57391b9f · audit-lint 2bb6b7f4 · ruff-import-sort 41175f2a · a46-recursion-guard 96cbd731 · a24-phase1-cfg-threshold 8ae3bfe4 · a47-float-parity 7a077591 · a45-normalize-parity【已回退】 · binary-identity 4e729612 · a56-fastcache-torch 68ce9b48 · a57-lowerast-usage e55c4c98 · a58-baseline-cleanup f4414e44 · render-perf e5015761 · residual-cleanup bc366ef7 · a63-scalarize-oor 233e60194 · a63-gdar-ndarray-scan 4e4573fb2 · a65-reverse-top-scalar 8e93b637d · a69-metal-fastmath 6bdba421b · a83-ib-dedup bcd2cbc79 -->
 
 # robostudio_features.md — features ledger for robostudio-main
 
@@ -1566,3 +1566,20 @@ test_state_history_get_set`:旧 wheel = A19 assert 拒编译(FAIL);新 wheel =
   控;若需 IEEE sqrt 须 SPIRV-Cross 后处理为 `precise::sqrt`,另行立项);②strict 不等于"更接近 f64
   参考"——无 FMA 时近抵消项误差可能更大(cylinder 案例),metal f32 的 A47 刀锋需 f64(A55)或测试口径
   解决;③默认档不变(fast),port conftest 按 arch 自选。
+
+## a83-ib-dedup — A83 IB 双重处理修复, 自动伴随冷缓存间歇崩溃消除(2026-10-26)
+- **描述**: ①DuplicateIndependentBlocksCleaner 补 visit(IfStmt)——check_children_ib
+  清理 true/false 分支 IB: 非 IB for-body 推 parent_block() 入 IB 集时宿主可为
+  IfStmt 分支, 分支 IB 与覆盖它的祖先 IB 双存 → 分支先处理(伴随 append 进
+  forward 分支)→ 祖先走查 accept(AdStackPopStmt) → 基类 DEFINE_VISIT
+  QD_NOT_IMPLEMENTED(statements.inc.h:49), 集合指针序(ASLR)+冷缓存致间歇。
+  ②auto_diff use_stack 循环防御性包含跳过(processed 集合+祖先链检查, 命中响亮
+  告警; 当前集合 0 触发 = 纵深防御)。文件: `quadrants/transforms/auto_diff/
+  ir_shaping.cpp`、`auto_diff.cpp`。
+- **背景需求**: A83(p1 forward 合并后无接触链冷缓存首跑间歇失败于
+  _flex_vertices adjoint, 约 1/3 冷跑; bt+块 dump 实锤双重处理)。一致性
+  正确性验证的最后一缺口。
+- **状态**: landed(bcd2cbc79, squash of mujocoqd/a83-ib-dedup)。门: 冷缓存
+  连跑 6/6 全部 102/102 adjoint(修复前约 1/3 失败); 端到端自动伴随 FD
+  2.03e-06 / BPTT / contact / FD 四门 PASS; 上游 test_ad_* 17 文件
+  427P/1S/2xF。
