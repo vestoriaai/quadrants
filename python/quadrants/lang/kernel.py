@@ -191,7 +191,13 @@ class LaunchContextBufferCache:
             return False
 
         assert args_hash is not None
-        launch_ctx.copy(self._launch_ctx_cache[args_hash])
+        try:
+          launch_ctx.copy(self._launch_ctx_cache[args_hash])
+        except RuntimeError:
+          # A85-era defense: a stale entry whose bound kernel differs (e.g. written
+          # before the kernel-identity fix above) is treated as a cache miss; the
+          # caller rebuilds and re-caches.
+          return False
         return True
 
 
@@ -729,7 +735,12 @@ class Kernel(FuncBase):
         callbacks: list[Callable[[], None]] = []
         launch_ctx = t_kernel.make_launch_context()
         # Special treatment for primitive types is unecessary and detrimental. See 'TemplateMapper.lookup' for details.
-        args_hash: "ArgsHash" = (id(t_kernel), *[id(arg) for arg in args])
+        # A85-era: the same Kernel wrapper serves multiple compiled variants (prune
+        # variants). Keying only on the wrapper + arg ids lets two variants whose
+        # argument ids collide (allocator address reuse across same-shaped arrays)
+        # reuse each other's cached launch context -> `kernel_ == other.kernel_`
+        # assertion. Fold the compiled-kernel identity into the hash.
+        args_hash: "ArgsHash" = (id(t_kernel), id(compiled_kernel_data), *[id(arg) for arg in args])
         # Stale-cache guard for mutable structs containing ndarrays. Frozen dataclass fields cannot be reassigned, so
         # id(struct) in args_hash is already sufficient. For mutable structs, ndarray attributes can change between
         # calls while the struct id stays the same, so we fold the live ndarray id(s) into the hash.

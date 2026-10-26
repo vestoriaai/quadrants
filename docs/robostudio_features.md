@@ -1583,3 +1583,15 @@ test_state_history_get_set`:旧 wheel = A19 assert 拒编译(FAIL);新 wheel =
   连跑 6/6 全部 102/102 adjoint(修复前约 1/3 失败); 端到端自动伴随 FD
   2.03e-06 / BPTT / contact / FD 四门 PASS; 上游 test_ad_* 17 文件
   427P/1S/2xF。
+
+## a85-launchcache — launch_ctx 缓存跨变体碰撞修复(2026-10-26, 未 squash, 随 a85 线)
+- **描述**: LaunchContextBufferCache 的 args_hash=(id(t_kernel), arg ids) 不含
+  编译变体/compiled-kernel 身份; wrapper 复用多 prune 变体 + 对象地址复用
+  (CPython id 复用)→ 跨 kernel 缓存命中 → C++ `kernel_ == other.kernel_`
+  断言致命。修复: ①args_hash 折入 id(compiled_kernel_data); ②populate 侧
+  kernel_ 断言降级为缓存 miss(try/except RuntimeError, 纵深防御)。
+  实测: 一次 S1 运行 752 次防御性 miss 重建, 流程不再崩溃。
+- **背景需求**: A85 修复(结构体数组批量 needs_grad 化)产生更多同形数组/
+  变体, 暴露此既有缓存键缺陷。
+- **状态**: landed-in-progress(robostudio-main 工作树未提交, 随 A85 线一并
+  squash)。文件: `python/quadrants/lang/kernel.py`。
