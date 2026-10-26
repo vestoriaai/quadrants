@@ -187,7 +187,7 @@ class LaunchContextBufferCache:
             launch_ctx_cache_tracker = self._launch_ctx_cache_tracker[args_hash]
         except KeyError:
             pass
-        if not launch_ctx_cache_tracker:  # Empty or none
+        if True:  # A85 EXPERIMENT: launch-ctx cache disabled, always rebind fresh
             return False
 
         assert args_hash is not None
@@ -741,6 +741,27 @@ class Kernel(FuncBase):
         # reuse each other's cached launch context -> `kernel_ == other.kernel_`
         # assertion. Fold the compiled-kernel identity into the hash.
         args_hash: "ArgsHash" = (id(t_kernel), id(compiled_kernel_data), *[id(arg) for arg in args])
+        # A85/A86: launch 期 grad 缓冲身份追踪(QD_LAUNCH_TRACE=1 门控; 追踪 reverse
+        # 链 launch 序/grad 绑定 id/可注册 runtime.a86_watch={id(arr): 名} 看范数流)
+        if os.environ.get("QD_LAUNCH_TRACE") == "1":
+            _adm = str(getattr(self, "autodiff_mode", ""))
+            _nm = getattr(self.func, '__name__', '?')
+            _gi = [(k, id(arg.grad) if getattr(arg, 'grad', None) is not None else None)
+                   for k, arg in zip(range(len(args)), args)
+                   if hasattr(arg, 'grad')]
+            print(f"  [gb] {'REV' if 'REVERSE' in _adm else 'fwd'} {_nm}#{id(self) % 100000}: {_gi}", flush=True)
+            if 'REVERSE' in _adm:
+                import numpy as _np
+                _watch = getattr(impl.get_runtime(), "a86_watch", None)
+                if _watch:
+                    _pre = [(f"{_watch.get(id(a), '?')}@{k}", float(_np.linalg.norm(a.grad.to_numpy())))
+                            for k, a in zip(range(len(args)), args) if getattr(a, 'grad', None) is not None]
+                    print(f"  [gv] PRE  {_nm}: {_pre}", flush=True)
+                    _cb = lambda: print(f"  [gv] POST {_nm}: "
+                                        + str([(f"{_watch.get(id(a), '?')}@{k}", float(_np.linalg.norm(a.grad.to_numpy())))
+                                               for k, a in zip(range(len(args)), args)
+                                               if getattr(a, 'grad', None) is not None]), flush=True)
+                    callbacks.append(_cb)
         # Stale-cache guard for mutable structs containing ndarrays. Frozen dataclass fields cannot be reassigned, so
         # id(struct) in args_hash is already sufficient. For mutable structs, ndarray attributes can change between
         # calls while the struct id stays the same, so we fold the live ndarray id(s) into the hash.

@@ -308,6 +308,16 @@ def clear_all_gradients(gradient_type=SNodeGradType.ADJOINT):
     for root_fb in _snode.FieldsBuilder._finalized_roots():
         visit(root_fb)
 
+    # A86: ndarray grads are not SNode places, so the field walk above misses
+    # them. mujoqo's warp-bridge allocates the whole Data as ndarrays with
+    # needs_grad=True (grad-scratch included), so a tape re-entry would
+    # otherwise accumulate onto stale adjoints from the previous iteration.
+    if gradient_type == SNodeGradType.ADJOINT:
+        for arr in list(impl.get_runtime().ndarrays):
+            g = getattr(arr, "grad", None)
+            if g is not None:
+                g.fill(0)
+
 
 def grad_replaced(func):
     """A decorator for python function to customize gradient with Quadrants's autodiff
