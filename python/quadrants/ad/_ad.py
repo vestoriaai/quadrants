@@ -355,8 +355,11 @@ def grad_replaced(func):
 
     def decorated(*args, **kwargs):
         # TODO [#3025]: get rid of circular imports and move this to the top.
+        # A86: 嵌套 grad_replaced(整步边界包住内部边界)时, 内层不再插带 ——
+        # 外层已把整块记为一个单元, 内层重复记录会双算伴随.
+        _already = impl.get_runtime().grad_replaced
         impl.get_runtime().grad_replaced = True
-        if impl.get_runtime().target_tape:
+        if impl.get_runtime().target_tape and not _already:
             impl.get_runtime().target_tape.insert(decorated, args)
         try:
             func(*args, **kwargs)
