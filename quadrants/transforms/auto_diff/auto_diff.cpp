@@ -5,6 +5,9 @@
 #include "quadrants/transforms/auto_diff/post_adjoint_cleanup.h"
 #include "quadrants/transforms/auto_diff/validation.h"
 
+#include <cstdlib>
+#include <string>
+
 #include "quadrants/ir/analysis.h"
 #include "quadrants/ir/ir.h"
 #include "quadrants/ir/transforms.h"
@@ -59,7 +62,14 @@ void auto_diff(IRNode *root, const CompileConfig &config, AutodiffMode autodiff_
         // AdStackAlloca shape, not the alloca-with-store shape promote_ssa_to_local_var emits) and before
         // `make_adjoint` (so the reverse pass is generated against the cleaned forward IR with no spurious push/load
         // scaffolding).
-        eliminate_recomputable_ad_stack_pushes(ib);
+        // A86 追踪四十八: 纯重放 tape + 原位覆写环境下, ArgLoad 叶子的反向
+        // DAG 重执行会读到事后值(叶子合法性未覆盖跨 kernel 变异)——
+        // QD_ELIM_RECOMPUTABLE=0 时跳过本 pass, 供诊断与健全性回归。
+        {
+          const char *elim_env = std::getenv("QD_ELIM_RECOMPUTABLE");
+          if (!(elim_env != nullptr && std::string(elim_env) == "0"))
+            eliminate_recomputable_ad_stack_pushes(ib);
+        }
         type_check(root, config);
 
         make_adjoint(ib, config.ad_stack_size);
