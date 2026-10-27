@@ -390,7 +390,18 @@ class IdentifyIndependentBlocks : public BasicStmtVisitor {
         // The top level block is already not an IB, store it
         independent_blocks_.push_back({depth_ - 1, block});
       } else {
-        independent_blocks_.push_back({depth_ - 1, block->parent_block()});
+        // A86: single-hop parent_block() is only correct when the non-IB for-body hangs directly off the enclosing
+        // loop body. With an intervening IfStmt (`if guard: for k in ...: acc += ...`), parent_block() is the BRANCH
+        // block; promoting the branch to the IB makes make_adjoint process only the branch and silently drop adjoints
+        // of every sibling statement in the same iteration (e.g. the `res[d] = acc` store after the if) - gradients
+        // come out all-zero with no diagnostic. Walk up to the nearest enclosing loop body instead: that scope is the
+        // iteration unit MakeAdjoint must transform in place, and it is always itself an IB candidate by induction
+        // (its own visit_loop_body call pushed it or descended into it).
+        Block *target = block->parent_block();
+        while (target != nullptr && loop_bodies_.find(target) == loop_bodies_.end()) {
+          target = target->parent_block();
+        }
+        independent_blocks_.push_back({depth_ - 1, target != nullptr ? target : block->parent_block()});
       }
     }
   }
@@ -399,6 +410,7 @@ class IdentifyIndependentBlocks : public BasicStmtVisitor {
     QD_ASSERT(depth_ == 0);
     depth_++;
     current_ib_ = stmt->body.get();
+    loop_bodies_.insert(stmt->body.get());
     visit_loop_body(stmt->body.get());
     depth_--;
   }
@@ -408,6 +420,7 @@ class IdentifyIndependentBlocks : public BasicStmtVisitor {
       current_ib_ = stmt->body.get();
     }
     depth_++;
+    loop_bodies_.insert(stmt->body.get());
     visit_loop_body(stmt->body.get());
     depth_--;
   }
@@ -440,6 +453,9 @@ class IdentifyIndependentBlocks : public BasicStmtVisitor {
   std::vector<std::pair<int, Block *>> independent_blocks_;
   int depth_{0};
   Block *current_ib_{nullptr};
+  // A86: every for-body entered during the walk (see visit(RangeForStmt/StructForStmt)). Used by visit_loop_body's
+  // non-IB fallback to find the nearest enclosing loop body instead of the immediate parent block.
+  std::set<Block *> loop_bodies_;
 };
 
 // ============================================================================
