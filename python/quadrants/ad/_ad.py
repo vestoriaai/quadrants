@@ -237,6 +237,17 @@ class Tape:
             calls[0].autodiff_mode = mode
 
     def insert(self, func, args):
+        # A86 追踪五十: 内部数据搬运 helper(`quadrants._kernels` 的 fill_field/
+        # fill_ndarray/clear_gradients/各 to_ext_arr/ext_arr_to_* 布局转换)没有
+        # 伴随语义, 但 kernel 对象统一具备 `.grad` 属性, grad() 的 hasattr 检查
+        # 拦不住它们。tape 块内的任何 .fill()/clear_all_gradients()/to_numpy()
+        # 都会把这类 helper 记进 calls, grad() 的逆序回放随即执行其伴随 kernel
+        # —— "读后清零"协议把已经回放好的下游伴随清零(实测: with 块内一次
+        # ndarray.grad.fill(0) 即整条梯度链归零)。按被装饰函数的源模块整组跳过
+        # (Kernel.source_module 由 Kernel.__init__ 记录; 实例自身的 __module__
+        # 是 Kernel 类所在模块, 不可用)。
+        if getattr(func, "source_module", None) == "quadrants._kernels":
+            return
         # Kernels with mode `AutodiffMode.NONE` and `AutodiffMode.VALIDATION` are all forward kernels.
         # The difference is there are `assert` for global data access rule check in VALIDATION kernels.
         assert func.autodiff_mode in (

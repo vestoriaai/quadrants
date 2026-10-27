@@ -334,6 +334,11 @@ class Kernel(FuncBase):
         )
         self.autodiff_mode = autodiff_mode
         self.grad: "Kernel | None" = None
+        # A86 追踪五十: 被装饰函数的源模块。Tape.insert 用它跳过框架内部数据搬运
+        # helper(`quadrants._kernels` 的 fill/clear/布局转换)——它们无伴随语义却
+        # 会被 tape 记录并在 grad() 逆序回放中执行伴随, 污染已算好的下游伴随。
+        # Kernel 实例自身的 __module__ 是本类模块, 拿不到被装饰函数的, 故在此记录。
+        self.source_module = getattr(_func, "__module__", None)
         impl.get_runtime().kernels.append(self)  # type: ignore[arg-type]
         self.reset()
         self.kernel_cpp: None | KernelCxx = None
@@ -1248,6 +1253,13 @@ class Kernel(FuncBase):
         self._last_launch_key = key
         kernel_cpp = self.materialized_kernels[key]
         compiled_kernel_data = self.compiled_kernel_data_by_key.get(key, None)
+        # A86 追踪五十: launch 变体追踪(QD_LAUNCH_TRACE=1 时附加)。key 的
+        # instance_id 段区分编译特征(needs_grad 等)——排查 REV kernel 命中
+        # grad-less 变体(伴随发射被裁)时用。
+        import os as _os
+        if _os.environ.get("QD_LAUNCH_TRACE") == "1" and 'REVERSE' in str(getattr(self, 'autodiff_mode', '')):
+            _nm2 = getattr(getattr(self, 'func', None), '__name__', '?')
+            print(f"  [key] {_nm2}#{id(self) % 100000} key={key}", flush=True)
         self.launch_observations.found_kernel_in_materialize_cache = compiled_kernel_data is not None
         # Hot-path fast lane: for non-checkpoint kernels (`use_checkpoints=False`), skip every piece of checkpoint
         # plumbing -- no label translation, no extra kwarg on `launch_kernel`, no post-launch GraphStatus build. This
