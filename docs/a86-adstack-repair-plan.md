@@ -1,126 +1,118 @@
-# A86: adstack/自动反向修复计划(追踪四十八)
+# A86: adstack/自动反向修复计划 v2(追踪四十八; v1 经第一性原理评估后修订)
 
-日期: 2026-10-27 | 状态: 计划书 v1(Phase 0 未执行, 假设未验证)
-关联: mujoqo-iftwt `docs/a86-bptt-closure-report.md` §6/D1、账本追踪三十四/四十二/四十六
+日期: 2026-10-27 | 状态: 计划书 v2(Phase 0 实验未执行)
+关联: mujoqo-iftwt `docs/a86-bptt-closure-report.md` §6-7/D1-D5、账本追踪三十四/四十二/四十六
+v1→v2 变更: H1 由"经验假设"升级为"结构不健全的第一性原理推导"; 修复方向由
+"kill-switch 门控"改为"叶子合法性收紧 + 只读标注"; 补 purity 检验与 act 覆盖缺口。
 
-## 0. 现状与症状(已知事实)
+## 0. 已知事实(带证据)
 
 | # | 事实 | 证据 |
 |---|---|---|
-| K1 | builder 内核(while+嵌套 if+标量跨迭代携带)的自动反向产出 inf/垃圾 | mujoqo S1 链 M_scratch.grad=inf; c623 reverse IR: 除数来自 unclamped `stack load top` |
-| K2 | 栈配对不对称实录: `$7880014` load-top-无-pop(peek), 对照 `$7880011` 配对消费 | 追踪三十四/三十五 IR 审计; **是否设计(broadcast 读)从未定性** |
-| K3 | step_ift 单步边界下, 每 stage 的伴随应用精确(1.5-2.3e-07) | 追踪四十六 a86_steprec; 即: 边界外的自动反向才是坏的 |
-| K4 | 受影响内核族: cholesky factorize/solve、RNE、transmission —— 全部含 while/分支依赖控制流 | mujoqo `_src/smooth.py` builder 内核 |
-| K5 | 现有 IFT/FD 边界已绕开全部受影响路径(三 sample 全 PASS) | mujoqo cdd2d30; 即本缺陷当前为**潜伏**, 不阻塞 sample |
+| K1 | builder 内核(while+嵌套 if+标量跨迭代)自动反向产出 inf/垃圾 | mujoqo S1 链 M_scratch.grad=inf; c623 reverse IR 除数来自 unclamped `stack load top` |
+| K2 | 栈配对不对称实录($7880014 peek-无-pop), 是否设计**未定性** | 追踪三十四/三十五 IR 审计 |
+| K3 | step_ift 单步边界下每 stage 伴随应用精确(1.5-2.3e-07) | 追踪四十六 a86_steprec |
+| K4 | 受影响内核族: cholesky factorize/solve、RNE、transmission | mujoqo `_src/smooth.py` |
+| K5 | IFT/FD 边界已绕开全部受影响路径, 三 sample 全 PASS | mujoqo cdd2d30 —— 本缺陷当前**潜伏**, 是"未来新内核的正确性 + 撤边界性能"问题 |
 
-## 1. 根因假设(按优先级; Phase 0 前均未验证)
+## 1. 第一性原理推导(替代 v1 的经验假设)
 
-**H1(强假设, 新识别): `eliminate_recomputable_ad_stack_pushes` 在纯重放+原位覆写环境下不健全。**
-- 机制: 该 pass(auto_diff.cpp:62, eliminate_recomputable_pushes.cpp)删除"可重算"的
-  push —— 判据为 chain leaves 落在 kernel args / 已栈化 allocas / **未在 IB 内变异的
-  SNode**。但判据没有覆盖: **被同一段重放里*其他 kernel* 原位覆写的普通数组**。
-  forward 时 push 的值 v 由数组状态 S_fwd 计算; 反向重算时数组已是 S_later
-  (后续 kernel 原位覆写过) → 重算值 ≠ 前向值 → 栈内容错位 → 下游
-  load-top(含合法 peek)读到垃圾 → inf。
-- 与 mujoqo 现场吻合: euler 的 M/qLD scratch 全是原位覆写; 受影响内核全在
-  原位覆写密集区。
-- 一日可验证: 加 config knob 关掉该 pass → 重跑 mujoqo S1 无边界链 →
-  inf/垃圾消失与否即判。
+**架构不变量**: 纯重放 tape + 可变状态之下, 反向核消费的每个前向值必须满足二者之一:
+(i) 该值所在存储在 forward 写入后至 reverse 读取前**未被任何执行改变**;
+(ii) 该值在 forward 时被**快照**(adstack push 即此机制)。
+不存在第三选项。
 
-**H2: make_adjoint 反向走查的栈配对缺陷(A65/A68 协议实现)**。
-- 机制: 反向 kernel 的伴随走查按 forward 语句逆序重放控制流, guard 值经
-  guard-stack 传递; 分支依赖的 push 数要求反向在**同一路径**上镜像
-  push/pop —— 若 walk 在 peek(不消费)与 pop 之间混入分支重入, LIFO 对齐破坏。
-- 已知实例: A68 while 协议(forward 每执行迭代 push 一个 marker, 反向 LIFO
-  消费)与 guard-stack 混用时的对齐未系统验证。
+**由此推导 eliminate_recomputable_ad_stack_pushes 的结构性不健全**:
+该 pass 的判据(leaves ∈ {ArgLoad, Const, LoopIndex, AdStackLoadTop/Alloca};
+SNode leaves 门控"未在 IB 内变异")检查的是**本 kernel IR 内**的变异 —— 但
+tape 系统中"谁会在 forward 与 reverse 之间改写该数组"是**运行期信息**
+(重放序列编译时未知)。具体地:
+- **ArgLoad 叶子**: kernel 数组参数的内容在 forward 与 reverse 之间可被任何
+  更晚的 forward kernel 原位覆写(mujoqo: qvel/qfrc_*/M/qLD/efc_* 全是)。
+  反向时 DAG 重执行读到的是**终态内容** → 重算值 ≠ 前向值 → 该值的一切
+  下游伴随错。
+- **BackupSSA 的跨块 SSA 重执行**(make_adjoint)同构同险。
+- 上游纯净用法(每 kernel 只读 args 不原位改他者)下不触发 —— 解释为何此
+  缺陷在上游潜伏而在 MuJoCo-warp 式原位状态变更移植中爆发。
+- 推论: **判据对 tape 用法是必要非充分的; 静态分析原则上无法覆盖
+  (重放变异集是运行期信息) —— 唯一健全出路 = 收紧叶子合法集 或 快照。**
 
-**H3: 静态不可判定构型**: 分支依赖的 push 数使任何静态配对分析在该构型下
-  都不成立 —— 需要协议级 fallback(checkpoint/值快照, 见 §2 方案 C)。
+结论: H1 由"假设"升级为**推导出的结构缺陷**; P0 实验只负责确认 mujoqo 现场
+触发路径(哪个数组/哪条链), 不再负责判断"是否有缺陷"。
 
-优先级排序理由: H1 可一日证伪/证实且解释面广(覆盖 K1 的 inf 与部分假梯度);
-H2 次之(A65/A68 是我们自己的新代码, 审计线索直接); H3 是 H1/H2 都排除后的
-结论性诊断。
+## 2. 修复设计(v2, 从不变量推导)
 
-## 2. 修复方案选项
+**F-a(正确性主体): 叶子合法性收紧 —— 可重算链禁止可变 ArgLoad 叶子。**
+- RecomputableChainAnalyzer 的 leaf 集删去 ArgLoad(或收紧为带只读标注的
+  arg); Const/LoopIndex/栈化 allocas 保留。
+- 效果: 触碰可变数组的链保留 push(快照 ✓ 满足不变量 ii); 纯常量/索引链
+  仍消除(✓ 保留大部分收益: loop-index/上一迭代值链是频次最高的形态)。
 
-**方案 A(H1 成立时): 消除 pass 的健全性门控 / kill-switch。**
-- 形态: config 项(如 `ad_stack_elimination=off/on`)或判据扩展 —— chain leaves
-  增加"跨 kernel 可能被覆写"类(保守化: 只要 leaf 数组在 IB 外有任何写入点
-  即视为不可重算)。
-- 代价: 栈内存与运行时 push 增大(determine_ad_stack_size 已有上限机制);
-  触发 stack overflow 的 kernel 需要上限调整或降级。
-- 杠杆: 可能以 <1 天修复恢复全部 builder 内核自动反向的正确性。
+**F-b(性能保留): 只读标注机制。**
+- mujoqo 的 Model 侧数组(m.*)在 put_data 后不可变 —— 标注只读后, 触碰
+  m.* 的链恢复可消除(实例: gain/bias/mass 常量链, cholesky 的行地址表)。
+- 形态: qd 层 API(如 `qd.mark_read_only(arr)`)或 arg 注解; 消除 pass 的
+  analyzer 识别标注。
 
-**方案 B(H2 成立时): make_adjoint 反向走查的配对修复。**
-- 形态: 修正 walk 中 peek/pop 的发射顺序; 或统一协议为"每个 load-top 都
-  有配对 pop(消费型)"并禁止无主 peek。
+**F-c(守门): 消除 pass 增加 config knob(默认维持现行为), 供诊断与回归
+  A/B; 长期默认值随 F-a/F-b 落地后再翻转。**
 
-**方案 C(H3 成立时): 不健全内核的 checkpoint fallback。**
-- 形态: 静态分析判定配对不可验证的 kernel, 放弃 adstack, 改为 per-iteration
-  值快照(ring buffer / forward_state_spill 机制扩展) —— 正确但内存与运行时
-  成本高, 仅对该 kernel 降级。
+**不选择**: 全局 kill-switch(v1 方案 A)—— 一刀切恢复正确性但把消除收益
+(头注自述 5-10x push 成本节省)全部丢掉; 收紧+标注在保留多数收益的同时
+满足不变量。
 
-**方案 D(长期, 与 A/B/C 正交): 栈协议规格化文档 + 编译期平衡校验 pass**
-- 形式化不变量: 对每个 AdStackAllocaStmt 栈 s, 沿任意执行迹,
-  push(s) 与 pop+消费型 load-top(s) 逐事件 LIFO 配对; 校验 pass 在编译期
-  assert(可配置为 warning), 违规即时报而非静默产错值。
+## 3. 阶段计划(gate 与退出条件)
 
-## 3. 阶段计划(每阶段带 gate 与退出条件)
+**P-1 上游核对(半日, 最先做)**
+- 该 pass 源自上游 genesis quadrants: 查 issue/commit/设计文档是否已知
+  "原位变更下不健全"; 若上游已有修复/讨论, 直接对齐。
+- Gate: 结论(已知/未知/已修)写入本文件再进 P0。
 
-**P0 — H1 验证(预计 0.5-1 天)**
-- 加 config knob 关 eliminate_recomputable_ad_stack_pushes。
-- 实验: mujoqo S1 无边界链(p5_s1_onestep_fd 去掉 IFT 边界或直接跑
-  factor_solve_i 的 auto 反向)双跑对比。
-- Gate: inf/垃圾消失 → H1 成立, 走方案 A; 不消失 → H1 排除, 进 P1。
+**P0 现场触发确认(0.5-1 天)**
+- 构建最小复现: 含 ArgLoad 叶子的 while+if kernel(手工写, 非依赖 mujoqo),
+  forward 改写叶子数组 → reverse → 断言错值; 现行 HEAD 复现。
+- 再跑 mujoqo S1 无边界链加 knob(F-c)对比: inf/垃圾消失路径确认。
+- Gate: 最小复现成立 + knob 闭环 → 进 P2; 不成立 → 推翻推导, 回到 P-1。
 
-**P1 — 栈平衡审计工具(预计 1 个工作日)**
-- IR pass: 对每 kernel 按 AdStackAllocaStmt 逐一统计 push/pop/load-top
-  事件序列, 输出配对报告(静态可查部分); 同时支持运行期插桩计数
-  (已有 [gb]/stack 审计手法, 追踪三十四/三十五)。
-- Gate: 在最小复现与 c623 上重放追踪三十四/三十五的发现并分类
-  ($7880014 peek 定性: 设计 or bug)。
+**P1 平衡审计工具(1 个工作日)**
+- IR pass: 按 AdStackAllocaStmt 输出 push/pop/load-top 事件序列与配对报告;
+  附运行期计数插桩。定性 K2($7880014 peek: 设计 or bug)。
 
-**P2 — 定位(预计 1-2 个工作日, 不确定性最高)**
-- 在受控内核族(§4)上逐构型定位违反点; 每个发现附最小复现 + IR 前后对比。
-- Gate: 每个候选缺陷有"最小 kernel + 错值复现 + IR 证据"三件套。
+**P2 修复实现(1-2 个工作日)**
+- F-a 收紧 + F-b 标注 + F-c knob; 伴随链(quat 列)回归。
 
-**P3 — 修复(预计 1-3 个工作日, 视 P2 结论落在方案 A/B/C 哪档)**
+**P3 测试(1 个工作日)**
+- 控制流构型矩阵单测(for+while/if-in-while/while+break/嵌套 while/多栈/
+  标量携带): 伴随 vs FD(rel 门 1e-4 量级, f32)+双 eps 稳定性。
+- 平衡校验跑 mujoqo 全量 battery 内核, 输出违规清单。
+- 单/多线程逐位一致。
 
-**P4 — 测试(预计 1 个工作日)**: 见 §4。
+**P4 mujoqo 接入(1-2 个工作日)**
+- S3 撤 FD 边界 → 纯自动链回归(门: 保持 1.47e-04 量级);
+- S1/S2 回归; P4 反向画像重做(解析链反向应 ≈ 正向 2-3 倍);
+- ad_ift 仅保留求解类解析 IFT(长期, D0 本意)。
 
-**P5 — mujoqo 接入与收益兑现(预计 1-2 个工作日)**
-- 撤 FD 边界 → S3 纯自动链回归(精度门: 保持 ≤1.47e-04 量级);
-- P4 反向画像重做(解析链的反向成本应 ≈ 正向 2-3 倍);
-- 清理: ad_ift 仅保留求解类解析 IFT(长期保留, 属 D0 立项本意)。
+## 4. 资源估计(v2, 场景化)
 
-## 4. 测试计划
+- P-1+P0: 1-1.5 天。P1: 1 天。P2: 1-2 天。P3 测试: 1 天。P4: 1-2 天。
+- 合计 **5-7.5 个工作日**(v1 的 6-10 会话段 → 场景化后收紧; P-1 若发现
+  上游已修则 P0-P3 塌缩为升级适配, ≈2 天)。
 
-1. **内核族单测**(新, qd 侧): 控制流构型矩阵 —— for+while / if-in-while /
-   while+break / 嵌套 while / 多栈 / 标量跨迭代携带 / cholesky 形(实锤族)。
-   每个: forward vs 手工参考 + 伴随 vs FD(rel 门, f32 下 1e-4 量级) +
-   双 eps 稳定性检查。
-2. **编译期平衡校验**(方案 D 产物): 对 mujoqo 全量 battery 内核跑一遍,
-   输出违规清单(既有 battery 是现成的回归面)。
-3. **集成**: mujoqo S1/S2/S3 冒烟 + S3 纯自动链(撤边界)回归 + battery
-   7/7 风格一致性门。
-4. **确定性**: 单线程/多线程双跑逐位一致(原位覆写+多线程原子序是已知变量)。
-
-## 5. 资源估计
-
-- 执行者: 本 agent(quadrants 仓 + mujoqo 仓均已就绪, A65/A68 同区域既往
-  工作经验可直接复用)。
-- 编译成本是主要摩擦(cfg_optimization off 纪律已固化, CLAUDE.md)。
-- 总量: **6-10 个专注会话段**(P0 后不确定性显著下降; P2 前的估计置信度低,
-  P2 后可收敛到 ±1 段)。
-- 上游核对(半日): 该 pass 源自上游 genesis quadrants —— 先查上游 issue/
-  commit 是否已知此限制(可能已有修复或讨论), 避免重复造轮子。
-
-## 6. 风险
+## 5. 风险
 
 | 风险 | 应对 |
 |---|---|
-| H1/H2 均不成立(H3 类不可判定构型) | 方案 C checkpoint fallback; 成本升级但路径明确 |
-| 修复破坏目前通过的内核 | P4 全量 battery + 内核族回归门前置 |
-| 上游已有修复/不同设计 | P0 前先做半日上游核对 |
-| 栈内存增长触发 overflow | determine_ad_stack_size 上限机制 + 降级路径 |
-| mujoqo 撤边界后精度回退 | P5 回归门: 保持 1.47e-04 量级, 否则边界按列回退 |
+| 收紧后消除收益大幅缩水(栈内存/overflow) | F-b 只读标注找回大头; determine_ad_stack_size 上限机制 + 降级路径 |
+| 上游已修/设计如此(有意的 trade-off) | P-1 前置核对; 若上游有意, 本计划转为"mujoqo 场景的 sound-subset 上游 PR" |
+| quat 分量扰动触发非光滑(单位范数约束) | 列级有效性检查复用翻转守卫模式 |
+| 修复破坏现有通过内核 | P3 全量 battery + 内核族回归门前置 |
+| mujoqo 撤边界后精度回退 | P4 回归门: 保持 1.47e-04 量级, 否则按列回退边界 |
+
+## 6. 随发现补充的缺口登记(本轮新增)
+
+- **边界输入覆盖**: step_ift/rollout_ift 的 FD 输入组为 (qpos, qvel, ctrl);
+  通用模型需加 act(na>0)——pendula na=0 未覆盖, 登记为通用化缺口。
+- **purity 检验**: step 是否为 (qpos,qvel,ctrl) 的纯函数未显式验证(全量
+  restore vs 部分重置对比)—— 若不纯, 冒烟 g_ref 方法论需改全量 restore。
+- **探针确定性配置对齐**: 跨进程对比实验须统一 cpu_max_num_threads=1
+  (此前种子对比的跨进程差异含此因素)。
