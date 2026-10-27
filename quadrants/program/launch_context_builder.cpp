@@ -174,7 +174,21 @@ void LaunchContextBuilder::set_host_accessible_ndarray_ptrs(int arg_id, uint64 d
   // stamping it into `array_ptrs` would just move the stale read to a harder-to-diagnose segfault.
   set_ndarray_ptrs(arg_id, data_ptr, grad_ptr);
   array_ptrs[{arg_id, TypeFactory::DATA_PTR_POS_IN_NDARRAY}] = reinterpret_cast<void *>(data_ptr);
-  if (kernel_->nested_parameters[arg_id].needs_grad) {
+  // A86 追踪五十一: 门控结果追踪 —— nested_parameters.needs_grad 为 False 时
+  // grad_ptr 不进 kernel 可见 args buffer(伴随写静默丢失)。
+  static const bool a86_trace2 = [] {
+    const char *env = std::getenv("QD_LAUNCH_TRACE");
+    return env != nullptr && std::string(env) == "1";
+  }();
+  const bool ng_meta = kernel_->nested_parameters[arg_id].needs_grad;
+  if (a86_trace2) {
+    const std::string kname = kernel_ != nullptr ? kernel_->name : "<null>";
+    if (kname.find("reverse_grad") != std::string::npos && grad_ptr != 0) {
+      fmt::print("  [cpp] host_rebind kernel={} arg_id={} ng_meta={} grad_ptr={:x} -> {}\n", kname, arg_id,
+                 ng_meta, (uint64)grad_ptr, ng_meta ? "written" : "DROPPED");
+    }
+  }
+  if (ng_meta) {
     array_ptrs[{arg_id, TypeFactory::GRAD_PTR_POS_IN_NDARRAY}] = reinterpret_cast<void *>(grad_ptr);
   }
 }
@@ -378,6 +392,19 @@ void LaunchContextBuilder::set_arg_ndarray_with_grad(int arg_id, const Ndarray &
   intptr_t ptr_grad = arr_grad.get_device_allocation_ptr_as_int();
   QD_ASSERT_INFO(arr.shape.size() <= quadrants_max_num_indices,
                  "External array cannot have > {max_num_indices} indices");
+  // A86 追踪五十一: grad 指针绑定追踪(QD_LAUNCH_TRACE=1 门控)。排查 REV kernel
+  // 的自动伴随写入静默无效时, 对比 python 侧 companion id 与此处实际打包的指针。
+  static const bool a86_trace = [] {
+    const char *env = std::getenv("QD_LAUNCH_TRACE");
+    return env != nullptr && std::string(env) == "1";
+  }();
+  if (a86_trace) {
+    const std::string kname = kernel_ != nullptr ? kernel_->name : "<null>";
+    if (kname.find("reverse_grad") != std::string::npos) {
+      fmt::print("  [cpp] set_with_grad kernel={} arg_id={} primal={:x} grad={:x}\n", kname, arg_id,
+                 (uint64)ptr, (uint64)ptr_grad);
+    }
+  }
   set_arg_ndarray_impl(arg_id, ptr, arr.shape, ptr_grad);
 }
 
