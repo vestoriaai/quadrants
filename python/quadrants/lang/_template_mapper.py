@@ -5,6 +5,7 @@ from weakref import ReferenceType
 from quadrants.lang import impl
 from quadrants.lang.impl import Program
 from quadrants.lang.kernel_arguments import ArgMetadata
+from quadrants.lang._ndarray import Ndarray
 from quadrants.lang.util import is_data_oriented
 from quadrants.types import ndarray_type
 
@@ -107,6 +108,18 @@ class TemplateMapper:
         # branching for primitive types dramatically improve performance of hash computation.
         mapping_cache_tracker: list[ReferenceType | None] | None = None
         args_hash: ArgsHash = tuple([id(arg) for arg in args])
+        # A86 追踪五十一: ndarray 的 grad companion 分配状态参与缓存键。特征
+        # needs_grad 按 `arg.grad is not None` 提取(见 _template_mapper_hotpath),
+        # 而 companion 可能晚于首次 launch 才挂上(set_grad/惰性分配)—— 仅按对象
+        # id 固化的 args_hash 会在状态翻转后命中旧特征编译的变体(grad-less,
+        # 伴随发射被裁 → 该 kernel 的自动伴随永久丢失, REV 写入静默无效)。
+        # companion 一旦分配即恒定(创建 needs_grad=True 或 set_grad), 键因此
+        # 稳定; 状态翻转必然 miss 并重算特征, 生成独立 instance。
+        _grad_bits = tuple(
+            (a.grad is not None) for a in args if isinstance(a, Ndarray)
+        )
+        if _grad_bits:
+            args_hash = args_hash + _grad_bits
         # A ``@qd.data_oriented`` container's member ndarrays can be reassigned between calls on the same instance
         # (``state.x = other_ndarray``), which ``id(arg)`` cannot see, so the spec-key cache would serve an entry
         # compiled for the old dtype/ndim. Fold the reachable ndarray ids in as well.
