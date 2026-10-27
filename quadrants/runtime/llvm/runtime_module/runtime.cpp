@@ -1810,6 +1810,17 @@ void cpu_parallel_range_for(RuntimeContext *context,
   range_task_context.body_loop_size = block_dim;
   auto runtime = context->runtime;
   const int ntasks = (end - begin + block_dim - 1) / block_dim;
+  // A86 追踪五十一: 调度层观测(QD_LAUNCH_TRACE=1 门控)—— 首跑 launch 的
+  // body 是否被调度执行(range 是否退化)。
+  static const bool a86_trace = [] {
+    const char *env = std::getenv("QD_LAUNCH_TRACE");
+    return env != nullptr && std::string(env) == "1";
+  }();
+  if (a86_trace) {
+    std::printf("  [cpp] range_for body=%lx begin=%d end=%d step=%d ntasks=%d\n",
+                (unsigned long)(uintptr_t)body, begin, end, step, ntasks);
+    std::fflush(stdout);
+  }
   // C1.5 (QD_AUTO_SERIAL): small pure range-fors run inline on the submitting
   // thread - the pool's wake-all barrier (~13us) dwarfs small loop bodies.
   // Scoped here (not in the pool) so only plain range-fors take the fallback;
