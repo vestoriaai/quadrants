@@ -50,8 +50,9 @@ with qd.ad.Tape(loss=L):
     loss_k(y, t, L)
 qd.sync()
 g1 = x.grad.to_numpy().copy()
-exp1 = 4.0 * (2.0 * x_np - t_np)
-print("单核 tape x.grad:", np.array2string(g1, precision=3), " PASS" if np.allclose(g1, exp1, atol=1e-4) else " FAIL")
+# 单核 tape: x 不在 tape 内, x.grad=0 是正确行为(判别力在两核)
+print("单核 tape x.grad:", np.array2string(g1, precision=3),
+      " PASS" if np.allclose(g1, 0.0, atol=1e-6) else " FAIL")
 
 # 两核 tape{scale2; loss}
 for _warm in range(3):
@@ -69,5 +70,6 @@ with qd.ad.Tape(loss=L):
     loss_k(y, t, L)
 qd.sync()
 g2 = x.grad.to_numpy()
-exp2 = 4.0 * (2.0 * x_np - t_np)
+# 链: dL/dy=(y-t), dL/dx=dL/dy*2 = 2*(2x-t)
+exp2 = 2.0 * (2.0 * x_np - t_np)
 print("两核 tape x.grad:", np.array2string(g2, precision=3), " PASS" if np.allclose(g2, exp2, atol=1e-4) else " FAIL")
