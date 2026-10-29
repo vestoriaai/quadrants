@@ -368,6 +368,11 @@ def grad_replaced(func):
         # TODO [#3025]: get rid of circular imports and move this to the top.
         # A86: 嵌套 grad_replaced(整步边界包住内部边界)时, 内层不再插带 ——
         # 外层已把整块记为一个单元, 内层重复记录会双算伴随.
+        # A86 追踪七十: finally 必须栈式恢复 _already 而非硬设 False ——
+        # 硬设 False 会让外层(如 rollout_ift 整段边界)forward 重放中的
+        # 第二个起所有内层 grad_replaced 边界漏记 tape(内层 finally 把
+        # 外层的嵌套标志清掉了), 反向时整段 FD 与内层伴随双重执行
+        # (rollout 路径 ctrl.grad 污染 -15744 的根因)。
         _already = impl.get_runtime().grad_replaced
         impl.get_runtime().grad_replaced = True
         if impl.get_runtime().target_tape and not _already:
@@ -375,7 +380,7 @@ def grad_replaced(func):
         try:
             func(*args, **kwargs)
         finally:
-            impl.get_runtime().grad_replaced = False
+            impl.get_runtime().grad_replaced = _already
 
     decorated.grad = None
     decorated.autodiff_mode = AutodiffMode.NONE
