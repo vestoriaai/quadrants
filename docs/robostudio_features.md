@@ -1595,3 +1595,23 @@ test_state_history_get_set`:旧 wheel = A19 assert 拒编译(FAIL);新 wheel =
   变体, 暴露此既有缓存键缺陷。
 - **状态**: landed-in-progress(robostudio-main 工作树未提交, 随 A85 线一并
   squash)。文件: `python/quadrants/lang/kernel.py`。
+## metal-launch-model — A1 Metal 提交模型:阀门 commit 化 + flush 即释 args + stream FIFO 回收(2026-10-25,mujocoqd/metal-launch-model,待 squash)
+
+- **设计**:`GfxRuntime::submit_current_cmdlist_if_timeout` 的 `kMaxPendingLaunches=32` 阀门原为
+  MoltenVK encoder tracker 防御,在原生 Metal 上每 ~33 launch `synchronize()` 全排空,把 host/GPU
+  完全串行化。Metal 专属(`arch==metal`,`QD_METAL_RETAINED_FLUSH=0` 回退)三件:①`flush()` 提交后立即
+  释放停车的 args/ret buffer(标准 MTLCommandBuffer retain 已编码命令引用的资源到完成;ext-array
+  镜像仍停车供 R3a 池复用);②阀门改 `flush()`+清零,镜像 >1024 远端兜底;③`MetalStream::submit`
+  提交时从队首回收 `status>=Completed` 的 cmdbuf(FIFO 有序完成;含 Error 与 command_sync 一致)。
+  Vulkan 不变。任务书 docs/metal_launch_model_development_spec.md;上游 mujoqo docs/metal-开发计划.md。
+- **数字**(Apple M4,mujoqo humanoid):in-call 排空/步 ×64 3.4→2.0(余 2 为 port 侧观察点,mujoqo
+  B1 已清)、×1 2.2→0.5;heavy 核 ×128 连发 host 326→13µs/launch、total 52.7→36.3ms(=纯 GPU,流水
+  恢复);trivial floor 19→6.8µs;parity ×1 逐位一致、×64 落在基线 run-to-run 噪声包络内;port metal
+  门禁 history/ray/passive/sensor/forward 失败集合与基线**逐名相同**(零新增;passive 6F/sensor 11F/
+  forward 14F 为 dev136→dev152 既有回归面,移交);**union gates 20/21**——gate 19 "cpu head state
+  per-iteration" 在基线 dev152 轮、主树 .venv-consolidated、本线轮**三 venv 同挂**(CPU/LLVM 路径,
+  A1 不触达;ledger 既往 21/21 记录已过期,移交 c15/offload 线核查)。
+- **footprint**:runtime.cpp +44/−1,metal_device.mm +12;零头文件;无新 API。
+- **限制**:e2e 收益受 GPU 串行链地板限制(mujoqo §11.5:1-64 env 的 step 时间 ≈ 126 个 per-world
+  单线程 kernel 的 GPU 关键路径 ~3ms,host 已不在关键路径);A2 args ring 池据此推迟(F6)。
+  仍停车的只有 ext-array 镜像,流式 ext-array 且无 host 观察点的负载由 1024 兜底排空。

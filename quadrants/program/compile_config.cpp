@@ -37,6 +37,11 @@ CompileConfig::CompileConfig() {
   make_block_local = true;
   detect_read_only = true;
   real_matrix_scalarize = true;
+  // CPU-10 (mujoqo §12.18): QD_REAL_MATRIX_SCALARIZE=0 opts out — tensor
+  // values then emit LLVM VectorType (the value-level vector IR lever);
+  // correctness is defined by the battery+parity gates.
+  if (const char *rms = std::getenv("QD_REAL_MATRIX_SCALARIZE"))
+    real_matrix_scalarize = (strcmp(rms, "0") != 0);
   force_scalarize_matrix = false;
   half2_vectorization = false;
   make_cpu_multithreading_loop = true;

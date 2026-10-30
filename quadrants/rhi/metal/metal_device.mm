@@ -900,6 +900,16 @@ void MetalCommandList::set_line_width(float width) {
   // There is no way to set width in metal for rasterizing lines.
   return;
 }
+void MetalCommandList::begin_profiler_scope(const std::string &kernel_name) {
+  // A72: attribution is the submitted command buffer's GPUStartTime/GPUEndTime
+  // span, so the scope just tags the cmdlist; MetalStream::submit consumes the
+  // name (GfxRuntime flushes per task in profiler mode, so exactly one name is
+  // pending at submit time).
+  profiler_scope_name_ = kernel_name;
+}
+void MetalCommandList::end_profiler_scope() {
+  // No in-list end marker: the buffer span covers the whole task.
+}
 void MetalCommandList::image_transition(DeviceAllocation img, ImageLayout old_layout, ImageLayout new_layout) {}
 struct MetalBufferImageCopyDesc {
   // Other params
@@ -1050,7 +1060,47 @@ StreamSemaphore MetalStream::submit(CommandList *cmdlist, const std::vector<Stre
   MetalCommandList *cmdlist2 = (MetalCommandList *)cmdlist;
 
   MTLCommandBuffer_id cmdbuf = [cmdlist2->finalize() retain];
+  // A72 kernel profiler: a command buffer tagged by begin_profiler_scope carries
+  // exactly one task (GfxRuntime flushes per task in profiler mode), so its
+  // GPUStartTime/GPUEndTime span is that kernel's GPU time. The completion handler
+  // runs on Metal's internal queue and pushes into the mutex-guarded device sink;
+  // profiler_pending_ tracks in-flight scoped buffers for profiler_sync's wait.
+  if (!cmdlist2->profiler_scope_name_.empty()) {
+    auto *dev = const_cast<MetalDevice *>(device_);
+    auto name = std::move(cmdlist2->profiler_scope_name_);
+    cmdlist2->profiler_scope_name_.clear();
+    dev->profiler_pending_ += 1;
+    [cmdbuf addCompletedHandler:^(id<MTLCommandBuffer> done) {
+      double ms = (done.GPUEndTime - done.GPUStartTime) * 1e3;
+      dev->profiler_record(std::move(name), ms);
+    }];
+  }
+  // QD_GPU_TIME=1/2: device-side execution time per committed command buffer, printed by the
+  // completion handler (no host wait involved). With QD_GPU_TIME=2 GfxRuntime forces one flush
+  // per kernel launch, so each line is one kernel's true GPU time in the pipelined stream.
+  static const int gpu_time_mode = std::getenv("QD_GPU_TIME") != nullptr ? std::atoi(std::getenv("QD_GPU_TIME")) : 0;
+  if (gpu_time_mode > 0) {
+    uint64_t seq = gpu_time_seq_++;
+    __block MTLCommandBuffer_id cb = cmdbuf;
+    [cmdbuf addCompletedHandler:^(id<MTLCommandBuffer> done) {
+      double ms = (done.GPUEndTime - done.GPUStartTime) * 1e3;
+      fprintf(stderr, "QDGPU seq=%llu gpu_ms=%.4f status=%ld\n", (unsigned long long)seq, ms, (long)done.status);
+      (void)cb;
+    }];
+  }
   [cmdbuf commit];
+  // Retire already-finished command buffers from the front of the pending list. The queue is FIFO so completion is
+  // in submission order; stopping at the first unfinished buffer keeps this O(completed). Without this the list only
+  // shrank in `command_sync()`, which is why GfxRuntime had to force a full drain every kMaxPendingLaunches launches.
+  // `status >= Completed` also covers `Error`, matching `command_sync()` which never inspected the status either.
+  size_t done = 0;
+  while (done < pending_cmdbufs_.size() && [pending_cmdbufs_[done] status] >= MTLCommandBufferStatusCompleted) {
+    [pending_cmdbufs_[done] release];
+    ++done;
+  }
+  if (done > 0) {
+    pending_cmdbufs_.erase(pending_cmdbufs_.begin(), pending_cmdbufs_.begin() + done);
+  }
   pending_cmdbufs_.push_back(cmdbuf);
 
   return {};
@@ -1695,6 +1745,39 @@ Stream *MetalDevice::get_graphics_stream() {
   return compute_stream_.get();
 }
 void MetalDevice::wait_idle() { compute_stream_->command_sync(); }
+
+// A72 metal kernel profiler ----------------------------------------------------
+void MetalDevice::profiler_record(std::string kernel_name, double gpu_ms) {
+  std::lock_guard<std::mutex> lock(profiler_mu_);
+  profiler_records_.emplace_back(std::move(kernel_name), gpu_ms);
+  if (profiler_pending_ > 0) {
+    profiler_pending_ -= 1;
+  }
+}
+
+void MetalDevice::profiler_sync() {
+  // synchronize() has already drained the queue via wait_idle; the completion
+  // handlers fire on Metal's internal queue, which normally lands before
+  // wait_idle returns. Bound the wait so a dropped handler degrades to a warn
+  // instead of hanging the profiler.
+  for (int i = 0; i < 2000 && profiler_pending_.load() > 0; ++i) {
+    struct timespec ts = {0, 500 * 1000};  // 0.5 ms
+    nanosleep(&ts, nullptr);
+  }
+  if (profiler_pending_.load() > 0) {
+    QD_WARN(
+        "[metal profiler] {} scoped command buffer(s) never reported GPU times; "
+        "their records are dropped",
+        profiler_pending_.load());
+    profiler_pending_.store(0);
+  }
+}
+
+std::vector<std::pair<std::string, double>> MetalDevice::profiler_flush_sampled_time() {
+  std::lock_guard<std::mutex> lock(profiler_mu_);
+  return std::move(profiler_records_);
+}
+// ------------------------------------------------------------------------------
 
 void MetalDevice::memcpy_internal(DevicePtr dst, DevicePtr src, uint64_t size) {
   Stream *stream = get_compute_stream();

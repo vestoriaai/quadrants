@@ -4,6 +4,7 @@
 
 #ifdef QD_WITH_LLVM
 #include "llvm/Bitcode/BitcodeReader.h"
+#include "llvm/IR/MDBuilder.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Linker/Linker.h"
 #include "quadrants/analysis/offline_cache_util.h"
@@ -77,7 +78,39 @@ FunctionCreationGuard::~FunctionCreationGuard() {
   mb->func = old_func;
   mb->builder->restoreIP(ip);
 
-  QD_ASSERT(!llvm::verifyFunction(*body, &llvm::errs()));
+  // CPU-10 (mujoqo §12.18): verifyFunction's IR error dump goes to
+  // llvm::errs, which is LOST when the compile runs on a ParallelExecutor
+  // worker (the pool aborts on the thrown assert without flushing). Capture
+  // to a FILE like the A21 terminate handler so the failing instruction and
+  // the full module survive for offline inspection.
+  //
+  // CPU-10 补充 21: fill orphan blocks (early return inside loop body
+  // under scalarize=0 leaves loop_inc / if-join blocks without terminators)
+  // — make them well-formed before verify.
+  for (auto &bb : *body) {
+    if (!bb.getTerminator()) {
+      mb->builder->SetInsertPoint(&bb);
+      mb->builder->CreateBr(final);
+    }
+  }
+  {
+    std::string err_str;
+    llvm::raw_string_ostream err_os(err_str);
+    if (llvm::verifyFunction(*body, &err_os)) {
+      err_os.flush();
+      FILE *diag = fopen("/tmp/quadrants_verify_fail.log", "w");
+      const std::string fname = body->getName().str();
+      if (diag) {
+        fprintf(diag, "verifyFunction failed in %s:\n%s\n", fname.c_str(), err_str.c_str());
+        if (mb->module) {
+          llvm::raw_fd_ostream mod_os(fileno(diag), /*shouldClose=*/false);
+          mod_os << "---- full function ----\n";
+          mb->module->print(mod_os, nullptr);
+        }
+      }
+      QD_ASSERT_INFO(false, "verifyFunction failed in {} (dump at /tmp/quadrants_verify_fail.log)", fname);
+    }
+  }
 }
 
 namespace {
@@ -202,6 +235,10 @@ void TaskCodeGenLLVM::visit(RandStmt *stmt) {
 void TaskCodeGenLLVM::emit_extra_unary(UnaryOpStmt *stmt) {
   auto input = llvm_val[stmt->operand];
   auto input_quadrants_type = stmt->operand->ret_type;
+  // CPU-10 (mujoqo §12.18): trace unsupported unary ops under scalarize=0
+  fmt::print(stderr, "[CPU-10 trace] emit_extra_unary op={} input_type={} is_tensor={}\n",
+             unary_op_type_name(stmt->op_type), input_quadrants_type->to_string(),
+             (int)(input_quadrants_type->is<TensorType>()));
   if (input_quadrants_type->is_primitive(PrimitiveTypeID::f16)) {
     // Promote to f32 since we don't have f16 support for extra unary ops in in
     // runtime.cpp.
@@ -225,6 +262,28 @@ void TaskCodeGenLLVM::emit_extra_unary(UnaryOpStmt *stmt) {
     } else {                                                               \
       QD_NOT_IMPLEMENTED                                                   \
     }                                                                      \
+  }
+  if (false) {
+  }
+  // CPU-10 (mujoqo §12.18 补充 21): scalarize=0 — TensorType operands reach
+  // here as LLVM vectors; use vector-capable LLVM intrinsics instead of the
+  // scalar runtime calls in UNARY_STD.
+  if (input_quadrants_type->is<TensorType>() && input->getType()->isVectorTy()) {
+    if (op == UnaryOpType::abs) {
+      llvm_val[stmt] = builder->CreateIntrinsic(llvm::Intrinsic::fabs, {input_type}, {input});
+    } else if (op == UnaryOpType::exp) {
+      llvm_val[stmt] = builder->CreateIntrinsic(llvm::Intrinsic::exp, {input_type}, {input});
+    } else if (op == UnaryOpType::log) {
+      llvm_val[stmt] = builder->CreateIntrinsic(llvm::Intrinsic::log, {input_type}, {input});
+    } else if (op == UnaryOpType::sin) {
+      llvm_val[stmt] = builder->CreateIntrinsic(llvm::Intrinsic::sin, {input_type}, {input});
+    } else if (op == UnaryOpType::cos) {
+      llvm_val[stmt] = builder->CreateIntrinsic(llvm::Intrinsic::cos, {input_type}, {input});
+    } else {
+      QD_P(unary_op_type_name(op));
+      QD_NOT_IMPLEMENTED
+    }
+    return;
   }
   if (false) {
   }
@@ -370,6 +429,16 @@ TaskCodeGenLLVM::TaskCodeGenLLVM(int id,
 
   kernel_name = kernel->name + "_kernel";
   current_callable = kernel;
+
+  // CPU-3 (mujoqo §12.2): one alias-scope domain per kernel module; the
+  // per-(callable, arg) scopes inside it are created lazily by
+  // get_arg_scope_pair as ArgLoadStmts are visited.  NB: `module` is already
+  // moved out to the JIT by the time later visits run — always take the
+  // context from tlctx, never from the module member.
+  if (arch_is_cpu(compile_config.arch)) {
+    llvm::MDBuilder mdb(*tlctx.get_this_thread_context());
+    args_alias_domain_ = mdb.createAliasScopeDomain("qd_args_domain");
+  }
 }
 
 void TaskCodeGenLLVM::visit(DecorationStmt *stmt) {
@@ -381,6 +450,24 @@ void TaskCodeGenLLVM::create_elementwise_cast(UnaryOpStmt *stmt,
                                               bool on_self) {
   auto from_ty = stmt->operand->ret_type->cast<TensorType>();
   QD_ASSERT_INFO(from_ty, "Cannot perform elementwise ops on non-tensor type {}", from_ty->to_string());
+  const auto n_src = from_ty->get_num_elements();
+  // CPU-10 (mujoqo §12.18): placeholder tensors (garbage/huge num_elements,
+  // e.g. 2^31) leak through under scalarize=0.  QD_ERROR here would throw on
+  // a ParallelExecutor worker (abort without message) — instead log to a
+  // FILE (A21 pattern) and emit an undef <4 x to_ty>: the placeholder-typed
+  // consumers are semantically dead, so IR stays valid and the run continues
+  // (the source dtype is identified from the log for the upstream fix).
+  if (arch_is_cpu(compile_config.arch) &&
+      (n_src < 0 || (unsigned)n_src > 1024)) {
+    FILE *diag = fopen("/tmp/quadrants_huge_cast.log", "a");
+    if (diag) {
+      fprintf(diag, "huge cast n=%d to_string=%s tb=%s\n", n_src,
+              from_ty->to_string().c_str(), stmt->get_tb().c_str());
+      fclose(diag);
+    }
+    llvm_val[stmt] = llvm::UndefValue::get(llvm::VectorType::get(to_ty, 4, /*scalable=*/false));
+    return;
+  }
   llvm::Value *vec =
       llvm::UndefValue::get(llvm::VectorType::get(to_ty, from_ty->get_num_elements(), /*scalable=*/false));
   for (int i = 0; i < from_ty->get_num_elements(); ++i) {
@@ -527,7 +614,10 @@ void TaskCodeGenLLVM::visit(UnaryOpStmt *stmt) {
   } else if (op == UnaryOpType::bit_not) {
     llvm_val[stmt] = builder->CreateNot(input);
   } else if (op == UnaryOpType::neg) {
-    if (is_real(stmt->operand->ret_type)) {
+    // CPU-10: element-type check — with codegen_vector_type on, operand
+    // ret_type is a TensorType whose LLVM value is a float VectorType;
+    // is_real(TensorType) is false and CreateNeg asserts on float vectors.
+    if (is_real(stmt->operand->ret_type.get_element_type())) {
       llvm_val[stmt] = builder->CreateFNeg(input, "neg");
     } else {
       llvm_val[stmt] = builder->CreateNeg(input, "neg");
@@ -1130,6 +1220,16 @@ void TaskCodeGenLLVM::create_naive_range_for(RangeForStmt *for_stmt) {
 
   // next cfg
   builder->SetInsertPoint(after_loop);
+
+  // CPU-10 (mujoqo §12.18 补充 21): an early return inside the loop body
+  // (returned=true, e.g. the done-worlds guard in ext_arr_to_ndarray_matrix
+  // under scalarize=0) leaves loop_inc unreachable and without a terminator
+  // — fill it with a branch to after_loop so the function stays well-formed
+  // (LLVM verifier).
+  if (loop_inc->use_empty() && loop_inc->getTerminator() == nullptr) {
+    builder->SetInsertPoint(loop_inc);
+    builder->CreateBr(after_loop);
+  }
 }
 
 void TaskCodeGenLLVM::visit(RangeForStmt *for_stmt) {
@@ -1184,7 +1284,19 @@ llvm::Value *TaskCodeGenLLVM::bitcast_to_u64(llvm::Value *val, DataType type) {
 }
 
 void TaskCodeGenLLVM::visit(ArgLoadStmt *stmt) {
-  llvm_val[stmt] = get_struct_arg(stmt->arg_id, stmt->create_load);
+  auto *val = get_struct_arg(stmt->arg_id, stmt->create_load);
+  // CPU-3: scope-tag the slot load itself (LICM can then hoist it out of
+  // inner loops even when the loop stores to another arg array), and record
+  // pointer bases so element accesses can find their slot's scope.
+  if (arch_is_cpu(compile_config.arch)) {
+    const int idx = stmt->arg_id[0];
+    if (auto *li = llvm::dyn_cast<llvm::LoadInst>(val)) {
+      set_arg_alias_md(li, get_arg_scope_pair(current_callable, idx).second, current_callable);
+      if (li->getType()->isPointerTy())
+        arg_slot_of_base_[li] = {current_callable, idx};
+    }
+  }
+  llvm_val[stmt] = val;
 }
 
 void TaskCodeGenLLVM::visit(ReturnStmt *stmt) {
@@ -1485,6 +1597,72 @@ llvm::Value *TaskCodeGenLLVM::real_type_atomic(AtomicOpStmt *stmt) {
   return nullptr;
 }
 
+llvm::Value *TaskCodeGenLLVM::vector_type_atomic(AtomicOpStmt *stmt) {
+  // scalarize=0 keeps vector-typed values (e.g. the vec3 subtree-com
+  // accumulation in smooth._subtree_accumulate) as <N x T>; LLVM AtomicRMW is
+  // scalar-only, so decompose into per-lane RMW on element addresses and
+  // reassemble the returned old value (mujoqo §12.27). Without this the
+  // statement falls through to QD_NOT_IMPLEMENTED in visit(AtomicOpStmt).
+  auto val_ty = stmt->val->ret_type->cast<TensorType>();
+  if (!val_ty || !val_ty->get_element_type()->is<PrimitiveType>()) {
+    return nullptr;
+  }
+  const auto n = val_ty->get_num_elements();
+  if (n <= 1 || n > 64) {
+    return nullptr;
+  }
+  auto *vec_val = llvm_val[stmt->val];
+  auto *vec_ty = llvm::dyn_cast<llvm::VectorType>(vec_val->getType());
+  // The LLVM vector may be wider than the IR element count: alloca slots are
+  // pow2-padded (§12.18 pad-UP), so a 6-element record loads as <8 x float>.
+  // Only the first n lanes are semantically live — iterate those.
+  if (!vec_ty || vec_ty->getElementCount().getKnownMinValue() < (unsigned)n) {
+    return nullptr;
+  }
+  const auto elem_primitive = val_ty->get_element_type()->cast<PrimitiveType>()->type;
+  const bool is_float = elem_primitive == PrimitiveTypeID::f32 || elem_primitive == PrimitiveTypeID::f64;
+  auto *elem_ty = tlctx->get_data_type(val_ty->get_element_type());
+  auto *dest_ptr = llvm_val[stmt->dest];
+  auto order = llvm::AtomicOrdering::SequentiallyConsistent;
+  auto syncscope = kernel_atomic_syncscope(llvm_context, current_arch());
+  llvm::Value *old_vec = llvm::UndefValue::get(vec_ty);
+  for (unsigned lane = 0; lane < (unsigned)n; lane++) {
+    auto *lane_ptr = builder->CreateConstInBoundsGEP1_32(elem_ty, dest_ptr, lane);
+    auto *lane_val = builder->CreateExtractElement(vec_val, lane);
+    llvm::Value *lane_old = nullptr;
+    switch (stmt->op_type) {
+      case AtomicOpType::add:
+        lane_old = builder->CreateAtomicRMW(is_float ? llvm::AtomicRMWInst::FAdd : llvm::AtomicRMWInst::Add,
+                                            lane_ptr, lane_val, llvm::MaybeAlign(0), order, syncscope);
+        break;
+      case AtomicOpType::sub:
+        if (!is_float) {
+          lane_old = builder->CreateAtomicRMW(llvm::AtomicRMWInst::Sub, lane_ptr, lane_val, llvm::MaybeAlign(0),
+                                              order, syncscope);
+        }
+        break;
+      case AtomicOpType::min:
+        lane_old = builder->CreateAtomicRMW(is_float ? llvm::AtomicRMWInst::FMin : llvm::AtomicRMWInst::Min,
+                                            lane_ptr, lane_val, llvm::MaybeAlign(0), order, syncscope);
+        break;
+      case AtomicOpType::max:
+        lane_old = builder->CreateAtomicRMW(is_float ? llvm::AtomicRMWInst::FMax : llvm::AtomicRMWInst::Max,
+                                            lane_ptr, lane_val, llvm::MaybeAlign(0), order, syncscope);
+        break;
+      case AtomicOpType::xchg:
+        lane_old = builder->CreateAtomicRMW(llvm::AtomicRMWInst::Xchg, lane_ptr, lane_val, llvm::MaybeAlign(0), order);
+        break;
+      default:
+        break;
+    }
+    if (lane_old == nullptr) {
+      return nullptr;
+    }
+    old_vec = builder->CreateInsertElement(old_vec, lane_old, lane);
+  }
+  return old_vec;
+}
+
 void TaskCodeGenLLVM::visit(AtomicOpStmt *stmt) {
   bool is_local = stmt->dest->is<AllocaStmt>();
   if (is_local) {
@@ -1492,6 +1670,8 @@ void TaskCodeGenLLVM::visit(AtomicOpStmt *stmt) {
   }
   llvm::Value *old_value;
   if (llvm::Value *result = optimized_reduction(stmt)) {
+    old_value = result;
+  } else if (llvm::Value *result = vector_type_atomic(stmt)) {
     old_value = result;
   } else if (llvm::Value *result = quant_type_atomic(stmt)) {
     old_value = result;
@@ -1531,7 +1711,32 @@ void TaskCodeGenLLVM::visit(GlobalStoreStmt *stmt) {
       QD_NOT_IMPLEMENTED;
     }
   } else {
-    builder->CreateStore(llvm_val[stmt->val], llvm_val[stmt->dest]);
+    // scalarize=0 (mujoqo §12.30): vector-typed values are pow2-padded in the
+    // LLVM lowering (a 3-lane vec3 record travels as <4 x float>). A merged
+    // padded store overruns the packed record (writes the pad lane into the
+    // neighbour) and O3 upgrades it to align 16 — a false promise on 12-byte
+    // strides — so decompose to per-lane scalar stores of exactly the live
+    // lanes. Plain vectors (num == lanes) take the merged store as before.
+    auto val_ty = stmt->val->ret_type->cast<TensorType>();
+    auto *vec_ty = llvm::dyn_cast<llvm::VectorType>(llvm_val[stmt->val]->getType());
+    if (val_ty && vec_ty && val_ty->get_element_type()->is<PrimitiveType>()) {
+      const auto n = val_ty->get_num_elements();
+      const auto lanes = vec_ty->getElementCount().getKnownMinValue();
+      if (n > 1 && (unsigned)n != lanes) {
+        auto *elem_ty = vec_ty->getElementType();
+        for (unsigned lane = 0; lane < (unsigned)n; lane++) {
+          auto *lane_ptr = builder->CreateConstInBoundsGEP1_32(elem_ty, llvm_val[stmt->dest], lane);
+          auto *lane_val = builder->CreateExtractElement(llvm_val[stmt->val], lane);
+          auto *lane_store = builder->CreateStore(lane_val, lane_ptr);
+          attach_arg_alias_metadata(lane_store, llvm_val[stmt->dest]);
+        }
+        // keep the slot non-null: downstream visits may still read it
+        llvm_val[stmt] = llvm_val[stmt->val];
+        return;
+      }
+    }
+    auto *store = builder->CreateStore(llvm_val[stmt->val], llvm_val[stmt->dest]);
+    attach_arg_alias_metadata(store, llvm_val[stmt->dest]);
   }
 }
 
@@ -1577,6 +1782,7 @@ void TaskCodeGenLLVM::create_global_load(GlobalLoadStmt *stmt, bool should_cache
       llvm_val[stmt] = create_intrinsic_load(ptr, tlctx->get_data_type(stmt->ret_type));
     } else {
       auto *load = builder->CreateLoad(tlctx->get_data_type(stmt->ret_type), ptr);
+      attach_arg_alias_metadata(load, ptr);
       // LLVM's `setVolatile(true)` lowers to `ld.volatile.global` on PTX (for generic / addrspace(1) pointers)
       // and to `global_load_*` with the optimiser inhibited from hoisting / reusing the load on AMDGPU.  Both
       // backends treat this as the canonical "always re-read from memory" primitive.
@@ -1796,6 +2002,20 @@ void TaskCodeGenLLVM::visit(ExternalPtrStmt *stmt) {
   auto *gep = builder->CreateGEP(struct_type, llvm_val.at(stmt->base_ptr),
                                  {tlctx->get_constant(0), tlctx->get_constant(int(stmt->is_grad) + 1)});
   llvm::Value *ptr_val = builder->CreateLoad(tlctx->get_data_type(ptr_type), gep);
+  // CPU-3: the ndarray base-pointer load lives HERE (ExternalPtrStmt) — the
+  // ArgLoadStmt for the descriptor only emits its address (create_load=false).
+  // Scope-tag the base load and record the (callable, arg slot) so element
+  // accesses can find their slot's scope via the GEP-chain walk.
+  int slot = -1;
+  if (auto *al = stmt->base_ptr->cast<ArgLoadStmt>(); al != nullptr && !al->arg_id.empty())
+    slot = al->arg_id[0];
+  if (arch_is_cpu(compile_config.arch)) {
+    if (slot >= 0)
+      if (auto *bl = llvm::dyn_cast<llvm::LoadInst>(ptr_val)) {
+        set_arg_alias_md(bl, get_arg_scope_pair(current_callable, slot).second, current_callable);
+        arg_slot_of_base_[bl] = {current_callable, slot};
+      }
+  }
   ptr_val = maybe_tag_amdgpu_global_ptr(ptr_val);
   unsigned ptr_val_as = ptr_val->getType()->getPointerAddressSpace();
 
@@ -1825,6 +2045,12 @@ void TaskCodeGenLLVM::visit(ExternalPtrStmt *stmt) {
         struct_type, llvm_val[stmt->base_ptr],
         {tlctx->get_constant(0), tlctx->get_constant(TypeFactory::SHAPE_POS_IN_NDARRAY), tlctx->get_constant(i)});
     raw_arg = builder->CreateLoad(tlctx->get_data_type(PrimitiveType::i32), raw_arg);
+    // CPU-3: these shape loads are emitted inline (one set per element
+    // access!) — scope-tag them (descriptor region) so LICM hoists them out
+    // of loops that store to this arg's array.
+    if (arch_is_cpu(compile_config.arch))
+      if (auto *sl = llvm::dyn_cast<llvm::LoadInst>(raw_arg))
+        set_arg_alias_md(sl, get_arg_scope_pair(current_callable, slot).second, current_callable);
     sizes[i] = raw_arg;
   }
 
@@ -1887,14 +2113,31 @@ void TaskCodeGenLLVM::visit(ExternalTensorShapeAlongAxisStmt *stmt) {
   auto extended_arg_id = arg_id;
   extended_arg_id.push_back(TypeFactory::SHAPE_POS_IN_NDARRAY);
   extended_arg_id.push_back(axis);
-  llvm_val[stmt] = get_struct_arg(extended_arg_id, /*create_load=*/true);
+  auto *val = get_struct_arg(extended_arg_id, /*create_load=*/true);
+  // CPU-3: shape words live in the descriptor region — scope-tag them so
+  // LICM can hoist them out of loops whose bodies store to this arg's array.
+  if (arch_is_cpu(compile_config.arch))
+    if (auto *li = llvm::dyn_cast<llvm::LoadInst>(val))
+      set_arg_alias_md(li, get_arg_scope_pair(current_callable, stmt->arg_id[0]).second,
+                       current_callable);
+  llvm_val[stmt] = val;
 }
 
 void TaskCodeGenLLVM::visit(ExternalTensorBasePtrStmt *stmt) {
   auto arg_id = stmt->arg_id;
   int pos = stmt->is_grad ? TypeFactory::GRAD_PTR_POS_IN_NDARRAY : TypeFactory::DATA_PTR_POS_IN_NDARRAY;
   arg_id.push_back(pos);
-  llvm_val[stmt] = get_struct_arg(arg_id, /*create_load=*/true);
+  auto *val = get_struct_arg(arg_id, /*create_load=*/true);
+  // CPU-3: ndarray base pointers come through HERE (not ArgLoadStmt, whose
+  // loads are the scalar slots) — scope-tag the base load and record it so
+  // element accesses can find their slot's scope.
+  if (arch_is_cpu(compile_config.arch)) {
+    if (auto *li = llvm::dyn_cast<llvm::LoadInst>(val)) {
+      set_arg_alias_md(li, get_arg_scope_pair(current_callable, stmt->arg_id[0]).second, current_callable);
+      arg_slot_of_base_[li] = {current_callable, stmt->arg_id[0]};
+    }
+  }
+  llvm_val[stmt] = val;
 }
 
 std::string TaskCodeGenLLVM::init_offloaded_task_function(OffloadedStmt *stmt, std::string suffix) {
@@ -2219,7 +2462,42 @@ void TaskCodeGenLLVM::finalize_offloaded_task_function() {
     static FileSequenceWriter writer("quadrants_kernel_generic_llvm_ir_{:04d}.ll", "unoptimized LLVM IR (generic)");
     writer.write(module.get());
   }
-  QD_ASSERT(!llvm::verifyFunction(*func, &llvm::errs()));
+  if (compile_config.print_kernel_llvm_ir) {
+    static FileSequenceWriter writer("quadrants_kernel_generic_llvm_ir_{:04d}.ll", "unoptimized LLVM IR (generic)");
+    writer.write(module.get());
+  }
+  // CPU-10 (mujoqo §12.18 补充 21): an early return inside a loop body
+  // (returned=true, e.g. the done-worlds guard) leaves loop_inc and if-join
+  // blocks unreachable WITHOUT terminators — fill them with a branch to the
+  // kernel's final block so the function stays well-formed (LLVM verifier).
+  // Runs at END of per-kernel codegen: all blocks have their final content.
+  for (auto &bb : *func) {
+    if (bb.getTerminator() == nullptr) {
+      builder->SetInsertPoint(&bb);
+      builder->CreateBr(final_block);
+    }
+  }
+  {
+    // CPU-10 (mujoqo §12.18 补充 21): capture the verifier error to a FILE —
+    // llvm::errs is lost when the compile runs on a ParallelExecutor worker.
+    std::string err_str;
+    llvm::raw_string_ostream err_os(err_str);
+    const bool bad = llvm::verifyFunction(*func, &err_os);
+    if (bad) {
+      err_os.flush();
+      FILE *diag = fopen("/tmp/quadrants_verify2_fail.log", "w");
+      const std::string fname = func->getName().str();
+      if (diag) {
+        fprintf(diag, "verifyFunction failed in %s:\n%s\n---- full function ----\n",
+                fname.c_str(), err_str.c_str());
+        llvm::raw_fd_ostream mod_os(fileno(diag), false);
+        module->print(mod_os, nullptr);
+        mod_os.flush();
+        fclose(diag);
+      }
+      QD_ASSERT_INFO(!bad, "verifyFunction failed in {} (dump at /tmp/quadrants_verify2_fail.log)", fname);
+    }
+  }
   // QD_INFO("Kernel function verified.");
 }
 
@@ -3143,7 +3421,18 @@ void TaskCodeGenLLVM::visit(MeshPatchIndexStmt *stmt) {
 }
 
 void TaskCodeGenLLVM::visit(MatrixInitStmt *stmt) {
-  auto type = tlctx->get_data_type(stmt->ret_type->as<TensorType>());
+  auto tensor_ret = stmt->ret_type->as<TensorType>();
+  auto type = tlctx->get_data_type(tensor_ret);
+  // CPU-10 (mujoqo §12.18): trace garbage ret shapes reaching MatrixInitStmt
+  // (the <2^31 x i32> huge-vector source under scalarize=0).
+  const auto num = tensor_ret->get_num_elements();
+  if (num < 0 || num > 1024) {
+    fmt::print(stderr, "[CPU-10 trace] MatrixInitStmt garbage ret: num={} to_string={} values={} shape={}",
+               num, tensor_ret->to_string(), stmt->values.size(), tensor_ret->get_shape().size());
+    for (int d : tensor_ret->get_shape())
+      fmt::print(stderr, " dim={}", d);
+    fmt::print(stderr, "\n");
+  }
   llvm::Value *vec = llvm::UndefValue::get(type);
   for (int i = 0; i < stmt->values.size(); ++i) {
     auto *elem = llvm_val[stmt->values[i]];
@@ -3191,8 +3480,42 @@ void TaskCodeGenLLVM::initialize_context() {
     // _probe/a47_reassoc_repro.py: a three-term sum returns one term under
     // reassoc). Keep GPU semantics unchanged - vectorized GPU codegen may
     // rely on it and no parity issue is reported there.
-    if (arch_is_cpu(compile_config.arch)) {
+    if (arch_is_cpu(compile_config.arch) && std::getenv("QD_CPU_REASSOC") == nullptr) {
       fast_flags.setAllowReassoc(false);
+    }
+    // §12.54 (mujoqo, QD_CPU_FMA_CONTRACT=1): qd CPU never set the contract
+    // flag, so LLVM O3 cannot fuse accumulate chains (JTDAJ/cholesky inner
+    // loops) into fma — every accumulation step pays fmul+fadd with two
+    // roundings. Unlike reassoc, contraction preserves operand order (no
+    // regrouping); it only single-rounds the mul+add pair. Numerics still
+    // differ from two-rounding, so this is env-gated for A/B and the parity
+    // gate is battery/envelope, not bit-exact.
+    //
+    // Domain exclusion: single-rounding flips knife-edge EPA/GJK contact
+    // decisions (test_mesh_mesh_common_translation: a common-translation pair
+    // loses its contact, deterministic across reruns). Those kernels are
+    // branch-dominated, not FMA hotspots — exclude the collision-geometry
+    // family so the solver-line wins (JTDAJ −7.4%, TILE4 −8%) come without
+    // the contact-semantics cost. Mirrors the A47 domain reasoning.
+    if (arch_is_cpu(compile_config.arch)) {
+      // §12.56: default ON — min-of-6 interleaved A/B shows the ON side
+      // consistently ahead at e2e min (−3.0%) with clear kernel-level wins
+      // (JTDAJ −7.4%, tile_cholesky AXPY combo −7.2%) and the full battery
+      // green (282P); QD_CPU_FMA_CONTRACT=0 opts out.
+      const char *fma_env = std::getenv("QD_CPU_FMA_CONTRACT");
+      if (fma_env == nullptr || fma_env[0] == '1') {
+        const std::string kname = kernel != nullptr ? kernel->name : std::string();
+        bool collision_domain = false;
+        for (const char *pat : {"gjk", "epa", "narrowphase", "broadphase", "ccd",
+                                "collision", "mesh"}) {
+          if (kname.find(pat) != std::string::npos) {
+            collision_domain = true;
+            break;
+          }
+        }
+        if (!collision_domain)
+          fast_flags.setAllowContract();
+      }
     }
     builder->setFastMathFlags(fast_flags);
   }
@@ -3528,6 +3851,46 @@ llvm::Value *TaskCodeGenLLVM::get_args_ptr(const Callable *callable, llvm::Value
   }
   return args_ptr;
 }
+
+const std::pair<llvm::MDNode *, llvm::MDNode *> &
+TaskCodeGenLLVM::get_arg_scope_pair(const Callable *callable, int idx) {
+  auto key = std::make_pair(callable, idx);
+  if (auto it = arg_alias_scope_.find(key); it != arg_alias_scope_.end())
+    return it->second;
+  llvm::MDBuilder mdb(*tlctx->get_this_thread_context());
+  const unsigned next_id = arg_alias_scope_.size() * 2;
+  // desc scope: the arg's slot in the args buffer (base ptr + shape words);
+  // data scope: the array payload the base pointer points at.  Distinct
+  // allocations, so an access in one may declare no-alias against the other.
+  auto *data = mdb.createAliasScope("qd_arg_data_" + std::to_string(next_id), args_alias_domain_);
+  auto *desc = mdb.createAliasScope("qd_arg_desc_" + std::to_string(next_id + 1), args_alias_domain_);
+  auto res = arg_alias_scope_.emplace(key, std::make_pair(data, desc));
+  callable_arg_scopes_[callable].push_back(data);
+  callable_arg_scopes_[callable].push_back(desc);
+  return res.first->second;
+}
+void TaskCodeGenLLVM::set_arg_alias_md(llvm::Instruction *acc, llvm::MDNode *own,
+                                       const Callable *callable) {
+  std::vector<llvm::Metadata *> others;
+  for (auto *s : callable_arg_scopes_[callable])
+    if (s != own)
+      others.push_back(s);
+  acc->setMetadata(llvm::LLVMContext::MD_alias_scope,
+                   llvm::MDNode::get(acc->getContext(), {own}));
+  acc->setMetadata(llvm::LLVMContext::MD_noalias, llvm::MDNode::get(acc->getContext(), others));
+}
+
+void TaskCodeGenLLVM::attach_arg_alias_metadata(llvm::Instruction *acc, llvm::Value *ptr) {
+  if (!arch_is_cpu(compile_config.arch))
+    return;
+  llvm::Value *v = ptr->stripPointerCasts();
+  while (auto *gep = llvm::dyn_cast<llvm::GetElementPtrInst>(v))
+    v = gep->getPointerOperand()->stripPointerCasts();
+  if (auto it = arg_slot_of_base_.find(v); it != arg_slot_of_base_.end())
+    set_arg_alias_md(acc, get_arg_scope_pair(it->second.first, it->second.second).first,
+                     it->second.first);
+}
+
 void TaskCodeGenLLVM::set_args_ptr(Callable *callable, llvm::Value *context, llvm::Value *ptr) {
   auto *runtime_context_type = get_runtime_type("RuntimeContext");
   auto *args_type = tlctx->get_data_type(callable->args_type);

@@ -31,6 +31,10 @@ void MetalProgramImpl::materialize_runtime(KernelProfilerBase *profiler, uint64 
   gfx::GfxRuntime::Params params;
   params.device = device_.get();
   params.program_impl = this;
+  // A72: wire the Program-level kernel profiler into GfxRuntime (Vulkan already
+  // did); attribution then flows through per-task scopes -> per-buffer
+  // GPUStartTime/GPUEndTime -> profiler_flush_sampled_time -> insert_record.
+  params.profiler = profiler;
   runtime_ = std::make_unique<gfx::GfxRuntime>(std::move(params));
   snode_tree_mgr_ = std::make_unique<gfx::SNodeTreeManager>(runtime_.get());
 }

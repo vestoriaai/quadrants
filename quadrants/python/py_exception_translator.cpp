@@ -20,7 +20,10 @@ void register_py_exception_translator() {
   std::set_terminate([]() {
     // A21: write to a FILE (explicitly closed) - every pipe/buffer variant has
     // proven lossy when abort() fires during compilation.
-    FILE *diag = fopen("/tmp/quadrants_terminate.log", "w");
+    // CPU-10 (mujoqo §12.18): append mode — parallel-executor worker threads
+    // can terminate multiple times in one run (each overwrite hid the FIRST
+    // root-cause message behind later ones).
+    FILE *diag = fopen("/tmp/quadrants_terminate.log", "a");
     if (auto p = std::current_exception()) {
       try {
         std::rethrow_exception(p);

@@ -1,6 +1,7 @@
 // The LLVM backend for CPUs/NVPTX/AMDGPU
 #pragma once
 
+#include <map>
 #include <optional>
 #include <set>
 #include <unordered_map>
@@ -8,6 +9,7 @@
 
 #ifdef QD_WITH_LLVM
 
+#include "llvm/IR/MDBuilder.h"
 #include "quadrants/ir/ir.h"
 #include "quadrants/codegen/llvm/llvm_codegen_utils.h"
 #include "quadrants/codegen/llvm/llvm_compiled_data.h"
@@ -161,6 +163,21 @@ class TaskCodeGenLLVM : public IRVisitor, public LLVMModuleBuilder {
 
   std::unordered_map<Function *, llvm::Function *> func_map;
 
+  // CPU-3 (mujoqo §12.2): per-arg-slot alias scopes (CPU only), TWO per
+  // ndarray arg — {data, desc} — because the descriptor (base ptr + shape
+  // words in the args buffer) and the array payload are distinct allocations.
+  // Cross-arg accesses are no-alias, and so is an arg's own desc↔data pair:
+  // LICM can then hoist the in-loop base/shape loads out of solver inner
+  // loops and the vectorizer may overlap J/h traffic (the AXPY chains were
+  // stuck in scalar code purely for want of this disjointness).  Same-slot
+  // data↔data keeps may-alias (in-place patterns stay sound).  Scopes are
+  // keyed per callable so a @qd.real_func callee's arg indices never borrow
+  // the caller's region identities.
+  llvm::MDNode *args_alias_domain_ = nullptr;
+  std::unordered_map<const Callable *, std::vector<llvm::MDNode *>> callable_arg_scopes_;
+  std::map<std::pair<const Callable *, int>, std::pair<llvm::MDNode *, llvm::MDNode *>> arg_alias_scope_;
+  std::unordered_map<llvm::Value *, std::pair<const Callable *, int>> arg_slot_of_base_;
+
   using IRVisitor::visit;
   using LLVMModuleBuilder::call;
 
@@ -182,6 +199,16 @@ class TaskCodeGenLLVM : public IRVisitor, public LLVMModuleBuilder {
   llvm::Value *get_struct_arg(const std::vector<int> &index, bool create_load);
 
   llvm::Value *get_args_ptr(const Callable *callable, llvm::Value *context);
+
+  // CPU-3: lazily create (or fetch) the {data, desc} scope pair for (callable, arg idx).
+  const std::pair<llvm::MDNode *, llvm::MDNode *> &get_arg_scope_pair(const Callable *callable, int idx);
+
+  // CPU-3: attach !alias.scope/{own} + !noalias/{other scopes of callable}.
+  void set_arg_alias_md(llvm::Instruction *acc, llvm::MDNode *own, const Callable *callable);
+
+  // CPU-3: walk ptr through GEPs/casts to a recorded arg base and scope-tag
+  // the access; no-op when the access is not arg-backed.
+  void attach_arg_alias_metadata(llvm::Instruction *acc, llvm::Value *ptr);
 
   // Tag a device pointer as addrspace(1) so InferAddressSpaces can promote its
   // flat_* accesses to global_*. AMDGPU only; no-op elsewhere.
@@ -332,6 +359,11 @@ class TaskCodeGenLLVM : public IRVisitor, public LLVMModuleBuilder {
                                            const DataType &type);
 
   virtual llvm::Value *real_type_atomic(AtomicOpStmt *stmt);
+
+  // scalarize=0 keeps vector-typed values (e.g. the vec3 subtree-com
+  // accumulation) as <N x T>; LLVM AtomicRMW is scalar-only, so decompose
+  // into per-lane RMW on element addresses and reassemble the old value.
+  virtual llvm::Value *vector_type_atomic(AtomicOpStmt *stmt);
 
   void visit(AtomicOpStmt *stmt) override;
 

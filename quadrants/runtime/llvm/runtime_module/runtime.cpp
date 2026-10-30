@@ -956,7 +956,11 @@ void LLVMRuntime_initialize_thread_pool(LLVMRuntime *runtime, void *thread_pool,
   // garbage (observed: 0 on fresh pages) — the serial-inline branch then
   // never engages and every range-for pays the full pool wake barrier
   // (~11-14us/launch). Set the default explicitly before the env overrides.
-  runtime->serial_range_threshold = 64;
+  // CPU-2: threshold now means ITERATIONS (see cpu_parallel_range_for): ranges
+  // <= 650 iterations run inline (single-thread work < pool wake barrier
+  // ~13us); larger ranges take the pool. Default 64 -> 650 per the humanoid
+  // x{4096,64,1} sweep (all three optimal at 650).
+  runtime->serial_range_threshold = 650;
   if (const char *env = std::getenv("QD_AUTO_SERIAL")) {
     if (std::strcmp(env, "0") == 0)
       runtime->serial_range_threshold = 0;
@@ -964,6 +968,7 @@ void LLVMRuntime_initialize_thread_pool(LLVMRuntime *runtime, void *thread_pool,
   if (const char *env = std::getenv("QD_AUTO_SERIAL_THRESHOLD")) {
     runtime->serial_range_threshold = std::atoi(env);
   }
+
 }
 
 void runtime_NodeAllocator_initialize(LLVMRuntime *runtime, int snode_id, std::size_t node_size) {
@@ -1827,11 +1832,21 @@ void cpu_parallel_range_for(RuntimeContext *context,
   // graph do-while and other task shapes keep pool semantics. Each task is
   // self-contained (stack TLS, per-task xlogue), so thread-0 replay is
   // order-only different. Threshold 64 tasks by default, env-tunable.
-  if (ntasks <= runtime->serial_range_threshold && step == 1) {
-    for (int t = 0; t < ntasks; t++)
-      cpu_parallel_range_for_task(&range_task_context, 0, t);
-    return;
-  }
+  // CPU-2 (mujoqo §12.2): the inline gate must measure TOTAL ITERATIONS, not
+  // task count. make_cpu_multithreaded_range_for rewrites plain range-fors into
+  // an outer [0, cpu_max_num_threads) loop (task count == num_threads, always
+  // <= the 64-task threshold) wrapping serial per-thread chunks — gating on
+  // ntasks alone therefore ran EVERY CPU kernel single-threaded (humanoid
+  // x4096: 147ms serial vs 44ms pooled). Gating on the total iteration count
+  // restores pool execution for real workloads while keeping C1.5's cheap
+  // inline for genuinely tiny loops.
+  // CPU-2 (mujoqo §12.2): no serial-inline fallback here. Every range-for that
+  // reaches this function has already been rewritten by
+  // make_cpu_multithreaded_range_for into an outer [0, cpu_max_num_threads)
+  // loop with serial per-thread chunks — the former ntasks <= 64 inline branch
+  // matched that shape and silently ran EVERY CPU kernel on one thread
+  // (humanoid x4096: 147ms serial vs 44ms pooled; ps: 100% single core).
+  // The pool wake barrier (~13us) is amortized by the chunked bodies.
   runtime->parallel_for(runtime->thread_pool, ntasks, num_threads,
                         &range_task_context, cpu_parallel_range_for_task);
 }

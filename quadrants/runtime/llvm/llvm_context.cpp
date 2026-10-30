@@ -16,6 +16,10 @@
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/IntrinsicsNVPTX.h"
+#include "llvm/IR/LLVMRemarkStreamer.h"
+#include "llvm/Remarks/RemarkStreamer.h"
+#include "llvm/Remarks/YAMLRemarkSerializer.h"
+#include "llvm/Support/ToolOutputFile.h"
 #ifdef QD_WITH_AMDGPU
 #include "llvm/IR/IntrinsicsAMDGPU.h"
 #endif  // QD_WITH_AMDGPU
@@ -153,7 +157,40 @@ llvm::Type *QuadrantsLLVMContext::get_data_type(DataType dt) {
     // Return type is <element_type * num_elements> if real matrix is used,
     // otherwise [element_type * num_elements].
     if (codegen_vector_type(config_)) {
-      return llvm::VectorType::get(element_type, num_elements,
+      // CPU-10 (mujoqo §12.18): pad non-pow2 real vectors (<3 x f32>) to the
+      // next power of two on CPU — ARM ISel aborts legalizing odd-lane
+      // vectors.  CPU-only: GPU targets handle <3> natively.  Undef-padded
+      // lanes are never stored back (tensor memory access goes through the
+      // manual-offset byte path in ExternalPtrStmt, not this type).
+      //
+      // Garbage-size types (negative / >8 num_elements, e.g. placeholder
+      // dims under scalarize=0) fall back to ArrayType on EVERY arch — the
+      // cap is deliberately NOT arch-gated: per-thread LLVM contexts may
+      // carry a non-CPU arch field even in CPU runs, and skipping the cap
+      // there materializes <2^31 x i32> allocas (the ext_arr_to_ndarray_
+      // matrix abort class).  GPU semantics for sane sizes are unchanged.
+      if (num_elements < 0) {
+        fmt::print(stderr, "[T10] negative TensorType fallback to ArrayType: num={}\n", num_elements);
+        return llvm::ArrayType::get(element_type, num_elements);
+      }
+      unsigned n = (unsigned)num_elements;
+      fmt::print(stderr, "[T10b] TensorType num={} unsigned_n={} elem_is_vec={} elem_lanes={}\n",
+                 num_elements, n,
+                 (int)element_type->isVectorTy(),
+                 (int)(element_type->isVectorTy() ? llvm::cast<llvm::FixedVectorType>(element_type)->getNumElements() : 0));
+      if (arch_is_cpu(config_.arch) && (n & (n - 1)) != 0) {
+        // CPU-10 (mujoqo §12.18 补充 18): pad UP to the next power of two
+        // >= n.  A "round n to pow2" loop (n <<= 1 while n is not pow2)
+        // NEVER terminates for non-pow2 n — it wraps through 2^31 and
+        // materializes the <2^31 x i32> huge vector (the ext_arr_to_ndarray_
+        // matrix abort class).
+        unsigned pow2 = 1;
+        while (pow2 < n)
+          pow2 <<= 1;
+        return llvm::VectorType::get(element_type, pow2,
+                                     /*scalable=*/false);
+      }
+      return llvm::VectorType::get(element_type, n,
                                    /*scalable=*/false);
     }
     return llvm::ArrayType::get(element_type, num_elements);
@@ -1249,6 +1286,103 @@ LLVMCompiledKernel QuadrantsLLVMContext::link_compiled_tasks(std::vector<std::un
   linker.linkInModule(std::move(runtime_module), llvm::Linker::LinkOnlyNeeded | llvm::Linker::OverrideFromSrc);
   eliminate_unused_functions(mod.get(),
                              [&](std::string func_name) -> bool { return offloaded_names.count(func_name); });
+  // CPU-2 (mujoqo §12.2): kernel modules reach the JIT as UNOPTIMIZED IR — the
+  // codegen emits allocas for every body-local scalar and plain scalar ops;
+  // without an opt pipeline there is no mem2reg promotion, no loop
+  // vectorization, no scheduling, so CPU kernels run ~an order of magnitude
+  // slower than optimized code (the body-local slot traffic alone measured ~3x
+  // on the mujoqo humanoid solver kernels). Run the host optimization pipeline
+  // once per linked kernel module (offline-cacheable, one-time cost).
+  {
+    const int opt = std::getenv("QD_LLVM_OPT_LEVEL")
+                        ? std::atoi(std::getenv("QD_LLVM_OPT_LEVEL"))
+                        : 3;
+    if (opt > 0) {
+      using namespace llvm;
+      // CPU-3: build the PassBuilder with the HOST TargetMachine. Without a
+      // TM, TTI falls back to the generic (invalid) cost model and the
+      // vectorizer rejects every loop as unprofitable (measured: 0 vectorized
+      // loops across all 131 humanoid kernel modules despite correct
+      // alias-scope metadata and perfectly affine inner loops).
+      std::unique_ptr<llvm::TargetMachine> host_tm;
+      if (auto expected_jtmb = llvm::orc::JITTargetMachineBuilder::detectHost())
+        if (auto expected_tm = expected_jtmb->createTargetMachine())
+          host_tm = std::move(*expected_tm);
+      llvm::PassBuilder pb(host_tm.get());
+      llvm::LoopAnalysisManager lam;
+      llvm::FunctionAnalysisManager fam;
+      llvm::CGSCCAnalysisManager cgam;
+      llvm::ModuleAnalysisManager mam;
+      pb.registerModuleAnalyses(mam);
+      pb.registerFunctionAnalyses(fam);
+      pb.registerCGSCCAnalyses(cgam);
+      pb.registerLoopAnalyses(lam);
+      pb.crossRegisterProxies(lam, fam, cgam, mam);
+      const auto level = opt >= 3   ? llvm::OptimizationLevel::O3
+                         : opt == 2 ? llvm::OptimizationLevel::O2
+                                    : llvm::OptimizationLevel::O1;
+      // CPU-7: the FULL per-module default pipeline (simplification +
+      // optimization + post) — buildModuleOptimizationPipeline alone lacks
+      // the simplification half (SROA promotion, loop-canonicalization), and
+      // loops reading accumulators through allocas cost-reject in the
+      // vectorizer (measured: cholesky AXPY r-loop 0 vec with the
+      // optimization-only pipeline vs opt -O3's full pipeline vectorizing
+      // the same IR).
+      auto opt_pm = pb.buildPerModuleDefaultPipeline(level, llvm::ThinOrFullLTOPhase::None);
+      // CPU-7 (mujoqo §12.14/12.15): kernel modules carry NO target triple —
+      // without one TTI resolves to the generic target and the vectorizer's
+      // cost model rejects every loop (measured: the cholesky AXPY kernel
+      // goes 0 → 26 <4 x float> once the triple is set).  Set ONLY the
+      // triple; qd's DataLayout (custom address spaces) stays untouched.
+      if (host_tm)
+        mod->setTargetTriple(host_tm->getTargetTriple());
+      // CPU-3 diagnostic: capture optimization remarks (loop-vectorize miss
+      // reasons land here) while dumping is enabled.
+      std::unique_ptr<llvm::ToolOutputFile> remarks_of;
+      if (std::getenv("QD_DUMP_O3_IR")) {
+        std::error_code EC;
+        remarks_of = std::make_unique<llvm::ToolOutputFile>(
+            "/tmp/o3ir/remarks.yaml", EC, llvm::sys::fs::OF_Append);
+        if (!EC) {
+          auto &ctx = mod->getContext();
+          auto main_rs = std::make_unique<llvm::remarks::RemarkStreamer>(
+              std::make_unique<llvm::remarks::YAMLRemarkSerializer>(remarks_of->os()),
+              std::optional<llvm::StringRef>("remarks.yaml"));
+          ctx.setMainRemarkStreamer(std::move(main_rs));
+          ctx.setLLVMRemarkStreamer(std::make_unique<llvm::LLVMRemarkStreamer>(
+              *ctx.getMainRemarkStreamer()));
+        }
+      }
+      opt_pm.run(*mod, mam);
+      if (remarks_of) {
+        remarks_of->os().flush();
+        remarks_of->keep();
+        // The streamers reference the local ToolOutputFile — reset them on
+        // the (thread-shared) context before it dies, or the next module's
+        // optimization passes crash on the dangling serializer.
+        mod->getContext().setLLVMRemarkStreamer(nullptr);
+        mod->getContext().setMainRemarkStreamer(nullptr);
+      }
+      // CPU-3 diagnostic: post-O3 dump of the linked kernel module (per
+      // module, gated) — inspect what the pipeline actually produced
+      // (vectorized loop bodies, surviving alias-scope metadata).
+      if (std::getenv("QD_DUMP_O3_IR")) {
+        static std::atomic<int> dump_seq{0};
+        std::error_code EC;
+        std::string nm = mod->getName().str();
+        if (nm.empty() || nm == "<string>")
+          for (auto &f : *mod) {
+            nm = f.getName().str();
+            break;
+          }
+        char seq[16];
+        std::snprintf(seq, sizeof(seq), "%04d", dump_seq.fetch_add(1));
+        llvm::raw_fd_ostream out("/tmp/o3ir/" + std::string(seq) + "_" + nm + ".ll", EC);
+        if (!EC)
+          mod->print(out, nullptr);
+      }
+    }
+  }
   linked.module = std::move(mod);
   return linked;
 }

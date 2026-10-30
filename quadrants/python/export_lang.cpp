@@ -561,6 +561,19 @@ void export_lang(nb::module_ &m) {
       .def("get_graphics_device", [](Program *program) { return program->get_graphics_device(); })
       .def("compile_kernel", &Program::compile_kernel, nb::rv_policy::reference)
       .def("launch_kernel", &Program::launch_kernel)
+      .def(
+          "launch_kernel_batch",
+          [](Program *self, const nb::list &items) {
+            // Batch replay entry for the Python-side plan executor (QD_PLAN): one pybind
+            // crossing amortized over the whole recorded launch segment.
+            for (const nb::handle &h : items) {
+              const nb::tuple pair = nb::cast<nb::tuple>(h);
+              const CompiledKernelData &ckd = nb::cast<const CompiledKernelData &>(pair[0]);
+              LaunchContextBuilder &ctx = nb::cast<LaunchContextBuilder &>(pair[1]);
+              self->launch_kernel(ckd, ctx);
+            }
+          },
+          nb::arg("items"))
       .def("get_device_caps", &Program::get_device_caps)
       .def("subgroup_size", &Program::subgroup_size)
       .def("get_graph_cache_size", &Program::get_graph_cache_size)

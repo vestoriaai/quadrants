@@ -8,6 +8,7 @@
 #include "llvm/IR/Function.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/Support/Signals.h"
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/IntrinsicsNVPTX.h"
 
@@ -71,7 +72,16 @@ class LLVMModuleBuilder {
   llvm::Value *create_entry_block_alloca(llvm::Type *type,
                                          std::size_t alignment = 0,
                                          llvm::Value *array_size = nullptr) {
-    llvm::IRBuilderBase::InsertPointGuard guard(*builder);
+    // CPU-10 (mujoqo §12.18): trace huge vector types arriving through the
+    // llvm::Type* overload — they bypass get_data_type's garbage cap (the
+    // ext_arr_to_ndarray_matrix abort class).
+    if (auto *vt = llvm::dyn_cast_or_null<llvm::VectorType>(type)) {
+      if (vt->getElementCount().getKnownMinValue() > 64) {
+        fmt::print(stderr, "[CPU-10 trace] huge vector alloca via llvm::Type* overload: <{} x elts>\n",
+                   vt->getElementCount().getKnownMinValue());
+        llvm::sys::PrintStackTrace(llvm::errs());
+      }
+    }    llvm::IRBuilderBase::InsertPointGuard guard(*builder);
     builder->SetInsertPoint(entry_block);
     auto alloca = builder->CreateAlloca(type, (unsigned)0, array_size);
     if (alignment != 0) {
@@ -82,6 +92,15 @@ class LLVMModuleBuilder {
 
   llvm::Value *create_entry_block_alloca(DataType dt) {
     auto type = tlctx->get_data_type(dt);
+    // CPU-10 (mujoqo §12.18): trace garbage placeholder TensorTypes that
+    // survive to huge vector allocas under scalarize=0 (per-component
+    // matrix temporaries in ext_arr_to_ndarray_matrix).
+    if (auto *vt = llvm::dyn_cast_or_null<llvm::VectorType>(type)) {
+      if (vt->getElementCount().getKnownMinValue() > 64) {
+        fmt::print(stderr, "[CPU-10 trace] huge vector alloca <{} x elts> <- dtype to_string: {}\n",
+                   vt->getElementCount().getKnownMinValue(), dt.to_string());
+      }
+    }
     return create_entry_block_alloca(type);
   }
 

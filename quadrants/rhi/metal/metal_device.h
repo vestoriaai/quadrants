@@ -4,8 +4,10 @@
 #include "quadrants/rhi/impl_support.h"
 #include "quadrants/rhi/metal/metal_api.h"
 #include <memory>
+#include <mutex>
 #include <regex>
 #include <unordered_set>
+#include <atomic>
 
 // clang-format off
 #if defined(__APPLE__) && defined(__OBJC__)
@@ -387,6 +389,13 @@ class MetalCommandList final : public CommandList {
                   const ImageCopyParams &params) override;
   void set_line_width(float width) override;
 
+  // A72: per-task kernel profiling via the command-buffer GPUStartTime/GPUEndTime
+  // span (the MTLCounterSampleBuffer sampled path reads all-zero on Apple GPUs).
+  // GfxRuntime opens one scope per task and flushes per task in profiler mode, so
+  // each submitted command buffer carries exactly one kernel.
+  void begin_profiler_scope(const std::string &kernel_name) override;
+  void end_profiler_scope() override;
+
   MTLCommandBuffer_id finalize();
   // If noclear is false, ignore whatever is set in details
   // This may be used to "resume" the current renderpass
@@ -418,6 +427,11 @@ class MetalCommandList final : public CommandList {
   // Buffers accessed via physical storage buffer pointers in the next dispatch.
   // Needed for Metal hazard tracking since these are not explicitly bound.
   std::vector<DeviceAllocation> tracked_physical_buffers_;
+
+  // A72 profiler scope: name carried to MetalStream::submit, which consumes it
+  // and attaches the completion handler that attributes this buffer's GPU time
+  // span to it.
+  std::string profiler_scope_name_;
 
   // For renderpass resuming, track whether a renderpass has been started
   // Used to override LoadAction, to prevent uninteded clearing when resuming
@@ -466,6 +480,7 @@ class MetalStream final : public Stream {
   const MetalDevice *device_;
   MTLCommandQueue_id mtl_command_queue_;
   std::vector<MTLCommandBuffer_id> pending_cmdbufs_;
+  uint64_t gpu_time_seq_ = 0;  // QD_GPU_TIME debug sequence counter
   bool owns_queue_{true};
   bool is_destroyed_{false};
 };
@@ -525,6 +540,16 @@ class MetalDevice final : public GraphicsDevice {
   MTLDevice_id mtl_device() const {
     return mtl_device_;
   }
+
+  // A72 metal kernel profiler: attribution source is each scoped command buffer's
+  // GPUStartTime/GPUEndTime span, pushed by the completion handler into the device
+  // sink; GfxRuntime::synchronize drains it via profiler_flush_sampled_time.
+  void profiler_sync() override;
+  size_t profiler_get_sampler_count() override {
+    return 0;
+  }
+  std::vector<std::pair<std::string, double>> profiler_flush_sampled_time() override;
+  void profiler_record(std::string kernel_name, double gpu_ms);
 
   static MetalDevice *create();
   static MetalDevice *create_with_external_queue(uint64_t external_queue_ptr);
@@ -599,6 +624,9 @@ class MetalDevice final : public GraphicsDevice {
   }
 
  private:
+  friend class MetalStream;
+  friend class MetalCommandList;
+
   MTLDevice_id mtl_device_;
   rhi_impl::SyncedPtrStableObjectList<MetalMemory> memory_allocs_;
   rhi_impl::SyncedPtrStableObjectList<MetalImage> image_allocs_;
@@ -608,6 +636,13 @@ class MetalDevice final : public GraphicsDevice {
 
   bool is_destroyed_{false};
   bool fast_math_{true};
+
+  // A72 profiler sink: completion handlers run on Metal's internal queue, so the
+  // records list is mutex-guarded; profiler_pending_ counts scoped buffers
+  // submitted but not yet completed (drained by profiler_sync's bounded wait).
+  std::mutex profiler_mu_;
+  std::vector<std::pair<std::string, double>> profiler_records_;
+  std::atomic<size_t> profiler_pending_{0};
 };
 
 }  // namespace metal

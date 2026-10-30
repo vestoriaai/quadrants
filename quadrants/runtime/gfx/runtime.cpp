@@ -13,6 +13,7 @@
 #include "quadrants/common/filesystem.hpp"
 
 #include <cstring>
+#include <string>
 
 // FIXME: (penguinliong) Special offer for `run_codegen`. Find a new home for it
 // in the future.
@@ -410,7 +411,11 @@ void GfxRuntime::launch_kernel(KernelHandle handle, LaunchContextBuilder &host_c
   auto *qd_kernel = qd_kernels_[handle.get_launch_id()].get();
 
 #if defined(__APPLE__)
-  if (profiler_) {
+  // A72: this cap guards the Vulkan-style query-pool sampler path. Backends with
+  // no query pools (metal: attribution is the per-buffer GPUStartTime/GPUEndTime
+  // span, flushed per task below) report sampler count 0 and skip the cap, so
+  // kernels with many tasks keep profiling instead of being aborted.
+  if (profiler_ && device_->profiler_get_sampler_count() > 0) {
     const int apple_max_query_pool_count = 32;
     int task_count = qd_kernel->qd_kernel_attribs().tasks_attribs.size();
     if (task_count > apple_max_query_pool_count) {
@@ -1067,6 +1072,14 @@ void GfxRuntime::launch_kernel(KernelHandle handle, LaunchContextBuilder &host_c
 
     if (profiler_) {
       current_cmdlist_->end_profiler_scope();
+      if (profiler_ && device_->profiler_get_sampler_count() == 0) {
+        // A72: on backends without in-list timestamps (metal) attribution is the
+        // per-buffer GPUStartTime/GPUEndTime span, so each task must be the sole
+        // content of its own command buffer. flush() nulls current_cmdlist_;
+        // recreate it for the next task of this launch.
+        flush();
+        ensure_current_cmdlist();
+      }
     }
 
     QD_ERROR_IF(status != RhiResult::success, "Dispatch error : RhiResult({})", status);
@@ -1230,6 +1243,19 @@ void GfxRuntime::synchronize() {
   fflush(stdout);
 }
 
+// A1 (metal launch model): on Metal the per-launch args/ret buffers are released at flush() instead of being
+// parked until synchronize(), and the kMaxPendingLaunches valve commits instead of draining. Both rely on the
+// standard MTLCommandBuffer retaining the resources its commands reference until completion. QD_METAL_RETAINED_FLUSH=0
+// restores the pre-A1 behaviour for bisecting.
+static bool metal_retained_flush(const ProgramImpl *program_impl) {
+  static const bool enabled = [] {
+    const char *v = std::getenv("QD_METAL_RETAINED_FLUSH");
+    return v == nullptr || std::string(v) != "0";
+  }();
+  return enabled && program_impl != nullptr && program_impl->config != nullptr &&
+         program_impl->config->arch == Arch::metal;
+}
+
 StreamSemaphore GfxRuntime::flush() {
   StreamSemaphore sema;
   if (current_cmdlist_) {
@@ -1239,6 +1265,21 @@ StreamSemaphore GfxRuntime::flush() {
     // executing. The deferred-free buffers in ctx_buffers_ (e.g. the old adstack heap buffer left over after a
     // grow-on-demand resize) may still be referenced by commands in flight. Only `synchronize()` clears the vector,
     // after `wait_idle()` has drained the stream.
+    //
+    // Metal exception: a standard (retained-references) MTLCommandBuffer holds every resource its encoded commands
+    // reference until it completes, so dropping our DeviceAllocationGuard here only drops *our* reference -- the
+    // MTLBuffer stays alive for the in-flight work. Releasing the per-launch args/ret buffers at submit time keeps
+    // host-side state bounded without the drain the valve below used to force. Ext-array mirrors are kept parked:
+    // the R3a pool recycles them for reuse, and reuse (unlike release) does need the GPU to be idle.
+    if (metal_retained_flush(program_impl_)) {
+      std::vector<std::unique_ptr<DeviceAllocationGuard>> keep;
+      for (auto &buf : ctx_buffers_) {
+        if (ext_mirror_pending_ids_.count(buf->alloc_id)) {
+          keep.push_back(std::move(buf));
+        }
+      }
+      ctx_buffers_.swap(keep);
+    }
   } else {
     auto [cmdlist, res] = device_->get_compute_stream()->new_command_list_unique();
     QD_ASSERT(res == RhiResult::success);
@@ -1268,8 +1309,10 @@ void GfxRuntime::submit_current_cmdlist_if_timeout() {
   // must reach the queue before any external op is enqueued for Metal's same-queue FIFO scheduling to order them, so
   // commit every launch unconditionally instead of waiting for the staleness threshold.
   if (current_cmdlist_) {
-    bool force_flush = program_impl_ != nullptr && program_impl_->config != nullptr &&
-                       program_impl_->config->external_metal_command_queue != 0;
+    static const int gpu_time_mode = std::getenv("QD_GPU_TIME") != nullptr ? std::atoi(std::getenv("QD_GPU_TIME")) : 0;
+    bool force_flush = gpu_time_mode >= 2 ||
+                       (program_impl_ != nullptr && program_impl_->config != nullptr &&
+                        program_impl_->config->external_metal_command_queue != 0);
     constexpr uint64_t max_pending_time = 2000;  // 2000us = 2ms
     auto duration = high_res_clock::now() - current_cmdlist_pending_since_;
     if (force_flush || std::chrono::duration_cast<std::chrono::microseconds>(duration).count() > max_pending_time) {
@@ -1295,7 +1338,21 @@ void GfxRuntime::submit_current_cmdlist_if_timeout() {
   constexpr size_t kMaxPendingLaunches = 32;
   pending_launches_since_sync_ += 1;
   if (pending_launches_since_sync_ > kMaxPendingLaunches) {
-    synchronize();
+    if (metal_retained_flush(program_impl_)) {
+      // Metal has no MoltenVK encoder tracker to protect, `MetalStream::submit` retires completed cmdbufs on every
+      // submit, and flush() already released the args/ret buffers of the submitted cmdlist -- so a plain commit
+      // bounds host-side state. The old `synchronize()` here drained the GPU every ~33 launches, which serialized
+      // host and GPU (measured: 0.5-1.3 ms per drain even for trivial kernels, ~4 drains per mujoqo step).
+      flush();
+      pending_launches_since_sync_ = 0;
+      // Only ext-array mirrors are still parked (R3a pool inputs). Workloads that stream external arrays without
+      // ever touching a host observable could still grow that list; keep the coarse drain as a far backstop.
+      if (ctx_buffers_.size() > 1024) {
+        synchronize();
+      }
+    } else {
+      synchronize();
+    }
   }
 }
 
