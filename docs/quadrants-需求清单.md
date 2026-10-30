@@ -1,4 +1,16 @@
 
+#### A73 结案登记(2026-10-30)——不可复现,不设修复条目
+
+- **A73(块级 SharedArray+sync 与 ndarray 读交互"读零")结案为
+  方法学错误**:登记时的 V3+ 复现脚本定义了 kernel 却从未 launch,
+  "读零"实为读未写入的零初始化 buffer。带 launch 的 45 参数位置探针
+  (0..44 全位置)+ 522 行真实 megakernel differential
+  (constraints/collision/humanoid × CPU/metal)全部通过,读路径无损。
+- **处置**:docs/a73-block-sharedarray-ndarray-read-interaction.md 已改写
+  为结案记录;不排入修复计划,不占需求编号排期。仍有效的 block-tier
+  工程约束(3 参 range / while 条件读 / 块级 break 未验证)以工程约束
+  形式保留在结案文档,非缺陷。
+
 #### A42 开发线里程碑 2 + 定性更正(2026-10-19 凌晨,dev134 wheel)
 
 - **dev126/127 崩溃族定性更正**:A42 patch v1 漏插 dest MatrixPtrStmt →

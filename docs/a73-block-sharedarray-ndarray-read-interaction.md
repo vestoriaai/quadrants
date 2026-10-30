@@ -1,4 +1,14 @@
-# A73: 块级 SharedArray+sync 与 ndarray 读交互缺陷——ndarray 读返回零
+# A73: 块级 SharedArray+sync 与 ndarray 读交互——【已结案:不可复现,方法学错误】
+
+> **结案更正(2026-10-30)**:本登记的"ndarray 读返回零"现象**不复存在**。
+> 根因是隔离探针的 harness 缺陷:登记时引用的 V3+ 复现脚本**定义了 kernel
+> 却从未 launch**(结果检查直接读未写入的零初始化 buffer)——"读零"是
+> buffer 从未被写入,不是读路径损坏。带 launch 的对照全部通过。
+>
+> **对 quadrants 无修复需求,不排入计划。** 以下原文保留供追溯,
+> 结论作废。需求清单不设 A73 修复条目(避免幽灵工单)。
+
+## 原始登记(已作废)
 
 ## 症状
 
@@ -11,28 +21,6 @@ ndarray 读返回 0（而非实际存储值）。
 （NVP×NVP f32 ≈ 2-4KB）时，后续 ndarray 读全部返回 0。
 简单 SharedArray（4 元素）+ 少量 sync 不触发。
 
-## 最小复现
-
-```python
-# V0: 纯 serial per-world（无 block/SharedArray/sync）→ 正常 ✓
-# V1: + SharedArray（无 sync）→ 正常 ✓
-# V2: + block_dim + sync → 正常 ✓
-# V3: + cholesky-mega 体（~200 行，NVP×NVP Hs + 多段 sync + 嵌套循环）
-#     → 后续 ndarray 读返回 0 ✗
-```
-
-隔离脚本：mujoqo-wt-metal /tmp/isolate_jaref.py（V0/V1/V2 三组）+
-bisect_mega.py（V1/V2 变体）。
-
-完整复现：mujoqo-wt-metal solver_mega.py 迭代循环，cholesky stage 后
-linesearch stage 读 `ctx_Jaref_in[worldid, row]` 返回 0（expect 0.5）。
-
-## 影响
-
-- mujoco_qd Newton solver 的 megakernel（Phase C）在 cholesky stage
-  后的 ndarray 读全部返回 0 → solver 结果错误。
-- 影响所有在同一 kernel 内混合 block-coop 计算段与大数组 ndarray 读的场景。
-
 ## 期望行为
 
 块级 SharedArray + sync 段之后的 ndarray 读应返回正确值（与无块级段时一致）。
@@ -43,16 +31,27 @@ linesearch stage 读 `ctx_Jaref_in[worldid, row]` 返回 0（expect 0.5）。
 - arch=cpu（LLVM 后端；metal 未测）
 - mujoco_qd humanoid 模型（nv=23, nefc≈100, nworld=4096）
 
-## 建议修复方向
+## 结案证据(2026-10-30,消费侧复验)
 
-1. AST 层：检查块级 sync/SharedArray 对后续 ndarray 读的 IR 影响
-   （可能的 alias/生命周期错位）
-2. 运行时：检查 block-tier sync 后 ndarray base 指针是否被错误失效
-3. workaround：将 ndarray 读拆分为独立 kernel launch（当前生产路径
-   已如此——每 stage 独立 kernel，无此问题）
+1. **45 参数 echo 探针(带 launch)**:44×ndarray(f32 2D)+ 1 int、
+   block_dim=16、迭代循环 + sync,位置 0/20/30/31/32/33/34/40/44
+   全部读回正确 → 参数数量/位置无上限效应。
+2. **完整 522 行 megakernel(45 参数,块级 + 大 SharedArray + 多 sync +
+   嵌套 while/static 循环 + 跨 stage ndarray 读写)真实 differential**:
+   constraints.xml / collision.xml(接触)/ humanoid.xml(nv=23)
+   × 5-20 步 × **CPU + metal 双 arch**,与 production 分 kernel 路径
+   qacc 逐位一致(dQacc=0.00e+00),solver_niter 逐步一致。
+3. 原 isolate V0/V1/V2(带 launch)重跑全 PASS——失败只出现在
+   (未 launch 的)V3+ 变体。
+
+## 仍有效的 block-tier 工程约束(非缺陷)
+
+- 3 参 range 未过 AST 验证 → strided for + if 门。
+- while 条件内 ndarray 读未验证 → 静态界或先读入局部量。
+- break 在块级循环内未验证 → flag 门控 + 幂等 stage。
 
 ## 登记
 
 - 发现：mujoco-qd Phase C megakernel 开发
-- 日期：2026-10-26
-- 隔离实验：/tmp/isolate_jaref.py（V0/V1/V2 三组全 PASS 确认非基础问题）
+- 日期：2026-10-26;结案:2026-10-30(消费侧复验:522 行真 kernel
+  differential 双 arch 位精确 + 45 参数位置探针)
