@@ -8,6 +8,13 @@ import warnings
 from collections import defaultdict
 
 
+_C1DBG = os.environ.get('C1DBG')
+# Top-level Python scalar args are keyed by value in the launch-ctx cache (an id would
+# be recycled across distinct values), which makes their contexts safely cacheable.
+_PY_SCALAR_TYPES = frozenset((int, float, bool))
+_C1DBG2 = os.environ.get('C1DBG2')
+
+
 def _c1_lane_pop(d, k):
     d.pop(k, None)
 from dataclasses import _FIELDS  # type: ignore[reportAttributeAccessIssue]
@@ -187,7 +194,7 @@ class LaunchContextBufferCache:
             launch_ctx_cache_tracker = self._launch_ctx_cache_tracker[args_hash]
         except KeyError:
             pass
-        if True:  # A85 EXPERIMENT: launch-ctx cache disabled, always rebind fresh
+        if not launch_ctx_cache_tracker:  # Empty or none
             return False
 
         assert args_hash is not None
@@ -421,6 +428,7 @@ class Kernel(FuncBase):
         self._c1_lane: dict | None = (
             {} if os.environ.get("QD_LAUNCH_FAST", "1") != "0" else None
         )
+        self._c1_last_ctx_key = None
 
     def ast_builder(self) -> ASTBuilder:
         assert self.kernel_cpp is not None
@@ -745,7 +753,16 @@ class Kernel(FuncBase):
         # argument ids collide (allocator address reuse across same-shaped arrays)
         # reuse each other's cached launch context -> `kernel_ == other.kernel_`
         # assertion. Fold the compiled-kernel identity into the hash.
-        args_hash: "ArgsHash" = (id(t_kernel), id(compiled_kernel_data), *[id(arg) for arg in args])
+        args_hash: "ArgsHash" = (
+            id(t_kernel),
+            id(compiled_kernel_data),
+            *[arg if type(arg) in _PY_SCALAR_TYPES else id(arg) for arg in args],
+        )
+        # A cached context also binds grad pointers: an ndarray whose .grad was replaced
+        # must miss, even if the stale grad buffer is still alive elsewhere.
+        grad_ids = [id(g) for g in (getattr(arg, "grad", None) for arg in args) if g is not None]
+        if grad_ids:
+            args_hash = (*args_hash, *grad_ids)
         # A85/A86: launch 期 grad 缓冲身份追踪(QD_LAUNCH_TRACE=1 门控; 追踪 reverse
         # 链 launch 序/grad 绑定 id/可注册 runtime.a86_watch={id(arr): 名} 看范数流)
         if os.environ.get("QD_LAUNCH_TRACE") == "1":
@@ -806,6 +823,7 @@ class Kernel(FuncBase):
                 *args_hash,
                 *(id(self._resolve_struct_ndarray(args, idx, chain)) for idx, chain in self._mutable_nd_cached_val),
             )
+        self._c1_last_ctx_key = args_hash
         if not self.launch_context_buffer_cache.populate_launch_ctx_from_cache(args_hash, launch_ctx):
             launch_ctx_buffer: dict[KernelBatchedArgType, list[tuple]] = defaultdict(list)
             actual_argument_slot = 0
@@ -854,6 +872,8 @@ class Kernel(FuncBase):
                     callbacks,
                 )
                 i_out += num_args_
+                if type(val) in _PY_SCALAR_TYPES:
+                    is_launch_ctx_cacheable_ = True  # value is part of args_hash
                 is_launch_ctx_cacheable &= is_launch_ctx_cacheable_
 
             struct_nd_info = self._struct_ndarray_launch_info_by_key.get(key)
@@ -1076,9 +1096,12 @@ class Kernel(FuncBase):
             if compiled_kernel_data is None:
                 return
         t_kernel = self.materialized_kernels[key]
-        cached_ctx = self.launch_context_buffer_cache._launch_ctx_cache.get(
-            (id(kernel_cpp), *[id(a) for a in py_args])
-        )
+        # The lane key is the bare arg ids; a ctx key extended by grad or struct-member
+        # ids carries state the lane cannot re-validate on hit, so such keys stay off it.
+        ctx_key = self._c1_last_ctx_key
+        if ctx_key is None or len(ctx_key) != len(py_args) + 2:
+            return
+        cached_ctx = self.launch_context_buffer_cache._launch_ctx_cache.get(ctx_key)
         if cached_ctx is None:
             return
         import weakref as _wk
@@ -1128,15 +1151,14 @@ class Kernel(FuncBase):
                 and not self.graph_do_while_levels and not self.use_graph \
                 and self.autodiff_mode == _NONE \
                 and self.runtime.target_tape is None and not self.runtime.fwd_mode_manager:
-            import os as _o
-            if _o.environ.get('C1DBG2'):
+            if _C1DBG2:
                 fn = getattr(self, 'func', None)
                 print('DBG gate PASS:', fn.__name__ if fn else '?', 'ug=', self.use_graph, 'gdl=', self.graph_do_while_levels)
             lane_get = self._c1_lane.get
             key_ids = tuple([id(a) for a in py_args])
             entry = lane_get(key_ids)
             if entry is not None:
-                if _o.environ.get('C1DBG2'):
+                if _C1DBG2:
                     fn2 = getattr(self, 'func', None)
                     print('DBG fast HIT:', fn2.__name__ if fn2 else '?')
             if entry is not None:
@@ -1158,8 +1180,7 @@ class Kernel(FuncBase):
                         entry = None
                         break
                 if entry is not None:
-                    import os as _o
-                    if _o.environ.get('C1DBG'):
+                    if _C1DBG:
                         fn = getattr(self, 'func', None)
                         print('DBG fast hit:', fn.__name__ if fn else '?', 'ntotal_args=', len(py_args))
                     ctx = t_kernel.make_launch_context()
@@ -1272,8 +1293,7 @@ class Kernel(FuncBase):
                 self.compiled_kernel_data_by_key[key] = self._last_compiled_kernel_data
             # Return-value kernels (kernel returning a scalar) are excluded from
             # the lane: the fast path cannot relay their return value.
-            import os as _o
-            if _o.environ.get('C1DBG') and self.name == 'total':
+            if _C1DBG and self.name == 'total':
                 print('DBG total ret=', ret, 'lane_n=', len(self._c1_lane) if self._c1_lane else None)
             if self._c1_lane is not None and ret is None:
                 self._c1_maybe_populate(py_args, key, kernel_cpp, compiled_kernel_data)
